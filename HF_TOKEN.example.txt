@@ -1,0 +1,4 @@
+# Copy this file to HF_TOKEN.txt and replace the value below
+# with your own Hugging Face access token.
+hf_your_token_goes_here
+
