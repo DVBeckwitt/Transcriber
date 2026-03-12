@@ -32,12 +32,13 @@ MEDIA_EXTENSIONS = {
     ".mkv",
     ".webm",
 }
-DEFAULT_POLL_INTERVAL = 5.0
-DEFAULT_SETTLE_SECONDS = 15.0
+DEFAULT_POLL_INTERVAL = 2.0
+DEFAULT_SETTLE_SECONDS = 5.0
 DEFAULT_WATCH_DIR = Path.home() / "OneDrive" / "recordings"
 WATCH_RETRY_COOLDOWN_SECONDS = 300.0
 WATCHER_LOG_NAME = "transcriber-watcher.log"
 FALLBACK_TEMP_DIR_NAME = ".tmp_transcriber_temp"
+SHARED_OUTPUT_DIR_NAME = "shared"
 
 
 @dataclass
@@ -418,7 +419,8 @@ def resolve_input_path(arg_input: str | None) -> Path | None:
 
 
 def output_paths_for_input(input_path: Path) -> OutputPaths:
-    output_dir = input_path.parent
+    output_dir = input_path.parent / SHARED_OUTPUT_DIR_NAME
+    output_dir.mkdir(parents=True, exist_ok=True)
     base = input_path.stem
     return OutputPaths(
         srt_path=output_dir / f"{base}.srt",
@@ -675,7 +677,7 @@ def transcribe_file(cfg: RunConfig, input_path: Path, report: Reporter = print) 
         run_args = build_whisperx_args(
             cfg,
             input_path,
-            input_path.parent,
+            outputs.srt_path.parent,
             hf_token,
             diarize=current_diarize,
             no_align=current_no_align,
