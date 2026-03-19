@@ -55,7 +55,10 @@ SUBTITLE_TARGET_CPS = 17.0
 SUBTITLE_PREFERRED_BREAK_CHARS = ".?!,:;"
 
 SPANISH_TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-es-en"
-TRANSLATION_CONTEXT_WINDOW = 1
+TRANSLATION_CONTEXT_WINDOW = 2
+TRANSLATION_NUM_BEAMS = 4
+TRANSLATION_LENGTH_PENALTY = 1.0
+TRANSLATION_NO_REPEAT_NGRAM_SIZE = 3
 TRANSLATION_MARKER_START = "__CUR_START__"
 TRANSLATION_MARKER_END = "__CUR_END__"
 UNCERTAIN_MARKER_RE = re.compile(
@@ -1023,12 +1026,13 @@ def translation_context_for_cue(cues: Sequence[SRTCue], index: int, window: int)
 
 def build_translation_prompt(*, model_name: str, context_window: int, glossary: dict[str, str]) -> str:
     lines = [
-        "Translate Spanish transcript text to English.",
+        "Translate Spanish subtitle text to natural, accurate English.",
         f"Model: {model_name}",
         f"Context window: {context_window}",
         f"Preserve markers: {TRANSLATION_MARKER_START} ... {TRANSLATION_MARKER_END}",
-        "Preserve uncertain markers exactly.",
+        "Preserve speaker labels, names, numbers, and uncertain markers exactly.",
         "Use surrounding context only to disambiguate the current cue.",
+        "Prefer faithful meaning over literal phrasing.",
     ]
     if glossary:
         lines.append("Glossary:")
@@ -1141,7 +1145,14 @@ def translate_spanish_texts(texts: Sequence[str], device: str, batch_size: int =
         if target_device is not None:
             inputs = {key: value.to(target_device) for key, value in inputs.items()}
         with torch.no_grad() if torch is not None else contextlib.nullcontext():
-            outputs = model.generate(**inputs, max_new_tokens=256)
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                num_beams=TRANSLATION_NUM_BEAMS,
+                length_penalty=TRANSLATION_LENGTH_PENALTY,
+                no_repeat_ngram_size=TRANSLATION_NO_REPEAT_NGRAM_SIZE,
+                early_stopping=True,
+            )
         decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         translated.extend(text.strip() for text in decoded)
 
@@ -1340,7 +1351,11 @@ def build_audio_preprocess_command(input_path: Path, output_path: Path) -> list[
         "error",
         "-i",
         str(input_path),
+        "-map",
+        "0:a:0?",
         "-vn",
+        "-sn",
+        "-dn",
         "-ac",
         "1",
         "-ar",

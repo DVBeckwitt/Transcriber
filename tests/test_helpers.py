@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import MagicMock, patch
 
 from transcriber.__main__ import (
     build_audio_preprocess_command,
@@ -14,6 +15,7 @@ from transcriber.__main__ import (
     apply_confidence_cleanup,
     build_translation_prompt,
     load_translation_glossary,
+    translate_spanish_texts,
     output_paths_for_input,
     parse_args,
     parse_glossary_entries,
@@ -75,6 +77,7 @@ class HelperTests(unittest.TestCase):
         command = build_audio_preprocess_command(Path("in.mp4"), Path("out.wav"))
 
         self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("0:a:0?", command)
         self.assertIn("-vn", command)
         self.assertIn("-ac", command)
         self.assertIn("1", command)
@@ -148,6 +151,31 @@ class HelperTests(unittest.TestCase):
         ]
         context = translation_context_for_cue(cues, index=1, window=1)
         self.assertEqual(context, [(-1, "Hola"), (1, "Bien")])
+
+    @patch("transcriber.__main__.load_spanish_to_english_translator")
+    def test_translation_uses_beam_search(self, load_translator: MagicMock) -> None:
+        import torch
+
+        tokenizer = MagicMock()
+        tokenizer.return_value = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "attention_mask": torch.tensor([[1, 1, 1]]),
+        }
+        tokenizer.batch_decode.return_value = ["Hello there"]
+
+        model = MagicMock()
+        model.generate.return_value = torch.tensor([[1, 2, 3]])
+        load_translator.return_value = (tokenizer, model)
+
+        result = translate_spanish_texts(["Hola"], device="cpu", batch_size=1)
+
+        self.assertEqual(result, ["Hello there"])
+        model.generate.assert_called_once()
+        kwargs = model.generate.call_args.kwargs
+        self.assertEqual(kwargs["num_beams"], 4)
+        self.assertEqual(kwargs["length_penalty"], 1.0)
+        self.assertEqual(kwargs["no_repeat_ngram_size"], 3)
+        self.assertTrue(kwargs["early_stopping"])
 
     def test_confidence_cleanup_marks_low_confidence(self) -> None:
         cfg = make_cfg()
