@@ -40,7 +40,7 @@ if exist "%PID_FILE%" (
     echo.
     echo Watcher is already running with PID !WATCHER_PID!.
     echo Watcher log:
-    echo   "%WATCH_DIR%\transcriber-watcher.log"
+    echo   "%CD%\logs\transcriber-watcher.log"
     echo To stop it:
     echo   ".\stop_recordings_watcher.bat"
     echo.
@@ -51,7 +51,7 @@ if exist "%PID_FILE%" (
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$p = Start-Process -WindowStyle Hidden -WorkingDirectory '%CD%' -FilePath '%PY%' -ArgumentList @('-m','transcriber','--watch','--watch-dir','%WATCH_DIR%','--lang','en','--task','transcribe','--mode','quality') -PassThru; [System.IO.File]::WriteAllLines('%PID_FILE%', @([string]$p.Id, [string]$p.StartTime.ToUniversalTime().ToFileTimeUtc()), [System.Text.Encoding]::ASCII)"
+  "$p = Start-Process -WindowStyle Hidden -WorkingDirectory '%CD%' -FilePath '%PY%' -ArgumentList @('-m','transcriber','--watch','--watch-dir','%WATCH_DIR%','--lang','auto','--mode','quality') -PassThru; [System.IO.File]::WriteAllLines('%PID_FILE%', @([string]$p.Id, [string]$p.StartTime.ToUniversalTime().ToFileTimeUtc()), [System.Text.Encoding]::ASCII)"
 set "RC=%ERRORLEVEL%"
 
 if "%RC%"=="0" (
@@ -63,7 +63,7 @@ if "%RC%"=="0" (
   echo Watcher PID:
   echo   "!WATCHER_PID!"
   echo Watcher log:
-  echo   "%WATCH_DIR%\transcriber-watcher.log"
+  echo   "%CD%\logs\transcriber-watcher.log"
   echo To stop it:
   echo   ".\stop_recordings_watcher.bat"
   echo.

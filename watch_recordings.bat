@@ -19,7 +19,7 @@ if not exist "%PY%" (
   exit /b 1
 )
 
-"%PY%" -m transcriber --watch --watch-dir "%WATCH_DIR%" --lang en --task transcribe --mode quality %*
+"%PY%" -m transcriber --watch --watch-dir "%WATCH_DIR%" --lang auto --mode quality %*
 set "RC=%ERRORLEVEL%"
 
 echo.

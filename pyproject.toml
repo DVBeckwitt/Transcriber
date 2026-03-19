@@ -3,6 +3,11 @@ name = "transcriber-local"
 version = "0.1.0"
 description = "Local WhisperX transcription launcher"
 requires-python = ">=3.10"
+dependencies = [
+    "transformers>=4.40",
+    "sentencepiece",
+    "sacremoses",
+]
 
 [project.scripts]
 transcriber = "transcriber.__main__:main"

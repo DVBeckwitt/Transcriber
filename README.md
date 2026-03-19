@@ -1,12 +1,13 @@
 # Transcriber
 
 Local WhisperX launcher for fast transcription from audio/video files.
+It transcribes first, then translates Spanish transcripts to English as a separate text pass.
 
 It generates:
-- `your_file.srt` (subtitle transcript)
-- `your_file_llm.txt` (clean text block for LLM workflows)
-- `your_file_whisperx.log` (full run log)
-- `transcriber-watcher.log` (watch-mode activity log, when using folder watch)
+- `your_file.srt` subtitle transcript
+- `your_file_llm.txt` clean text block for LLM workflows
+- `logs/your_file_whisperx.log` full run log in the project folder
+- `logs/transcriber-watcher.log` watch-mode activity log in the project folder
 
 ## What you need before running
 
@@ -19,7 +20,7 @@ It generates:
 ## Install
 
 1. Create/activate a virtual environment.
-2. Install WhisperX in that environment (follow WhisperX's current install instructions).
+2. Install WhisperX in that environment.
 3. Install this launcher:
 
 ```powershell
@@ -42,6 +43,9 @@ Important:
   - https://hf.co/pyannote/speaker-diarization-3.1
   - https://hf.co/pyannote/segmentation-3.0
 
+Optional:
+- Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology during Spanish-to-English translation.
+
 ## Run
 
 ### Windows batch launcher
@@ -51,7 +55,7 @@ Important:
 ```
 
 Notes:
-- This is still the manual one-off workflow from before.
+- This is the manual one-off workflow from before.
 - If `--input` is not provided, it opens a file picker.
 - If file picker is unavailable, it falls back to terminal input.
 - Watch mode is optional and only starts when you use `--watch`, `.\watch_recordings.bat`, or `.\start_recordings_watcher.bat`.
@@ -81,8 +85,8 @@ Stop the hidden background watcher:
 
 Notes:
 - Both launchers watch `%USERPROFILE%\OneDrive\recordings`.
-- They default to English transcription in `quality` mode.
-- Watch activity is appended to `%USERPROFILE%\OneDrive\recordings\transcriber-watcher.log`.
+- They default to auto language detection in `quality` mode.
+- Watch activity is appended to `<project>\logs\transcriber-watcher.log`.
 - `.\watch_recordings.bat` runs in the foreground, so stop it with `Ctrl+C`.
 
 ### CLI/module
@@ -91,7 +95,7 @@ Notes:
 python -m transcriber --input "C:\path\to\audio.mp3"
 ```
 
-or (after install via `pip install -e .`):
+or:
 
 ```powershell
 transcriber --input "C:\path\to\audio.mp3"
@@ -106,18 +110,18 @@ transcriber
 Watch mode from the CLI:
 
 ```powershell
-transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --lang en --mode quality
+transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --lang auto --mode quality
 ```
 
 ## Common command examples
 
-Quality mode (best default quality):
+Quality mode:
 
 ```powershell
 transcriber --input "C:\media\meeting.mp4" --mode quality
 ```
 
-Fast mode (lower latency, diarization off by default):
+Fast mode:
 
 ```powershell
 transcriber --input "C:\media\meeting.mp4" --mode fast
@@ -126,13 +130,13 @@ transcriber --input "C:\media\meeting.mp4" --mode fast
 Spanish transcript:
 
 ```powershell
-transcriber --input "C:\media\call.wav" --lang es --task transcribe
+transcriber --input "C:\media\call.wav" --lang es
 ```
 
 Spanish audio translated to English:
 
 ```powershell
-transcriber --input "C:\media\call.wav" --lang es --task translate
+transcriber --input "C:\media\call.wav" --lang auto
 ```
 
 Force no diarization:
@@ -150,20 +154,26 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 ## Runtime behavior
 
 - Output files are written next to the input media file.
+- Logs are written under `<project>\logs\`.
 - Watch mode monitors the top level of the watched folder for supported media files.
 - Watch mode waits for a file to stop changing before transcription starts.
 - Watch mode skips files that already have an up-to-date `.srt` next to them.
 - Default mode presets:
   - `quality`: model `large-v3`, diarization on by default
   - `fast`: model `medium`, diarization off by default
+- Language is auto-detected unless you force `--lang en` or `--lang es`.
+- If the detected language is Spanish, the transcript is translated to English text after transcription.
+- When diarization is enabled, short speaker blips are smoothed by default.
+- Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
 
 ## CLI options
 
 ```text
 --input, -i        Path to audio/video file
---lang             en | es
---task             transcribe | translate
+--lang             auto | en | es
+--glossary         Glossary entry: 'source=target' or 'source' to preserve (repeatable)
+--glossary-file    Glossary text file (one entry per line)
 --mode             quality | fast
 --model            Override model name
 --device           Default: cuda
@@ -174,6 +184,15 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 --settle-seconds   Delay after file changes before watch mode starts a run
 --diarize          Force diarization on
 --no-diarize       Force diarization off
+--no-diarize-smoothing     Disable speaker diarization smoothing
+--min-speaker-turn-ms      Minimum speaker turn duration for smoothing
+--min-speaker-turn-tokens  Minimum speaker turn size (in tokens) for smoothing
+--confidence-cleanup       Enable low-confidence cleanup (default)
+--no-confidence-cleanup    Disable low-confidence cleanup
+--confidence-cleanup-mode  mark | redact
+--low-confidence-logprob   Avg logprob threshold for low confidence
+--high-no-speech-prob      No-speech probability threshold
+--low-confidence-word-prob Word confidence threshold
 ```
 
 ## Troubleshooting
@@ -189,4 +208,4 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
   - Confirm the token belongs to that same HF account.
 
 - No `.srt` created
-  - Check `*_whisperx.log` next to your media for the underlying error.
+  - Check `logs\\*_whisperx.log` in the project folder for the underlying error.

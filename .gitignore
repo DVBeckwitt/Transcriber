@@ -2,3 +2,5 @@
 HF_TOKEN.txt
 hf_token.txt
 .tmp_transcriber_temp/
+logs/
+*.log
