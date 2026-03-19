@@ -1,7 +1,7 @@
 # Transcriber
 
 Local WhisperX launcher for fast transcription from audio/video files.
-It transcribes first, then translates Spanish transcripts to English as a separate text pass.
+It can transcribe first, or ask WhisperX to translate directly into English output when you want an English SRT from Spanish audio.
 
 It generates:
 - `your_file.srt` subtitle transcript
@@ -46,6 +46,7 @@ Important:
 Optional:
 - Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology during Spanish-to-English translation.
 - Add `--asr-prompt` or `--asr-prompt-file` to bias WhisperX toward names and jargon during transcription.
+- Add `--translate-to-english` to use WhisperX translation mode so the `.srt` is written in English directly instead of generating a Spanish SRT first.
 - Use `--temperature-schedule`, `--best-of`, `--logprob-threshold`, and related options to control decode fallbacks.
 
 ## Run
@@ -129,10 +130,10 @@ Fast mode:
 transcriber --input "C:\media\meeting.mp4" --mode fast
 ```
 
-Spanish transcript:
+Spanish source audio with direct English SRT output:
 
 ```powershell
-transcriber --input "C:\media\call.wav" --lang es
+transcriber --input "C:\media\call.wav" --lang es --translate-to-english
 ```
 
 Spanish audio translated to English:
@@ -168,7 +169,8 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
   - `quality`: model `large-v3`, diarization on by default
   - `fast`: model `medium`, diarization off by default
 - Language is auto-detected unless you force `--lang en` or `--lang es`.
-- If the detected language is Spanish, the transcript is translated to English text after transcription.
+- If you pass `--translate-to-english`, WhisperX writes English subtitle text directly.
+- If the detected language is Spanish and `--translate-to-english` is not set, the launcher falls back to the existing post-translation step.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
@@ -182,6 +184,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 --glossary-file    Glossary text file (one entry per line)
 --asr-prompt       Optional text prompt to bias WhisperX toward names and jargon
 --asr-prompt-file  Text file with extra ASR prompt lines
+--translate-to-english  Use WhisperX translation mode to write English subtitles directly
 --temperature      Single decoding temperature
 --temperature-schedule  Comma-separated fallback temperatures
 --best-of          Sampling candidates when temperature is above 0

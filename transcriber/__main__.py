@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 MEDIA_FILTER = (
     "Audio/Video",
-    "*.wav *.mp3 *.m4a *.flac *.aac *.ogg *.wma *.mp4 *.mov *.mkv *.webm",
+    "*.wav *.mp3 *.m4a *.flac *.aac *.ogg *.opus *.wma *.mp4 *.mov *.mkv *.webm",
 )
 MEDIA_EXTENSIONS = {
     ".wav",
@@ -31,6 +31,7 @@ MEDIA_EXTENSIONS = {
     ".flac",
     ".aac",
     ".ogg",
+    ".opus",
     ".wma",
     ".mp4",
     ".mov",
@@ -65,7 +66,6 @@ UNCERTAIN_MARKER_RE = re.compile(
     r"__UNCERTAIN(?:_(\d+))?__(.*?)__UNCERTAIN_END__",
     re.DOTALL,
 )
-ENABLE_TRANSLATION = False
 UNCERTAIN_MARKER_NOISE_HINTS = (
     "uncert",
     "cerain",
@@ -1502,6 +1502,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Text file with extra ASR prompt lines for names and jargon.",
     )
     parser.add_argument(
+        "--translate-to-english",
+        action="store_true",
+        help="Use WhisperX translate mode so English SRT output is written directly.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         help="Single decoding temperature. Overrides the preset temperature schedule.",
@@ -1850,9 +1855,11 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         prompt_file=args.asr_prompt_file,
     )
 
+    translate_to_english = bool(args.translate_to_english) or language == "es"
+
     return RunConfig(
         language=language,
-        translate_to_english=language == "es",
+        translate_to_english=translate_to_english,
         mode=mode,
         model=model or "large-v3",
         batch_size=batch_size,
@@ -2098,13 +2105,14 @@ def run_whisperx_direct(
         torch = None
 
     whisper_language = None if cfg.language == "auto" else cfg.language
+    whisper_task = "translate" if cfg.translate_to_english else "transcribe"
 
     print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...")
     asr_options = {"beam_size": cfg.beam_size, "patience": cfg.patience}
     load_model_kwargs: dict[str, Any] = {
         "device": cfg.device,
         "compute_type": cfg.compute_type,
-        "task": "transcribe",
+        "task": whisper_task,
         "asr_options": asr_options,
         "vad_method": "silero",
     }
@@ -2118,7 +2126,7 @@ def run_whisperx_direct(
     print("[transcriber] Transcribing audio...")
     transcribe_kwargs: dict[str, Any] = {
         "batch_size": cfg.batch_size,
-        "task": "transcribe",
+        "task": whisper_task,
         "temperature": cfg.temperature_schedule or cfg.temperature,
         "print_progress": False,
         "condition_on_previous_text": cfg.condition_on_previous_text,
@@ -2141,9 +2149,10 @@ def run_whisperx_direct(
 
     detected_language = str(result.get("language") or "").strip().lower() or None
 
-    print(f"[transcriber] Aligning words for language={(detected_language or whisper_language or 'en')}...")
+    align_language = "en" if cfg.translate_to_english else (detected_language or whisper_language or "en")
+    print(f"[transcriber] Aligning words for language={align_language}...")
     try:
-        language_code = detected_language or whisper_language or "en"
+        language_code = align_language
         align_model, metadata = call_with_supported_kwargs(
             whisperx.load_align_model,
             language_code=language_code,
@@ -2223,9 +2232,12 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
     report(f'OutDir:    "{outputs.output_dir}"')
     report(f"Lang:      {cfg.language}")
     if cfg.language == "auto":
-        report("Translate: auto (Spanish -> English when detected)")
+        if cfg.translate_to_english:
+            report("Translate: whisperx (direct English output)")
+        else:
+            report("Translate: auto (Spanish -> English when detected)")
     else:
-        report(f"Translate: {'on' if cfg.translate_to_english else 'off'}")
+        report(f"Translate: {'whisperx direct' if cfg.translate_to_english else 'off'}")
     report(f"Mode:      {cfg.mode}")
     report(f"Model:     {cfg.model}")
     report(f'Diarize:   {"on" if cfg.diarize else "off"}')
@@ -2332,9 +2344,7 @@ def transcribe_file(
                 break
 
         if outputs.srt_path.exists():
-            should_translate = ENABLE_TRANSLATION and (
-                cfg.translate_to_english or (cfg.language == "auto" and detected_language == "es")
-            )
+            should_translate = (not cfg.translate_to_english) and cfg.language == "auto" and detected_language == "es"
             if cfg.language == "auto":
                 report(f"Detected language: {detected_language or 'unknown'}.")
             if should_translate:

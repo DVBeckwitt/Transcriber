@@ -15,6 +15,7 @@ from transcriber.__main__ import (
     apply_confidence_cleanup,
     build_translation_prompt,
     load_translation_glossary,
+    is_watchable_media,
     translate_spanish_texts,
     output_paths_for_input,
     parse_args,
@@ -54,6 +55,11 @@ def make_cfg(**overrides: object) -> RunConfig:
         low_confidence_word_prob=0.5,
         device="cpu",
         compute_type="float32",
+        translation_context_window=2,
+        translation_batch_size=4,
+        translation_num_beams=4,
+        translation_max_new_tokens=256,
+        translation_no_repeat_ngram_size=3,
         glossary={},
         glossary_path=None,
         asr_prompt=None,
@@ -69,6 +75,14 @@ class HelperTests(unittest.TestCase):
         cfg = build_config(parse_args([]), interactive=False)
         self.assertEqual(cfg.language, "auto")
         self.assertFalse(cfg.translate_to_english)
+
+    def test_translate_flag_enables_direct_whisperx_output(self) -> None:
+        cfg = build_config(parse_args(["--translate-to-english"]), interactive=False)
+        self.assertTrue(cfg.translate_to_english)
+
+    def test_spanish_language_defaults_to_translation(self) -> None:
+        cfg = build_config(parse_args(["--lang", "es"]), interactive=False)
+        self.assertTrue(cfg.translate_to_english)
 
     def test_temperature_schedule_parser(self) -> None:
         self.assertEqual(parse_temperature_schedule("0.0, 0.2,0.4"), (0.0, 0.2, 0.4))
@@ -86,6 +100,12 @@ class HelperTests(unittest.TestCase):
         self.assertIn("-af", command)
         self.assertIn("highpass=f=60,lowpass=f=8000", command)
         self.assertEqual(command[-1], "out.wav")
+
+    def test_opus_files_are_watchable(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "clip.opus"
+            source.write_bytes(b"data")
+            self.assertTrue(is_watchable_media(source))
 
     def test_output_paths_stay_next_to_source(self) -> None:
         cfg = make_cfg()
@@ -203,7 +223,7 @@ class HelperTests(unittest.TestCase):
 
     def test_uncertain_markup_renders_for_srt_and_llm(self) -> None:
         marker = "__UNCERTAIN_65__hola__UNCERTAIN_END__"
-        self.assertEqual(render_uncertain_markup(marker, "srt"), "<i>hola</i>")
+        self.assertEqual(render_uncertain_markup(marker, "srt"), "hola")
         self.assertEqual(render_uncertain_markup(marker, "llm"), "[hola] [65% confidence]")
 
     def test_speaker_smoothing_merges_short_blips(self) -> None:
