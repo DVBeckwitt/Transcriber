@@ -45,6 +45,8 @@ Important:
 
 Optional:
 - Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology during Spanish-to-English translation.
+- Add `--asr-prompt` or `--asr-prompt-file` to bias WhisperX toward names and jargon during transcription.
+- Use `--temperature-schedule`, `--best-of`, `--logprob-threshold`, and related options to control decode fallbacks.
 
 ## Run
 
@@ -155,6 +157,10 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 
 - Output files are written next to the input media file.
 - Logs are written under `<project>\logs\`.
+- Before transcription, inputs are normalized into a temporary mono 16 kHz WAV with a light speech-band filter.
+- If preprocessing fails, the launcher falls back to the original source file.
+- WhisperX receives an initial prompt built from `--asr-prompt`, `--asr-prompt-file`, and glossary terms when present.
+- Quality mode uses a fallback temperature schedule by default; fast mode uses a single-pass decode.
 - Watch mode monitors the top level of the watched folder for supported media files.
 - Watch mode waits for a file to stop changing before transcription starts.
 - Watch mode skips files that already have an up-to-date `.srt` next to them.
@@ -174,6 +180,15 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 --lang             auto | en | es
 --glossary         Glossary entry: 'source=target' or 'source' to preserve (repeatable)
 --glossary-file    Glossary text file (one entry per line)
+--asr-prompt       Optional text prompt to bias WhisperX toward names and jargon
+--asr-prompt-file  Text file with extra ASR prompt lines
+--temperature      Single decoding temperature
+--temperature-schedule  Comma-separated fallback temperatures
+--best-of          Sampling candidates when temperature is above 0
+--compression-ratio-threshold  Compression-ratio fallback threshold
+--logprob-threshold  Avg logprob fallback threshold
+--no-speech-threshold  No-speech fallback threshold
+--condition-on-previous-text / --no-condition-on-previous-text
 --mode             quality | fast
 --model            Override model name
 --device           Default: cuda

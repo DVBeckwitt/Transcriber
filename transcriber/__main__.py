@@ -13,6 +13,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,6 +92,12 @@ class RunConfig:
     beam_size: int
     patience: float
     temperature: float
+    temperature_schedule: tuple[float, ...]
+    best_of: int | None
+    compression_ratio_threshold: float | None
+    logprob_threshold: float | None
+    no_speech_threshold: float | None
+    condition_on_previous_text: bool
     diarize: bool
     diarize_smoothing: bool
     min_speaker_turn_ms: int
@@ -104,6 +111,7 @@ class RunConfig:
     compute_type: str
     glossary: dict[str, str]
     glossary_path: str | None
+    asr_prompt: str | None
     dry_run: bool
 
 
@@ -929,6 +937,22 @@ def load_translation_glossary(glossary_spec: str | None) -> dict[str, str]:
     return {}
 
 
+def load_text_lines_file(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        return []
+
+    lines: list[str] = []
+    for line in raw.splitlines():
+        cleaned = normalize_subtitle_whitespace(line)
+        if cleaned and not cleaned.startswith("#"):
+            lines.append(cleaned)
+    return lines
+
+
 def looks_like_glossary_file(value: str) -> bool:
     if any(sep in value for sep in ("=>", "->", "=", "|", "\t")):
         return False
@@ -1024,6 +1048,52 @@ def log_translation_prompt(log_path: Path, prompt: str) -> None:
         log.write("\n[transcriber] Translation prompt:\n")
         for line in prompt.splitlines():
             log.write(f"[transcriber] {line}\n")
+
+
+def build_asr_prompt(
+    *,
+    glossary: dict[str, str],
+    prompt_text: str | None = None,
+    prompt_file: str | None = None,
+    max_glossary_terms: int = 32,
+) -> str | None:
+    lines: list[str] = []
+
+    if prompt_file:
+        lines.extend(load_text_lines_file(Path(prompt_file).expanduser()))
+
+    if prompt_text:
+        for line in prompt_text.splitlines():
+            cleaned = normalize_subtitle_whitespace(line)
+            if cleaned:
+                lines.append(cleaned)
+
+    if glossary:
+        lines.append("Use these names, product names, and jargon exactly as written:")
+        for source, target in sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True)[:max_glossary_terms]:
+            if source == target:
+                lines.append(f"- {source}")
+            else:
+                lines.append(f"- {source} (preferred spelling: {target})")
+
+    prompt = "\n".join(line for line in lines if line.strip()).strip()
+    return prompt or None
+
+
+def parse_temperature_schedule(value: str | None) -> tuple[float, ...]:
+    if not value:
+        return ()
+
+    temperatures: list[float] = []
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        temperatures.append(float(item))
+
+    if not temperatures:
+        raise ValueError("Temperature schedule must contain at least one value.")
+    return tuple(temperatures)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1261,6 +1331,58 @@ def configure_temp_dir(base_dir: Path) -> Path:
     )
 
 
+def build_audio_preprocess_command(input_path: Path, output_path: Path) -> list[str]:
+    return [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-af",
+        "highpass=f=60,lowpass=f=8000",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path),
+    ]
+
+
+def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Reporter = print) -> Path:
+    output_path = temp_dir / f"{input_path.stem}.preprocessed.wav"
+    command = build_audio_preprocess_command(input_path, output_path)
+
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        report("[transcriber] ffmpeg not found; using the original input audio.")
+        return input_path
+    except subprocess.CalledProcessError as exc:
+        detail = f": {exc.stderr.strip()}" if exc.stderr and exc.stderr.strip() else ""
+        report(f"[transcriber] Audio preprocessing failed; using the original input audio{detail}")
+        with contextlib.suppress(OSError):
+            output_path.unlink()
+        return input_path
+    except Exception as exc:
+        report(f"[transcriber] Audio preprocessing failed; using the original input audio: {exc}")
+        with contextlib.suppress(OSError):
+            output_path.unlink()
+        return input_path
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        report("[transcriber] Audio preprocessing produced no output; using the original input audio.")
+        with contextlib.suppress(OSError):
+            output_path.unlink()
+        return input_path
+
+    return output_path
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="WhisperX one-click transcriber (quality + fast modes).")
     parser.add_argument("legacy", nargs="*", help="Legacy tokens: [language] [model] [mode]")
@@ -1277,6 +1399,56 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help=(
             "Glossary text file (one entry per line). Lines can use 'source => target', tab-separated pairs, or 'source | target'."
         ),
+    )
+    parser.add_argument(
+        "--asr-prompt",
+        help="Optional text prompt to bias WhisperX toward names and jargon.",
+    )
+    parser.add_argument(
+        "--asr-prompt-file",
+        help="Text file with extra ASR prompt lines for names and jargon.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help="Single decoding temperature. Overrides the preset temperature schedule.",
+    )
+    parser.add_argument(
+        "--temperature-schedule",
+        help="Comma-separated fallback temperatures, e.g. 0.0,0.2,0.4. Overrides --temperature.",
+    )
+    parser.add_argument(
+        "--best-of",
+        type=int,
+        help="Sampling candidates when temperature is above 0.",
+    )
+    parser.add_argument(
+        "--compression-ratio-threshold",
+        type=float,
+        help="Fallback when output compression ratio exceeds this value.",
+    )
+    parser.add_argument(
+        "--logprob-threshold",
+        type=float,
+        help="Fallback when average log probability drops below this value.",
+    )
+    parser.add_argument(
+        "--no-speech-threshold",
+        type=float,
+        help="Fallback when no-speech probability exceeds this value.",
+    )
+    parser.add_argument(
+        "--condition-on-previous-text",
+        dest="condition_on_previous_text",
+        action="store_true",
+        default=None,
+        help="Condition each decode window on the previous text.",
+    )
+    parser.add_argument(
+        "--no-condition-on-previous-text",
+        dest="condition_on_previous_text",
+        action="store_false",
+        help="Decode each window without conditioning on previous text.",
     )
     parser.add_argument("--mode", choices=("quality", "fast"), help="Run mode preset: quality or fast.")
     parser.add_argument("--model", help="Whisper model name, e.g. large-v3, medium.")
@@ -1501,6 +1673,12 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         beam_size = 2
         patience = 1.0
         temperature = 0.0
+        temperature_schedule = (0.0,)
+        best_of = 1
+        compression_ratio_threshold = 2.4
+        logprob_threshold = -1.0
+        no_speech_threshold = 0.6
+        condition_on_previous_text = False
         diarize_default = False
     else:
         if not model_locked:
@@ -1509,7 +1687,36 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         beam_size = 8
         patience = 1.2
         temperature = 0.0
+        temperature_schedule = (0.0, 0.2, 0.4, 0.6, 0.8)
+        best_of = 5
+        compression_ratio_threshold = 2.4
+        logprob_threshold = -1.0
+        no_speech_threshold = 0.6
+        condition_on_previous_text = True
         diarize_default = True
+
+    if args.temperature is not None:
+        temperature = float(args.temperature)
+        temperature_schedule = (temperature,)
+
+    try:
+        override_schedule = parse_temperature_schedule(args.temperature_schedule)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if override_schedule:
+        temperature_schedule = override_schedule
+        temperature = override_schedule[0]
+
+    if args.best_of is not None:
+        best_of = max(1, int(args.best_of))
+    if args.compression_ratio_threshold is not None:
+        compression_ratio_threshold = float(args.compression_ratio_threshold)
+    if args.logprob_threshold is not None:
+        logprob_threshold = float(args.logprob_threshold)
+    if args.no_speech_threshold is not None:
+        no_speech_threshold = float(args.no_speech_threshold)
+    if args.condition_on_previous_text is not None:
+        condition_on_previous_text = bool(args.condition_on_previous_text)
 
     if args.force_diarize:
         diarize = True
@@ -1534,6 +1741,11 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         file_entries.extend(load_glossary_file(glossary_file))
     glossary = parse_glossary_entries([*file_entries, *glossary_entries])
     glossary_path = str(glossary_files[0]) if glossary_files else None
+    asr_prompt = build_asr_prompt(
+        glossary=glossary,
+        prompt_text=args.asr_prompt,
+        prompt_file=args.asr_prompt_file,
+    )
 
     return RunConfig(
         language=language,
@@ -1544,6 +1756,12 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         beam_size=beam_size,
         patience=patience,
         temperature=temperature,
+        temperature_schedule=temperature_schedule,
+        best_of=best_of,
+        compression_ratio_threshold=compression_ratio_threshold,
+        logprob_threshold=logprob_threshold,
+        no_speech_threshold=no_speech_threshold,
+        condition_on_previous_text=condition_on_previous_text,
         diarize=diarize,
         diarize_smoothing=diarize_smoothing,
         min_speaker_turn_ms=max(0, int(args.min_speaker_turn_ms)),
@@ -1557,6 +1775,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         compute_type=args.compute_type,
         glossary=glossary,
         glossary_path=glossary_path,
+        asr_prompt=asr_prompt,
         dry_run=bool(args.dry_run),
     )
 
@@ -1792,9 +2011,20 @@ def run_whisperx_direct(
     transcribe_kwargs: dict[str, Any] = {
         "batch_size": cfg.batch_size,
         "task": "transcribe",
-        "temperature": cfg.temperature,
+        "temperature": cfg.temperature_schedule or cfg.temperature,
         "print_progress": False,
+        "condition_on_previous_text": cfg.condition_on_previous_text,
     }
+    if cfg.asr_prompt:
+        transcribe_kwargs["initial_prompt"] = cfg.asr_prompt
+    if cfg.best_of is not None:
+        transcribe_kwargs["best_of"] = cfg.best_of
+    if cfg.compression_ratio_threshold is not None:
+        transcribe_kwargs["compression_ratio_threshold"] = cfg.compression_ratio_threshold
+    if cfg.logprob_threshold is not None:
+        transcribe_kwargs["logprob_threshold"] = cfg.logprob_threshold
+    if cfg.no_speech_threshold is not None:
+        transcribe_kwargs["no_speech_threshold"] = cfg.no_speech_threshold
     if whisper_language:
         transcribe_kwargs["language"] = whisper_language
     result = call_with_supported_kwargs(model.transcribe, audio, **transcribe_kwargs)
@@ -1898,6 +2128,17 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
     )
     if cfg.glossary_path:
         report(f'Glossary:  "{cfg.glossary_path}"')
+    if cfg.asr_prompt:
+        report("ASRPrompt: on")
+    report(
+        "Decode:    "
+        f"temps={','.join(f'{temp:g}' for temp in cfg.temperature_schedule) if cfg.temperature_schedule else f'{cfg.temperature:g}'} "
+        f"best_of={cfg.best_of if cfg.best_of is not None else 'auto'} "
+        f"cr={cfg.compression_ratio_threshold if cfg.compression_ratio_threshold is not None else 'auto'} "
+        f"logprob={cfg.logprob_threshold if cfg.logprob_threshold is not None else 'auto'} "
+        f"no_speech={cfg.no_speech_threshold if cfg.no_speech_threshold is not None else 'auto'} "
+        f"prev_text={'on' if cfg.condition_on_previous_text else 'off'}"
+    )
     if cfg.dry_run:
         report("DryRun:    on")
     report("")
@@ -1951,31 +2192,36 @@ def transcribe_file(
                 report("")
                 return 1
 
-        attempt = 0
-        while True:
-            rc, detected_language = run_whisperx_direct_logged(
-                cfg,
-                input_path,
-                outputs.srt_path,
-                hf_token,
-                diarize=current_diarize,
-                log_path=outputs.log_path,
-                append=attempt > 0,
-            )
-            if rc == 0:
+        with tempfile.TemporaryDirectory(prefix="transcriber-audio-") as temp_audio_dir:
+            prepared_input = preprocess_audio_for_whisperx(input_path, Path(temp_audio_dir), report=report)
+            if prepared_input != input_path:
+                report(f'Audio preprocessing: "{prepared_input}"')
+
+            attempt = 0
+            while True:
+                rc, detected_language = run_whisperx_direct_logged(
+                    cfg,
+                    prepared_input,
+                    outputs.srt_path,
+                    hf_token,
+                    diarize=current_diarize,
+                    log_path=outputs.log_path,
+                    append=attempt > 0,
+                )
+                if rc == 0:
+                    break
+
+                if current_diarize and should_fallback_without_diarization(outputs.log_path):
+                    fallback_no_diarize = True
+                    current_diarize = False
+                    report("")
+                    report("Diarization unavailable or blocked. Retrying without diarization...")
+                    with outputs.log_path.open("a", encoding="utf-8", errors="ignore") as log:
+                        log.write("\n[transcriber] Diarization unavailable or blocked; retrying without --diarize.\n")
+                    attempt += 1
+                    continue
+
                 break
-
-            if current_diarize and should_fallback_without_diarization(outputs.log_path):
-                fallback_no_diarize = True
-                current_diarize = False
-                report("")
-                report("Diarization unavailable or blocked. Retrying without diarization...")
-                with outputs.log_path.open("a", encoding="utf-8", errors="ignore") as log:
-                    log.write("\n[transcriber] Diarization unavailable or blocked; retrying without --diarize.\n")
-                attempt += 1
-                continue
-
-            break
 
         if outputs.srt_path.exists():
             should_translate = cfg.translate_to_english or (cfg.language == "auto" and detected_language == "es")

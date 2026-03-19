@@ -5,16 +5,19 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from transcriber.__main__ import (
+    build_audio_preprocess_command,
+    build_asr_prompt,
+    build_config,
     RunConfig,
     SRTCue,
     TimedToken,
     apply_confidence_cleanup,
-    build_config,
     build_translation_prompt,
     load_translation_glossary,
     output_paths_for_input,
     parse_args,
     parse_glossary_entries,
+    parse_temperature_schedule,
     project_dir,
     render_uncertain_markup,
     smooth_timed_tokens,
@@ -32,6 +35,12 @@ def make_cfg(**overrides: object) -> RunConfig:
         beam_size=8,
         patience=1.2,
         temperature=0.0,
+        temperature_schedule=(0.0, 0.2, 0.4, 0.6, 0.8),
+        best_of=5,
+        compression_ratio_threshold=2.4,
+        logprob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        condition_on_previous_text=True,
         diarize=True,
         diarize_smoothing=True,
         min_speaker_turn_ms=900,
@@ -45,6 +54,7 @@ def make_cfg(**overrides: object) -> RunConfig:
         compute_type="float32",
         glossary={},
         glossary_path=None,
+        asr_prompt=None,
         dry_run=False,
     )
     for key, value in overrides.items():
@@ -57,6 +67,22 @@ class HelperTests(unittest.TestCase):
         cfg = build_config(parse_args([]), interactive=False)
         self.assertEqual(cfg.language, "auto")
         self.assertFalse(cfg.translate_to_english)
+
+    def test_temperature_schedule_parser(self) -> None:
+        self.assertEqual(parse_temperature_schedule("0.0, 0.2,0.4"), (0.0, 0.2, 0.4))
+
+    def test_audio_preprocess_command_targets_mono_wav(self) -> None:
+        command = build_audio_preprocess_command(Path("in.mp4"), Path("out.wav"))
+
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("-vn", command)
+        self.assertIn("-ac", command)
+        self.assertIn("1", command)
+        self.assertIn("-ar", command)
+        self.assertIn("16000", command)
+        self.assertIn("-af", command)
+        self.assertIn("highpass=f=60,lowpass=f=8000", command)
+        self.assertEqual(command[-1], "out.wav")
 
     def test_output_paths_stay_next_to_source(self) -> None:
         cfg = make_cfg()
@@ -80,6 +106,30 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(glossary["termino"], "termino")
         self.assertIn("__CUR_START__", prompt)
         self.assertIn("Glossary:", prompt)
+
+    def test_asr_prompt_includes_glossary_and_file_terms(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            prompt_file = Path(tmpdir) / "asr.txt"
+            prompt_file.write_text("Project Falcon\n# comment\nAcmeOS\n", encoding="utf-8")
+
+            glossary = parse_glossary_entries(["OpenAI => OpenAI", "WhisperX => WhisperX"])
+            prompt = build_asr_prompt(
+                glossary=glossary,
+                prompt_text="Use exact spellings.",
+                prompt_file=str(prompt_file),
+            )
+
+            self.assertIsNotNone(prompt)
+            self.assertIn("Project Falcon", prompt or "")
+            self.assertIn("AcmeOS", prompt or "")
+            self.assertIn("Use exact spellings.", prompt or "")
+            self.assertIn("OpenAI", prompt or "")
+            self.assertIn("WhisperX", prompt or "")
+
+    def test_temperature_override_sets_single_value(self) -> None:
+        cfg = build_config(parse_args(["--temperature", "0.3"]), interactive=False)
+        self.assertEqual(cfg.temperature, 0.3)
+        self.assertEqual(cfg.temperature_schedule, (0.3,))
 
     def test_glossary_file_loader(self) -> None:
         with TemporaryDirectory() as tmpdir:
