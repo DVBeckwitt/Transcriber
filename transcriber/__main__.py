@@ -65,6 +65,26 @@ UNCERTAIN_MARKER_RE = re.compile(
     r"__UNCERTAIN(?:_(\d+))?__(.*?)__UNCERTAIN_END__",
     re.DOTALL,
 )
+ENABLE_TRANSLATION = False
+UNCERTAIN_MARKER_NOISE_HINTS = (
+    "uncert",
+    "cerain",
+    "ciert",
+    "certain",
+    "end",
+)
+UNCERTAIN_MARKER_NOISE_WORDS = {
+    "uncertain",
+    "uncerain",
+    "uncertaint",
+    "uncierta",
+    "certain",
+    "certaint",
+    "cierta",
+    "ccertain",
+    "end",
+    "un",
+}
 
 DEFAULT_MIN_SPEAKER_TURN_MS = 900
 DEFAULT_MIN_SPEAKER_TURN_TOKENS = 2
@@ -112,6 +132,11 @@ class RunConfig:
     low_confidence_word_prob: float
     device: str
     compute_type: str
+    translation_context_window: int
+    translation_batch_size: int
+    translation_num_beams: int
+    translation_max_new_tokens: int
+    translation_no_repeat_ngram_size: int
     glossary: dict[str, str]
     glossary_path: str | None
     asr_prompt: str | None
@@ -608,14 +633,42 @@ def render_uncertain_markup(text: str, style: str) -> str:
         pct = match.group(1)
         inner = normalize_subtitle_whitespace(match.group(2))
         if style == "srt":
-            return f"<i>{inner}</i>"
+            return inner
         if style == "llm":
             if pct:
                 return f"[{inner}] [{pct}% confidence]"
             return f"[{inner}]"
         return inner
 
-    return UNCERTAIN_MARKER_RE.sub(replace, text)
+    updated = UNCERTAIN_MARKER_RE.sub(replace, text)
+    if style == "srt":
+        updated = strip_uncertain_marker_noise(updated)
+        return normalize_subtitle_whitespace(updated)
+    return updated
+
+
+def strip_uncertain_marker_noise(text: str) -> str:
+    if not text:
+        return text
+
+    def clean_token(token: str) -> str:
+        low = token.lower()
+        if not ("__" in token or ("_" in token and any(hint in low for hint in UNCERTAIN_MARKER_NOISE_HINTS))):
+            return token
+
+        parts = re.split(r"_+", token)
+        kept: list[str] = []
+        for part in parts:
+            cleaned = re.sub(r"[^a-z]+", "", part.lower())
+            if not cleaned:
+                continue
+            if cleaned.isdigit() or cleaned in UNCERTAIN_MARKER_NOISE_WORDS:
+                continue
+            kept.append(part)
+        return " ".join(kept)
+
+    cleaned = " ".join(filter(None, (clean_token(token) for token in text.split())))
+    return normalize_subtitle_whitespace(cleaned)
 
 
 def smooth_timed_tokens(
@@ -1114,7 +1167,14 @@ def chunked_text(items: Sequence[str], size: int) -> Iterable[list[str]]:
         yield list(items[idx : idx + size])
 
 
-def translate_spanish_texts(texts: Sequence[str], device: str, batch_size: int = 4) -> list[str]:
+def translate_spanish_texts(
+    texts: Sequence[str],
+    device: str,
+    batch_size: int = 4,
+    num_beams: int = TRANSLATION_NUM_BEAMS,
+    max_new_tokens: int = 256,
+    no_repeat_ngram_size: int = TRANSLATION_NO_REPEAT_NGRAM_SIZE,
+) -> list[str]:
     if not texts:
         return []
 
@@ -1147,10 +1207,10 @@ def translate_spanish_texts(texts: Sequence[str], device: str, batch_size: int =
         with torch.no_grad() if torch is not None else contextlib.nullcontext():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=256,
-                num_beams=TRANSLATION_NUM_BEAMS,
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
                 length_penalty=TRANSLATION_LENGTH_PENALTY,
-                no_repeat_ngram_size=TRANSLATION_NO_REPEAT_NGRAM_SIZE,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 early_stopping=True,
             )
         decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -1165,6 +1225,10 @@ def translate_srt_to_english(
     glossary: dict[str, str] | None = None,
     glossary_spec: str | None = None,
     context_window: int = TRANSLATION_CONTEXT_WINDOW,
+    batch_size: int = 4,
+    num_beams: int = TRANSLATION_NUM_BEAMS,
+    max_new_tokens: int = 256,
+    no_repeat_ngram_size: int = TRANSLATION_NO_REPEAT_NGRAM_SIZE,
     log_path: Path | None = None,
 ) -> None:
     if not srt_path.exists():
@@ -1204,7 +1268,14 @@ def translate_srt_to_english(
         source_blocks.append(protected_text)
         block_meta.append((prefix, placeholders, current_text))
 
-    translated_blocks = translate_spanish_texts(source_blocks, device=device)
+    translated_blocks = translate_spanish_texts(
+        source_blocks,
+        device=device,
+        batch_size=batch_size,
+        num_beams=num_beams,
+        max_new_tokens=max_new_tokens,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+    )
     if len(translated_blocks) != len(cues):
         raise RuntimeError("Translation produced an unexpected cue count.")
 
@@ -1214,7 +1285,14 @@ def translate_srt_to_english(
         translated_text = replace_glossary_placeholders(translated_block, placeholders)
         extracted = extract_between_markers(translated_text, TRANSLATION_MARKER_START, TRANSLATION_MARKER_END)
         if not extracted:
-            fallback = translate_spanish_texts([original], device=device, batch_size=1)[0]
+            fallback = translate_spanish_texts(
+                [original],
+                device=device,
+                batch_size=1,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+            )[0]
             extracted = replace_glossary_placeholders(fallback, placeholders)
         translated_text = normalize_subtitle_whitespace(extracted)
         if prefix:
@@ -1695,6 +1773,11 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         no_speech_threshold = 0.6
         condition_on_previous_text = False
         diarize_default = False
+        translation_context_window = TRANSLATION_CONTEXT_WINDOW
+        translation_batch_size = 4
+        translation_num_beams = TRANSLATION_NUM_BEAMS
+        translation_max_new_tokens = 256
+        translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
     else:
         if not model_locked:
             model = "large-v3"
@@ -1709,6 +1792,11 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         no_speech_threshold = 0.6
         condition_on_previous_text = True
         diarize_default = True
+        translation_context_window = TRANSLATION_CONTEXT_WINDOW
+        translation_batch_size = 4
+        translation_num_beams = TRANSLATION_NUM_BEAMS
+        translation_max_new_tokens = 256
+        translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
 
     if args.temperature is not None:
         temperature = float(args.temperature)
@@ -1788,6 +1876,11 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         low_confidence_word_prob=float(args.low_confidence_word_prob),
         device=args.device,
         compute_type=args.compute_type,
+        translation_context_window=translation_context_window,
+        translation_batch_size=translation_batch_size,
+        translation_num_beams=translation_num_beams,
+        translation_max_new_tokens=translation_max_new_tokens,
+        translation_no_repeat_ngram_size=translation_no_repeat_ngram_size,
         glossary=glossary,
         glossary_path=glossary_path,
         asr_prompt=asr_prompt,
@@ -2239,7 +2332,9 @@ def transcribe_file(
                 break
 
         if outputs.srt_path.exists():
-            should_translate = cfg.translate_to_english or (cfg.language == "auto" and detected_language == "es")
+            should_translate = ENABLE_TRANSLATION and (
+                cfg.translate_to_english or (cfg.language == "auto" and detected_language == "es")
+            )
             if cfg.language == "auto":
                 report(f"Detected language: {detected_language or 'unknown'}.")
             if should_translate:
@@ -2252,7 +2347,11 @@ def transcribe_file(
                         cfg.device,
                         glossary=cfg.glossary,
                         glossary_spec=cfg.glossary_path,
-                        context_window=TRANSLATION_CONTEXT_WINDOW,
+                        context_window=cfg.translation_context_window,
+                        batch_size=cfg.translation_batch_size,
+                        num_beams=cfg.translation_num_beams,
+                        max_new_tokens=cfg.translation_max_new_tokens,
+                        no_repeat_ngram_size=cfg.translation_no_repeat_ngram_size,
                         log_path=outputs.log_path,
                     )
                 except Exception as exc:
