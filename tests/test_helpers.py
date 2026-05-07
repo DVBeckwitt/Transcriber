@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import io
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import MagicMock, patch
@@ -16,6 +19,7 @@ from transcriber.__main__ import (
     build_translation_prompt,
     load_translation_glossary,
     is_watchable_media,
+    run_whisperx_direct_logged,
     translate_spanish_texts,
     output_paths_for_input,
     parse_args,
@@ -100,6 +104,37 @@ class HelperTests(unittest.TestCase):
         self.assertIn("-af", command)
         self.assertIn("highpass=f=60,lowpass=f=8000", command)
         self.assertEqual(command[-1], "out.wav")
+
+    @patch("transcriber.__main__.run_whisperx_direct")
+    def test_logged_whisperx_run_mirrors_progress_to_console_and_log(self, run_direct: MagicMock) -> None:
+        def fake_run(*_args: object, **_kwargs: object) -> str:
+            print("[transcriber] fake stdout progress")
+            print("[transcriber] fake stderr progress", file=sys.stderr)
+            return "en"
+
+        run_direct.side_effect = fake_run
+        with TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "run.log"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc, detected_language = run_whisperx_direct_logged(
+                    make_cfg(),
+                    Path("input.wav"),
+                    Path(tmpdir) / "output.srt",
+                    None,
+                    False,
+                    log_path,
+                )
+
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertEqual(rc, 0)
+            self.assertEqual(detected_language, "en")
+            self.assertIn("fake stdout progress", stdout.getvalue())
+            self.assertIn("fake stderr progress", stderr.getvalue())
+            self.assertIn("fake stdout progress", log_text)
+            self.assertIn("fake stderr progress", log_text)
 
     def test_opus_files_are_watchable(self) -> None:
         with TemporaryDirectory() as tmpdir:

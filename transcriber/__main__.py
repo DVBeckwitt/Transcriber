@@ -480,6 +480,25 @@ def resolve_whisperx_symbol(whisperx_module: Any, symbol_name: str) -> Any:
     )
 
 
+class TeeTextIO:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+            if "\n" in text or "\r" in text:
+                stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.streams[-1], name)
+
+
 def segment_is_low_confidence(
     segment: dict[str, Any],
     *,
@@ -2107,7 +2126,7 @@ def run_whisperx_direct(
     whisper_language = None if cfg.language == "auto" else cfg.language
     whisper_task = "translate" if cfg.translate_to_english else "transcribe"
 
-    print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...")
+    print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...", flush=True)
     asr_options = {"beam_size": cfg.beam_size, "patience": cfg.patience}
     load_model_kwargs: dict[str, Any] = {
         "device": cfg.device,
@@ -2120,15 +2139,15 @@ def run_whisperx_direct(
         load_model_kwargs["language"] = whisper_language
     model = call_with_supported_kwargs(whisperx.load_model, cfg.model, **load_model_kwargs)
 
-    print(f"[transcriber] Loading audio: {input_path}")
+    print(f"[transcriber] Loading audio: {input_path}", flush=True)
     audio = whisperx.load_audio(str(input_path))
 
-    print("[transcriber] Transcribing audio...")
+    print("[transcriber] Transcribing audio...", flush=True)
     transcribe_kwargs: dict[str, Any] = {
         "batch_size": cfg.batch_size,
         "task": whisper_task,
         "temperature": cfg.temperature_schedule or cfg.temperature,
-        "print_progress": False,
+        "print_progress": True,
         "condition_on_previous_text": cfg.condition_on_previous_text,
     }
     if cfg.asr_prompt:
@@ -2150,7 +2169,7 @@ def run_whisperx_direct(
     detected_language = str(result.get("language") or "").strip().lower() or None
 
     align_language = "en" if cfg.translate_to_english else (detected_language or whisper_language or "en")
-    print(f"[transcriber] Aligning words for language={align_language}...")
+    print(f"[transcriber] Aligning words for language={align_language}...", flush=True)
     try:
         language_code = align_language
         align_model, metadata = call_with_supported_kwargs(
@@ -2170,10 +2189,10 @@ def run_whisperx_direct(
         if not isinstance(result, dict):
             raise RuntimeError(f"Unexpected WhisperX alignment result type: {type(result)!r}")
     except Exception as exc:
-        print(f"[transcriber] Alignment failed; continuing without alignment: {exc}")
+        print(f"[transcriber] Alignment failed; continuing without alignment: {exc}", flush=True)
 
     if diarize:
-        print("[transcriber] Running diarization...")
+        print("[transcriber] Running diarization...", flush=True)
         diarization_pipeline = resolve_whisperx_symbol(whisperx, "DiarizationPipeline")
         with allow_trusted_checkpoint_loads():
             diarize_model = call_with_supported_kwargs(
@@ -2181,13 +2200,15 @@ def run_whisperx_direct(
                 use_auth_token=hf_token or "",
                 device=cfg.device,
             )
+            print("[transcriber] Diarization model loaded. Segmenting speakers...", flush=True)
             diarize_segments = call_with_supported_kwargs(diarize_model, audio)
+        print("[transcriber] Assigning speaker labels...", flush=True)
         assign_word_speakers = resolve_whisperx_symbol(whisperx, "assign_word_speakers")
         result = assign_word_speakers(diarize_segments, result)
 
     apply_confidence_cleanup(result, cfg)
 
-    print("[transcriber] Writing subtitle-sized SRT from in-memory timings...")
+    print("[transcriber] Writing subtitle-sized SRT from in-memory timings...", flush=True)
     write_direct_srt_from_result(result, srt_path, cfg)
 
     if torch is not None and getattr(torch, "cuda", None) is not None:
@@ -2208,8 +2229,10 @@ def run_whisperx_direct_logged(
 ) -> tuple[int, str | None]:
     mode = "a" if append else "w"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open(mode, encoding="utf-8", errors="ignore") as log:
-        with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+    with log_path.open(mode, encoding="utf-8", errors="ignore", buffering=1) as log:
+        stdout = TeeTextIO(log, sys.stdout)
+        stderr = TeeTextIO(log, sys.stderr)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
                 detected_language = run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
                 if detected_language is None:
