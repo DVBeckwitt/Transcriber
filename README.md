@@ -32,6 +32,12 @@ pip install -e .
 Use `uv` for repeatable local checks:
 
 ```powershell
+make validate
+```
+
+If `make` is not available on your Windows shell, run the underlying commands directly:
+
+```powershell
 uv sync
 uv run pytest -q
 uv run ruff check .
@@ -39,6 +45,8 @@ uv run ruff format --check .
 uv run mypy
 uv run python -m transcriber --help
 uv build
+uv run --with pip-audit pip-audit .
+uv run pre-commit run --all-files
 ```
 
 If the project `.venv` is locked by OneDrive or another process on Windows, point uv at a disposable local environment first:
@@ -58,12 +66,13 @@ Project workflow and governance:
 ## Current status
 
 - Agentic legibility: accepted. The repo now has `pyproject.toml` tool config, `uv.lock`, CI, generated-file ignore rules, and `AGENTS.md`.
-- Governance: accepted. Contributor workflow, PR checklist, CODEOWNERS, security policy, Dependabot, and architecture docs are in place.
+- Governance: accepted. Contributor workflow, PR checklist, issue templates, CODEOWNERS, security policy, Dependabot, and architecture docs are in place.
+- A+ hardening: shipped on 2026-05-11. `Makefile` validation, coverage gate, pre-commit hooks, and Gitleaks secret scanning are in place. This is a tooling/governance feature; public CLI behavior is unchanged.
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, and transcript merge collection were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
-- Release posture: local quality gates and dependency audit pass; deployment is a local CLI/tooling release. No migration is required. Rollback is `git revert` of the release commit.
+- Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/tooling release. No migration is required. Rollback is `git revert` of the release commit.
 
 ## Hugging Face token (for diarization)
 

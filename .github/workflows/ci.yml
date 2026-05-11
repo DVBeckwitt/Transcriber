@@ -26,28 +26,28 @@ jobs:
         run: python -m pip install uv
 
       - name: Sync dependencies
-        run: uv sync --locked
+        run: make sync
 
-      - name: Run tests
-        run: uv run pytest -q
+      - name: Run tests with coverage
+        run: make coverage
 
       - name: Run lint
-        run: uv run ruff check .
+        run: make lint
 
-      - name: Check formatting
-        run: uv run ruff format --check .
+      - name: Run format check
+        run: make format-check
 
-      - name: Run type check
-        run: uv run mypy
+      - name: Run typecheck
+        run: make typecheck
 
-      - name: Check CLI help
-        run: uv run python -m transcriber --help
+      - name: Check CLI entry point
+        run: make cli
 
       - name: Build package
-        run: uv build
+        run: make build
 
   security:
-    name: Python dependency audit
+    name: Security checks
     runs-on: ubuntu-latest
 
     steps:
@@ -66,4 +66,7 @@ jobs:
         run: uv sync --locked
 
       - name: Audit Python dependencies
-        run: uv run --with pip-audit pip-audit .
+        run: make audit
+
+      - name: Run pre-commit hooks
+        run: make hooks

@@ -1,0 +1,13 @@
+title = "Transcriber secret scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow documented placeholder tokens only."
+paths = [
+  '''HF_TOKEN\.example\.txt''',
+]
+regexes = [
+  '''hf_your_token_goes_here''',
+]

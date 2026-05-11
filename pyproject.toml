@@ -15,13 +15,24 @@ transcriber = "transcriber.__main__:main"
 [dependency-groups]
 dev = [
     "mypy>=1.18",
+    "pre-commit>=4.6.0",
     "pytest>=8.4",
+    "pytest-cov>=7.1.0",
     "ruff>=0.14",
 ]
 
 [tool.pytest.ini_options]
-addopts = "-ra -q"
+addopts = "-ra -q --cov=transcriber --cov=merge_transcripts --cov-report=term-missing"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["transcriber", "merge_transcripts"]
+
+[tool.coverage.report]
+fail_under = 34
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 120
@@ -45,4 +56,3 @@ py-modules = ["merge_transcripts"]
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
-

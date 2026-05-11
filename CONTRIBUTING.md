@@ -21,6 +21,12 @@ Use `feat`, `fix`, `docs`, `test`, `refactor`, or `chore`.
 Run the full gate before review:
 
 ```powershell
+make validate
+```
+
+If `make` is unavailable, run the same gates directly:
+
+```powershell
 uv sync --locked
 uv run pytest -q
 uv run ruff check .
@@ -28,6 +34,8 @@ uv run ruff format --check .
 uv run mypy
 uv run python -m transcriber --help
 uv build
+uv run --with pip-audit pip-audit .
+uv run pre-commit run --all-files
 ```
 
 If OneDrive or another process locks the default `.venv`, keep this set for the shell session:
@@ -43,6 +51,7 @@ $env:UV_PROJECT_ENVIRONMENT = ".uv-venv"
 - Docs describe user-visible behavior and rollback notes.
 - Generated files are absent from the diff.
 - Secrets are absent from the diff.
+- Coverage, dependency audit, and secret scan pass.
 - CI passes before merge.
 
 ## Generated Files And Secrets

@@ -32,7 +32,7 @@ build_watch_targets
 - `merge_transcripts.py`: standalone text utility for recursively merging transcript `.txt` files while skipping token files and generated/cache directories.
 - `tests/test_helpers.py`: unit tests for config, prompts, watcher policy, file movement failure handling, translation helpers, confidence cleanup, and transcript merging.
 - `*.bat`: Windows launchers. They should stay thin wrappers around `python -m transcriber`.
-- `.github/workflows/ci.yml`: CI contract for tests, lint, format, type checking, CLI startup, package build, and dependency audit.
+- `.github/workflows/ci.yml`: CI contract for tests with coverage, lint, format, type checking, CLI startup, package build, dependency audit, pre-commit hooks, and secret scanning.
 - `docs/decisions/`: ADRs for decisions that future agents should not re-decide from scratch.
 
 ## Stable Interfaces
@@ -51,7 +51,7 @@ build_watch_targets
 - Watch folder policy: update `build_watch_targets`, `run_watch_loop`, watcher docs, and tests.
 - Completed-file movement: update `move_completed_watch_outputs` and regression tests for missing or locked `.srt` files.
 - Transcript merging: update `merge_transcripts.py` and merge utility tests.
-- Quality gates: update `.github/workflows/ci.yml`, `pyproject.toml`, `AGENTS.md`, `CONTRIBUTING.md`, and ADRs when the contract changes.
+- Quality gates: update `Makefile`, `.github/workflows/ci.yml`, `pyproject.toml`, `AGENTS.md`, `CONTRIBUTING.md`, and ADRs when the contract changes.
 
 ## Generated And Local Artifacts
 

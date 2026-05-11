@@ -22,7 +22,7 @@ Use `HF_TOKEN.example.txt` as the safe template for local setup.
 
 ## Dependency And CI Checks
 
-CI runs tests, lint, formatting, type checking, CLI startup, package build, and a Python dependency vulnerability audit. Dependency update pull requests are managed through Dependabot.
+CI runs tests with coverage, lint, formatting, type checking, CLI startup, package build, Python dependency vulnerability audit, and Gitleaks secret scanning. Dependency update pull requests are managed through Dependabot.
 
 If a dependency audit fails:
 
@@ -30,3 +30,5 @@ If a dependency audit fails:
 2. Prefer upgrading through `uv lock --upgrade-package <name>` or the smallest safe lockfile update.
 3. Rerun the full validation gate from `AGENTS.md`.
 4. Document any deferred advisory and why it is not exploitable in this local CLI context.
+
+If secret scanning fails, rotate any exposed credential before removing it from the repository, because deletion alone does not invalidate a leaked token.
