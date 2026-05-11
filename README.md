@@ -48,15 +48,21 @@ $env:UV_PROJECT_ENVIRONMENT = ".uv-venv"
 uv sync
 ```
 
-See `AGENTS.md` for the repo map, agent workflow, maintenance boundaries, and current ship status.
+Project workflow and governance:
+- `AGENTS.md` maps the repo for agents and maintainers.
+- `CONTRIBUTING.md` defines branch, review, validation, and rollback expectations.
+- `SECURITY.md` defines vulnerability reporting, secret handling, and dependency audit policy.
+- `docs/architecture.md` maps runtime boundaries and change locations.
+- `docs/decisions/` records durable decisions.
 
 ## Current status
 
 - Agentic legibility: accepted. The repo now has `pyproject.toml` tool config, `uv.lock`, CI, generated-file ignore rules, and `AGENTS.md`.
+- Governance: accepted. Contributor workflow, PR checklist, CODEOWNERS, security policy, Dependabot, and architecture docs are in place.
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
-- Release posture: local quality gates pass; deployment is a local CLI/tooling release. Rollback is `git revert` of the release commit.
+- Release posture: local quality gates and dependency audit pass; deployment is a local CLI/tooling release. Rollback is `git revert` of the release commit.
 
 ## Hugging Face token (for diarization)
 

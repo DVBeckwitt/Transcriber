@@ -10,6 +10,10 @@ This repository is a local WhisperX launcher for audio/video transcription, subt
 - `merge_transcripts.py`: Utility for recursively merging transcript text files.
 - `tests/test_helpers.py`: Unit tests for CLI config, watcher policy, translation helpers, confidence cleanup, and transcript merging.
 - `README.md`: User setup, runtime behavior, CLI examples, and troubleshooting.
+- `CONTRIBUTING.md`: Branch, review, validation, and rollback workflow.
+- `SECURITY.md`: Vulnerability reporting, secret handling, and dependency audit policy.
+- `docs/architecture.md`: Runtime flow, module boundaries, stable interfaces, and change guide.
+- `docs/decisions/`: Accepted architecture and process decisions.
 - `*.bat`: Windows launchers for one-off transcription and watcher processes.
 - `logs/`, `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`, `.uv-venv/`: Generated local artifacts; do not edit or commit them.
 
@@ -53,9 +57,10 @@ If using `$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"`, keep that variable set for 
 ## Current Ship Status
 
 - Status date: 2026-05-11.
-- Agentic legibility work is ready for review: reproducible uv environment, CI quality gates, agent guide, and generated-artifact cleanup are in place.
+- Agentic legibility work is ready for review: reproducible uv environment, CI quality gates, agent guide, governance docs, security policy, architecture docs, and generated-artifact cleanup are in place.
 - Watcher move failure handling is fixed and covered by regression tests. Missing or locked `.srt` files no longer strand moved media without a retryable source.
 - Transcript merge secret filtering is fixed and covered by regression tests. Token files are skipped case-insensitively, and generated/cache directories are excluded from recursive scans.
+- Dependency audit is strict in CI through `pip-audit`; Dependabot is configured for GitHub Actions and uv.
 - Rollback path is git-based: revert the release commit to restore the previous behavior and docs.
 
 ## Conventions
@@ -65,6 +70,7 @@ If using `$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"`, keep that variable set for 
 - Keep CLI options backward compatible; visible CLI behavior is a public interface.
 - Add or update tests when changing logic.
 - Do not add GPU, WhisperX model download, ffmpeg, or Hugging Face token requirements to unit tests or CI.
+- Update `CONTRIBUTING.md`, `SECURITY.md`, or `docs/architecture.md` when their contracts change.
 
 ## Boundaries
 

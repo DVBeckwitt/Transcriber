@@ -5,6 +5,9 @@
 ### Added
 - Added project quality tooling with `pyproject.toml`, `uv.lock`, Ruff, mypy, pytest configuration, package build validation, and GitHub Actions CI.
 - Added `AGENTS.md` with repo map, validation commands, boundaries, current ship status, and rollback notes.
+- Added contributor workflow, pull request checklist, CODEOWNERS, security policy, and Dependabot configuration.
+- Added strict Python dependency audit to CI with `pip-audit`.
+- Added architecture map and watcher file movement ADR.
 - Added watcher support for the Escuela video folder policy from the recordings watcher.
 - Added `merge_transcripts.py` for recursive transcript text merging.
 
@@ -18,6 +21,6 @@
 - Removed tracked generated artifacts: bytecode caches, sample media output, and sample WhisperX log output.
 
 ### Status
-- Local quality gates pass: pytest, Ruff lint, Ruff format check, mypy, CLI help, uv lock sync, and package build.
+- Local quality gates pass: pytest, Ruff lint, Ruff format check, mypy, CLI help, uv lock sync, package build, and dependency audit.
 - Release type: local CLI/tooling update.
 - Rollback: revert the release commit.
