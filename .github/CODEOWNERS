@@ -1,0 +1,8 @@
+# Default owner for this repository.
+* @DVBeckwitt
+
+# Keep repository governance and automation reviewed by the owner.
+/.github/ @DVBeckwitt
+AGENTS.md @DVBeckwitt
+CONTRIBUTING.md @DVBeckwitt
+SECURITY.md @DVBeckwitt
