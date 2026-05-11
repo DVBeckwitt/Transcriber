@@ -17,10 +17,14 @@
 - Fixed transcript merge filtering so Hugging Face token files are skipped case-insensitively.
 - Fixed transcript merge scanning so generated/cache directories are skipped.
 
+### Changed
+- Simplified config preset setup, temporary directory candidate de-duplication, SRT finalization, confidence cleanup, and transcript merge collection without changing public behavior.
+
 ### Removed
 - Removed tracked generated artifacts: bytecode caches, sample media output, and sample WhisperX log output.
 
 ### Status
 - Local quality gates pass: pytest, Ruff lint, Ruff format check, mypy, CLI help, uv lock sync, package build, and dependency audit.
 - Release type: local CLI/tooling update.
+- Migration: none required; public CLI behavior and output contracts are unchanged.
 - Rollback: revert the release commit.

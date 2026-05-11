@@ -42,17 +42,15 @@ def is_skipped_path(path: Path, root: Path, output_path: Path) -> bool:
     if path.name.casefold() in SKIP_FILENAMES:
         return True
     skipped_parts = (part.casefold() for part in path.relative_to(root).parts[:-1])
-    if any(part in SKIP_DIR_NAMES or part.endswith(".egg-info") for part in skipped_parts):
-        return True
-    return False
+    return any(part in SKIP_DIR_NAMES or part.endswith(".egg-info") for part in skipped_parts)
 
 
 def collect_transcript_files(root: Path, output_path: Path) -> list[Path]:
-    files = []
-    for path in sorted(root.rglob("*.txt"), key=lambda p: p.relative_to(root).as_posix().lower()):
-        if path.is_file() and not is_skipped_path(path, root, output_path):
-            files.append(path)
-    return files
+    return [
+        path
+        for path in sorted(root.rglob("*.txt"), key=lambda p: p.relative_to(root).as_posix().lower())
+        if path.is_file() and not is_skipped_path(path, root, output_path)
+    ]
 
 
 def merge_transcript_files(root: Path, output_path: Path) -> tuple[int, Path]:

@@ -60,7 +60,9 @@ If using `$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"`, keep that variable set for 
 - Agentic legibility work is ready for review: reproducible uv environment, CI quality gates, agent guide, governance docs, security policy, architecture docs, and generated-artifact cleanup are in place.
 - Watcher move failure handling is fixed and covered by regression tests. Missing or locked `.srt` files no longer strand moved media without a retryable source.
 - Transcript merge secret filtering is fixed and covered by regression tests. Token files are skipped case-insensitively, and generated/cache directories are excluded from recursive scans.
+- Code simplification is complete for the current refactor slice. Public CLI behavior, watcher policy, and merge output contracts are unchanged.
 - Dependency audit is strict in CI through `pip-audit`; Dependabot is configured for GitHub Actions and uv.
+- No deprecation or migration is required for this release.
 - Rollback path is git-based: revert the release commit to restore the previous behavior and docs.
 
 ## Conventions

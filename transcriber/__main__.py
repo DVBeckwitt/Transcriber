@@ -564,13 +564,8 @@ def apply_confidence_cleanup(result: dict[str, Any], cfg: RunConfig) -> None:
             for word in words:
                 if not isinstance(word, dict):
                     continue
-                word_low = word_is_low_confidence(word, low_prob=cfg.low_confidence_word_prob) or seg_low
-                if not word_low:
-                    continue
-                word["_low_confidence"] = True
-
-        if seg_low:
-            segment["_low_confidence"] = True
+                if word_is_low_confidence(word, low_prob=cfg.low_confidence_word_prob) or seg_low:
+                    word["_low_confidence"] = True
 
 
 def segment_to_timed_tokens(segment: dict[str, Any]) -> list[TimedToken]:
@@ -1003,7 +998,7 @@ def load_glossary_file(path: Path) -> list[str]:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return []
-    return [line for line in text.splitlines()]
+    return text.splitlines()
 
 
 def load_translation_glossary(glossary_spec: str | None) -> dict[str, str]:
@@ -1376,9 +1371,7 @@ def finalize_srt_file(srt_path: Path) -> None:
         return
 
     text = srt_path.read_text(encoding="utf-8", errors="ignore")
-    updated_lines: list[str] = []
-    for line in text.splitlines():
-        updated_lines.append(render_uncertain_markup(line, "srt"))
+    updated_lines = [render_uncertain_markup(line, "srt") for line in text.splitlines()]
     srt_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
 
 
@@ -1390,28 +1383,25 @@ def temp_dir_candidates(base_dir: Path) -> list[Path]:
     candidates: list[Path] = []
     seen: set[str] = set()
 
+    def add_candidate(path: Path, key_source: str | None = None) -> None:
+        key = os.path.normcase(key_source if key_source is not None else str(path))
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(path)
+
     for env_name in ("TMPDIR", "TEMP", "TMP"):
         raw = os.environ.get(env_name, "").strip()
         if not raw:
             continue
-        key = os.path.normcase(raw)
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(Path(raw))
+        add_candidate(Path(raw), raw)
 
     local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
     if local_appdata:
         managed = Path(local_appdata) / "Transcriber" / "tmp"
-        key = os.path.normcase(str(managed))
-        if key not in seen:
-            seen.add(key)
-            candidates.append(managed)
+        add_candidate(managed)
 
-    fallback = base_dir / FALLBACK_TEMP_DIR_NAME
-    key = os.path.normcase(str(fallback))
-    if key not in seen:
-        candidates.append(fallback)
+    add_candidate(base_dir / FALLBACK_TEMP_DIR_NAME)
 
     return candidates
 
@@ -1799,45 +1789,37 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
     if interactive and not mode_locked:
         mode = prompt_mode(mode)
 
+    is_fast_mode = mode == "fast"
+    if not model_locked:
+        model = "medium" if is_fast_mode else "large-v3"
+
+    temperature = 0.0
+    compression_ratio_threshold = 2.4
+    logprob_threshold = -1.0
+    no_speech_threshold = 0.6
+    translation_context_window = TRANSLATION_CONTEXT_WINDOW
+    translation_batch_size = 4
+    translation_num_beams = TRANSLATION_NUM_BEAMS
+    translation_max_new_tokens = 256
+    translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
     temperature_schedule: tuple[float, ...]
-    if mode == "fast":
-        if not model_locked:
-            model = "medium"
+
+    if is_fast_mode:
         batch_size = 16
         beam_size = 2
         patience = 1.0
-        temperature = 0.0
         temperature_schedule = (0.0,)
         best_of = 1
-        compression_ratio_threshold = 2.4
-        logprob_threshold = -1.0
-        no_speech_threshold = 0.6
         condition_on_previous_text = False
         diarize_default = False
-        translation_context_window = TRANSLATION_CONTEXT_WINDOW
-        translation_batch_size = 4
-        translation_num_beams = TRANSLATION_NUM_BEAMS
-        translation_max_new_tokens = 256
-        translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
     else:
-        if not model_locked:
-            model = "large-v3"
         batch_size = 8
         beam_size = 8
         patience = 1.2
-        temperature = 0.0
         temperature_schedule = (0.0, 0.2, 0.4, 0.6, 0.8)
         best_of = 5
-        compression_ratio_threshold = 2.4
-        logprob_threshold = -1.0
-        no_speech_threshold = 0.6
         condition_on_previous_text = True
         diarize_default = True
-        translation_context_window = TRANSLATION_CONTEXT_WINDOW
-        translation_batch_size = 4
-        translation_num_beams = TRANSLATION_NUM_BEAMS
-        translation_max_new_tokens = 256
-        translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
 
     if args.temperature is not None:
         temperature = float(args.temperature)
