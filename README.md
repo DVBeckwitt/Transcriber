@@ -27,6 +27,37 @@ It generates:
 pip install -e .
 ```
 
+## Development
+
+Use `uv` for repeatable local checks:
+
+```powershell
+uv sync
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+uv run python -m transcriber --help
+uv build
+```
+
+If the project `.venv` is locked by OneDrive or another process on Windows, point uv at a disposable local environment first:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"
+uv sync
+```
+
+See `AGENTS.md` for the repo map, agent workflow, maintenance boundaries, and current ship status.
+
+## Current status
+
+- Agentic legibility: accepted. The repo now has `pyproject.toml` tool config, `uv.lock`, CI, generated-file ignore rules, and `AGENTS.md`.
+- Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
+- Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
+- Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
+- Release posture: local quality gates pass; deployment is a local CLI/tooling release. Rollback is `git revert` of the release commit.
+
 ## Hugging Face token (for diarization)
 
 Diarization requires a token and accepted model terms.
@@ -88,6 +119,9 @@ Stop the hidden background watcher:
 
 Notes:
 - Both launchers watch `%USERPROFILE%\OneDrive\recordings`.
+- They also watch `%USERPROFILE%\Videos\escuela` for supported video files.
+- Files from `%USERPROFILE%\Videos\escuela` are treated as Spanish, written as translated English `.srt` subtitles only without diarization speaker names, renamed to `Escuela de Nada - s01e<next> - <translated title>`, and then the source video plus `.srt` are moved to `\\BECKWITT-SERVER\Plex\TV\Escuela de Nada`.
+- The destination folder keeps `episode_counter.txt` with the last assigned episode number. If the file is missing, the watcher starts from episode `729` and uses the next available episode number.
 - They default to auto language detection in `quality` mode.
 - Watch activity is appended to `<project>\logs\transcriber-watcher.log`.
 - `.\watch_recordings.bat` runs in the foreground, so stop it with `Ctrl+C`.
@@ -163,8 +197,11 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - WhisperX receives an initial prompt built from `--asr-prompt`, `--asr-prompt-file`, and glossary terms when present.
 - Quality mode uses a fallback temperature schedule by default; fast mode uses a single-pass decode.
 - Watch mode monitors the top level of the watched folder for supported media files.
+- The default recordings watcher also monitors `%USERPROFILE%\Videos\escuela` for supported video files.
 - Watch mode waits for a file to stop changing before transcription starts.
 - Watch mode skips files that already have an up-to-date `.srt` next to them.
+- When `%USERPROFILE%\Videos\escuela` already has both the video and `.srt`, watch mode will still try to move them to `\\BECKWITT-SERVER\Plex\TV\Escuela de Nada`.
+- `%USERPROFILE%\Videos\escuela` files are renamed into `Escuela de Nada - s01e<next> - <translated title>` and tracked with `episode_counter.txt` in the destination folder.
 - Default mode presets:
   - `quality`: model `large-v3`, diarization on by default
   - `fast`: model `medium`, diarization off by default

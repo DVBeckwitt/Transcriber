@@ -2,32 +2,44 @@ from __future__ import annotations
 
 import contextlib
 import io
-from pathlib import Path
+import shutil
 import sys
-from tempfile import TemporaryDirectory
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+from merge_transcripts import collect_transcript_files, merge_transcript_files
 from transcriber.__main__ import (
-    build_audio_preprocess_command,
-    build_asr_prompt,
-    build_config,
+    DEFAULT_ESCUELA_DEST_DIR,
+    DEFAULT_ESCUELA_LAST_EPISODE,
+    DEFAULT_ESCUELA_WATCH_DIR,
+    DEFAULT_WATCH_DIR,
+    ESCUELA_EPISODE_COUNTER_FILE_NAME,
+    ESCUELA_RENAME_STRATEGY,
+    VIDEO_EXTENSIONS,
     RunConfig,
     SRTCue,
     TimedToken,
     apply_confidence_cleanup,
+    build_asr_prompt,
+    build_audio_preprocess_command,
+    build_config,
     build_translation_prompt,
-    load_translation_glossary,
+    build_watch_targets,
     is_watchable_media,
-    run_whisperx_direct_logged,
-    translate_spanish_texts,
+    load_translation_glossary,
+    move_completed_watch_outputs,
     output_paths_for_input,
     parse_args,
     parse_glossary_entries,
     parse_temperature_schedule,
     project_dir,
     render_uncertain_markup,
+    run_whisperx_direct_logged,
     smooth_timed_tokens,
+    translate_spanish_texts,
     translation_context_for_cue,
 )
 
@@ -36,6 +48,7 @@ def make_cfg(**overrides: object) -> RunConfig:
     cfg = RunConfig(
         language="auto",
         translate_to_english=False,
+        write_llm_txt=True,
         mode="quality",
         model="large-v3",
         batch_size=8,
@@ -142,6 +155,41 @@ class HelperTests(unittest.TestCase):
             source.write_bytes(b"data")
             self.assertTrue(is_watchable_media(source))
 
+    def test_escuela_target_only_watches_videos(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            audio = Path(tmpdir) / "clip.mp3"
+            video = Path(tmpdir) / "clip.mp4"
+            audio.write_bytes(b"audio")
+            video.write_bytes(b"video")
+
+            self.assertFalse(is_watchable_media(audio, VIDEO_EXTENSIONS))
+            self.assertTrue(is_watchable_media(video, VIDEO_EXTENSIONS))
+
+    def test_default_recordings_watch_also_adds_escuela_target(self) -> None:
+        targets = build_watch_targets(make_cfg(), DEFAULT_WATCH_DIR)
+
+        self.assertEqual([target.watch_dir for target in targets], [DEFAULT_WATCH_DIR, DEFAULT_ESCUELA_WATCH_DIR])
+        self.assertEqual(targets[0].cfg.language, "auto")
+        self.assertTrue(targets[1].cfg.translate_to_english)
+        self.assertEqual(targets[1].cfg.language, "es")
+        self.assertFalse(targets[1].cfg.diarize)
+        self.assertFalse(targets[1].cfg.write_llm_txt)
+        self.assertEqual(targets[1].allowed_extensions, frozenset(VIDEO_EXTENSIONS))
+        self.assertEqual(targets[1].move_completed_files_to, DEFAULT_ESCUELA_DEST_DIR)
+        self.assertEqual(targets[1].rename_strategy, ESCUELA_RENAME_STRATEGY)
+
+    def test_direct_escuela_watch_uses_special_policy(self) -> None:
+        targets = build_watch_targets(make_cfg(), DEFAULT_ESCUELA_WATCH_DIR)
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].watch_dir, DEFAULT_ESCUELA_WATCH_DIR)
+        self.assertEqual(targets[0].cfg.language, "es")
+        self.assertTrue(targets[0].cfg.translate_to_english)
+        self.assertFalse(targets[0].cfg.diarize)
+        self.assertFalse(targets[0].cfg.write_llm_txt)
+        self.assertEqual(targets[0].move_completed_files_to, DEFAULT_ESCUELA_DEST_DIR)
+        self.assertEqual(targets[0].rename_strategy, ESCUELA_RENAME_STRATEGY)
+
     def test_output_paths_stay_next_to_source(self) -> None:
         cfg = make_cfg()
         with TemporaryDirectory() as tmpdir:
@@ -154,6 +202,158 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(outputs.llm_path.parent, source.parent)
             self.assertEqual(outputs.lock_path.parent, source.parent)
             self.assertEqual(outputs.log_path.parent, project_dir() / "logs")
+
+    def test_move_completed_watch_outputs_moves_video_and_srt(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            dest_dir = root / "dest"
+            source_dir.mkdir()
+
+            video = source_dir / "episode.mp4"
+            video.write_bytes(b"video")
+            srt = source_dir / "episode.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            outputs = output_paths_for_input(video, make_cfg(), create_dirs=False)
+
+            messages: list[str] = []
+            moved = move_completed_watch_outputs(video, outputs, dest_dir, messages.append)
+
+            self.assertTrue(moved)
+            self.assertFalse(video.exists())
+            self.assertFalse(srt.exists())
+            self.assertTrue((dest_dir / "episode.mp4").exists())
+            self.assertTrue((dest_dir / "episode.srt").exists())
+            self.assertTrue(any("Moved" in message for message in messages))
+
+    def test_move_completed_watch_outputs_missing_srt_leaves_source_in_place(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            dest_dir = root / "dest"
+            source_dir.mkdir()
+
+            video = source_dir / "episode.mp4"
+            video.write_bytes(b"video")
+            outputs = output_paths_for_input(video, make_cfg(), create_dirs=False)
+
+            messages: list[str] = []
+            moved = move_completed_watch_outputs(video, outputs, dest_dir, messages.append)
+
+            self.assertFalse(moved)
+            self.assertTrue(video.exists())
+            self.assertFalse((dest_dir / "episode.mp4").exists())
+            self.assertTrue(any("missing" in message for message in messages))
+
+    def test_move_completed_watch_outputs_rolls_back_video_when_srt_move_fails(self) -> None:
+        original_move = shutil.move
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            dest_dir = root / "dest"
+            source_dir.mkdir()
+
+            video = source_dir / "episode.mp4"
+            video.write_bytes(b"video")
+            srt = source_dir / "episode.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            outputs = output_paths_for_input(video, make_cfg(), create_dirs=False)
+
+            def fail_srt_move(src: str, dst: str) -> str:
+                if Path(src) == srt:
+                    raise OSError("srt locked")
+                return str(original_move(src, dst))
+
+            messages: list[str] = []
+            with patch("transcriber.__main__.shutil.move", side_effect=fail_srt_move):
+                moved = move_completed_watch_outputs(video, outputs, dest_dir, messages.append)
+
+            self.assertFalse(moved)
+            self.assertTrue(video.exists())
+            self.assertTrue(srt.exists())
+            self.assertFalse((dest_dir / "episode.mp4").exists())
+            self.assertTrue(any("Rolled" in message for message in messages))
+
+    @patch("transcriber.__main__.translate_spanish_texts")
+    def test_move_completed_escuela_outputs_renames_and_updates_counter(self, translate_texts: MagicMock) -> None:
+        translate_texts.return_value = ["My First Job"]
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            dest_dir = root / "dest"
+            source_dir.mkdir()
+            dest_dir.mkdir()
+
+            (dest_dir / ESCUELA_EPISODE_COUNTER_FILE_NAME).write_text(
+                f"{DEFAULT_ESCUELA_LAST_EPISODE}\n", encoding="utf-8"
+            )
+
+            video = source_dir / "mi_primer_trabajo.mp4"
+            video.write_bytes(b"video")
+            srt = source_dir / "mi_primer_trabajo.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            outputs = output_paths_for_input(video, make_cfg(), create_dirs=False)
+
+            messages: list[str] = []
+            moved = move_completed_watch_outputs(
+                video,
+                outputs,
+                dest_dir,
+                messages.append,
+                cfg=make_cfg(language="es", translate_to_english=True, diarize=False, write_llm_txt=False),
+                rename_strategy=ESCUELA_RENAME_STRATEGY,
+            )
+
+            self.assertTrue(moved)
+            expected_base = "Escuela de Nada - s01e730 - My First Job"
+            self.assertTrue((dest_dir / f"{expected_base}.mp4").exists())
+            self.assertTrue((dest_dir / f"{expected_base}.srt").exists())
+            self.assertEqual(
+                (dest_dir / ESCUELA_EPISODE_COUNTER_FILE_NAME).read_text(encoding="utf-8").strip(),
+                "730",
+            )
+            self.assertFalse(video.exists())
+            self.assertFalse(srt.exists())
+            translate_texts.assert_called_once()
+
+    @patch("transcriber.__main__.translate_spanish_texts")
+    def test_move_completed_escuela_outputs_skips_taken_episode_numbers(self, translate_texts: MagicMock) -> None:
+        translate_texts.return_value = ["Next Thing"]
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            dest_dir = root / "dest"
+            source_dir.mkdir()
+            dest_dir.mkdir()
+
+            (dest_dir / ESCUELA_EPISODE_COUNTER_FILE_NAME).write_text(
+                f"{DEFAULT_ESCUELA_LAST_EPISODE}\n", encoding="utf-8"
+            )
+            (dest_dir / "Escuela de Nada - s01e730 - Existing.mp4").write_bytes(b"video")
+            (dest_dir / "Escuela de Nada - s01e730 - Existing.srt").write_text("existing", encoding="utf-8")
+
+            video = source_dir / "algo_nuevo.mp4"
+            video.write_bytes(b"video")
+            srt = source_dir / "algo_nuevo.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            outputs = output_paths_for_input(video, make_cfg(), create_dirs=False)
+
+            moved = move_completed_watch_outputs(
+                video,
+                outputs,
+                dest_dir,
+                lambda _: None,
+                cfg=make_cfg(language="es", translate_to_english=True, diarize=False, write_llm_txt=False),
+                rename_strategy=ESCUELA_RENAME_STRATEGY,
+            )
+
+            self.assertTrue(moved)
+            expected_base = "Escuela de Nada - s01e731 - Next Thing"
+            self.assertTrue((dest_dir / f"{expected_base}.mp4").exists())
+            self.assertTrue((dest_dir / f"{expected_base}.srt").exists())
 
     def test_glossary_parsing_and_prompt(self) -> None:
         glossary = parse_glossary_entries(["OpenAI => OpenAI", "esfuerzo|effort", "termino"])
@@ -209,17 +409,19 @@ class HelperTests(unittest.TestCase):
 
     @patch("transcriber.__main__.load_spanish_to_english_translator")
     def test_translation_uses_beam_search(self, load_translator: MagicMock) -> None:
-        import torch
+        class FakeTensor:
+            def to(self, _device: str) -> FakeTensor:
+                return self
 
         tokenizer = MagicMock()
         tokenizer.return_value = {
-            "input_ids": torch.tensor([[1, 2, 3]]),
-            "attention_mask": torch.tensor([[1, 1, 1]]),
+            "input_ids": FakeTensor(),
+            "attention_mask": FakeTensor(),
         }
         tokenizer.batch_decode.return_value = ["Hello there"]
 
         model = MagicMock()
-        model.generate.return_value = torch.tensor([[1, 2, 3]])
+        model.generate.return_value = FakeTensor()
         load_translator.return_value = (tokenizer, model)
 
         result = translate_spanish_texts(["Hola"], device="cpu", batch_size=1)
@@ -234,7 +436,7 @@ class HelperTests(unittest.TestCase):
 
     def test_confidence_cleanup_marks_low_confidence(self) -> None:
         cfg = make_cfg()
-        result = {
+        result: dict[str, Any] = {
             "segments": [
                 {
                     "text": "hola",
@@ -271,6 +473,42 @@ class HelperTests(unittest.TestCase):
         smoothed = smooth_timed_tokens(tokens)
 
         self.assertEqual([token.speaker for token in smoothed], ["SPEAKER_00", "SPEAKER_00", "SPEAKER_00"])
+
+    def test_merge_transcripts_recursively_skips_output_and_non_transcripts(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "one.txt").write_text("First transcript", encoding="utf-8")
+            (nested / "two.txt").write_text("Second transcript", encoding="utf-8")
+            (root / "HF_TOKEN.txt").write_text("secret", encoding="utf-8")
+            (root / "hf_token.txt").write_text("lower secret", encoding="utf-8")
+            (root / "notes.md").write_text("ignore me", encoding="utf-8")
+            cache_dir = root / ".uv-venv"
+            cache_dir.mkdir()
+            (cache_dir / "cached.txt").write_text("cache text", encoding="utf-8")
+            logs_dir = root / "logs"
+            logs_dir.mkdir()
+            (logs_dir / "run.txt").write_text("log text", encoding="utf-8")
+
+            output = root / "merged_transcript.txt"
+            count, resolved_output = merge_transcript_files(root, output)
+
+            self.assertEqual(count, 2)
+            self.assertEqual(resolved_output, output.resolve())
+
+            merged = output.read_text(encoding="utf-8")
+            self.assertIn("===== 1. nested/two.txt =====", merged)
+            self.assertIn("===== 2. one.txt =====", merged)
+            self.assertIn("First transcript", merged)
+            self.assertIn("Second transcript", merged)
+            self.assertNotIn("secret", merged)
+            self.assertNotIn("lower secret", merged)
+            self.assertNotIn("cache text", merged)
+            self.assertNotIn("log text", merged)
+
+            collected = collect_transcript_files(root, output)
+            self.assertEqual([path.relative_to(root).as_posix() for path in collected], ["nested/two.txt", "one.txt"])
 
 
 if __name__ == "__main__":

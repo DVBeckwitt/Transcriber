@@ -1,6 +1,29 @@
 # Local secrets
 HF_TOKEN.txt
 hf_token.txt
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Python environments and caches
+.venv/
+.uv-venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Transcriber runtime artifacts
 .tmp_transcriber_temp/
 logs/
 *.log
+*.srt
+*_llm.txt
+*.transcribing.lock

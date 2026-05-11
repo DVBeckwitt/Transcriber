@@ -4,6 +4,8 @@ setlocal EnableExtensions EnableDelayedExpansion
 pushd "%~dp0"
 
 set "WATCH_DIR=%USERPROFILE%\OneDrive\recordings"
+set "EXTRA_WATCH_DIR=%USERPROFILE%\Videos\escuela"
+set "ESCUELA_DEST=\\BECKWITT-SERVER\Plex\TV\Escuela de Nada"
 set "PID_FILE=%WATCH_DIR%\transcriber-watcher.pid"
 set "VENV=%USERPROFILE%\.venv"
 if defined VIRTUAL_ENV set "VENV=%VIRTUAL_ENV%"
@@ -39,6 +41,9 @@ if exist "%PID_FILE%" (
     set /p WATCHER_PID=<"%PID_FILE%"
     echo.
     echo Watcher is already running with PID !WATCHER_PID!.
+    echo Watching:
+    echo   "%WATCH_DIR%"
+    echo   "%EXTRA_WATCH_DIR%" ^(video only, Spanish to English SRT, no diarization names, moved to "%ESCUELA_DEST%"^)
     echo Watcher log:
     echo   "%CD%\logs\transcriber-watcher.log"
     echo To stop it:
@@ -60,6 +65,8 @@ if "%RC%"=="0" (
   echo.
   echo Watcher started for:
   echo   "%WATCH_DIR%"
+  echo Also watches:
+  echo   "%EXTRA_WATCH_DIR%" ^(video only, Spanish to English SRT, no diarization names, moved to "%ESCUELA_DEST%"^)
   echo Watcher PID:
   echo   "!WATCHER_PID!"
   echo Watcher log:

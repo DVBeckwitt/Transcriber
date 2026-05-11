@@ -8,17 +8,18 @@ import inspect
 import math
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import textwrap
 import time
-import subprocess
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
-
+from typing import Any
 
 MEDIA_FILTER = (
     "Audio/Video",
@@ -38,12 +39,19 @@ MEDIA_EXTENSIONS = {
     ".mkv",
     ".webm",
 }
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
 LOG_DIR_NAME = "logs"
 WATCHER_LOG_NAME = "transcriber-watcher.log"
 DEFAULT_POLL_INTERVAL = 2.0
 DEFAULT_SETTLE_SECONDS = 5.0
 DEFAULT_WATCH_DIR = Path.home() / "OneDrive" / "recordings"
+DEFAULT_ESCUELA_WATCH_DIR = Path.home() / "Videos" / "escuela"
+DEFAULT_ESCUELA_DEST_DIR = Path(r"\\BECKWITT-SERVER\Plex\TV\Escuela de Nada")
+DEFAULT_ESCUELA_LAST_EPISODE = 729
+ESCUELA_EPISODE_COUNTER_FILE_NAME = "episode_counter.txt"
+ESCUELA_RENAME_STRATEGY = "escuela_episode"
+ESCUELA_SERIES_NAME = "Escuela de Nada"
 WATCH_RETRY_COOLDOWN_SECONDS = 300.0
 FALLBACK_TEMP_DIR_NAME = ".tmp_transcriber_temp"
 LOCK_SUFFIX = ".transcribing.lock"
@@ -109,6 +117,7 @@ class LegacyOptions:
 class RunConfig:
     language: str
     translate_to_english: bool
+    write_llm_txt: bool
     mode: str
     model: str
     batch_size: int
@@ -176,6 +185,15 @@ class PendingWatchFile:
     mtime_ns: int
     stable_since: float
     last_attempt_at: float | None = None
+
+
+@dataclass(frozen=True)
+class WatchTarget:
+    watch_dir: Path
+    cfg: RunConfig
+    allowed_extensions: frozenset[str]
+    move_completed_files_to: Path | None = None
+    rename_strategy: str | None = None
 
 
 UNSUPPORTED_GLOBAL_RE = re.compile(r"Unsupported global: GLOBAL ([A-Za-z0-9_\.]+)")
@@ -533,7 +551,6 @@ def apply_confidence_cleanup(result: dict[str, Any], cfg: RunConfig) -> None:
     for segment in segments:
         if not isinstance(segment, dict):
             continue
-        seg_text = str(segment.get("text") or "")
         seg_low = segment_is_low_confidence(
             segment,
             low_logprob=cfg.low_confidence_logprob,
@@ -762,9 +779,7 @@ def smooth_timed_tokens(
         prev_run = runs[idx - 1]
         next_run = runs[idx + 1]
         is_short = int(run["duration_ms"]) < min_run_duration_ms or int(run["word_count"]) <= min_run_words
-        low_confidence = (
-            run["avg_confidence"] is not None and float(run["avg_confidence"]) < low_confidence_threshold
-        )
+        low_confidence = run["avg_confidence"] is not None and float(run["avg_confidence"]) < low_confidence_threshold
         low_confidence = low_confidence or bool(run.get("has_low_confidence"))
         if not speaker or not (is_short or low_confidence):
             continue
@@ -1146,7 +1161,9 @@ def build_asr_prompt(
 
     if glossary:
         lines.append("Use these names, product names, and jargon exactly as written:")
-        for source, target in sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True)[:max_glossary_terms]:
+        for source, target in sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True)[
+            :max_glossary_terms
+        ]:
             if source == target:
                 lines.append(f"- {source}")
             else:
@@ -1204,7 +1221,9 @@ def translate_spanish_texts(
     except Exception:
         torch = None
 
-    use_cuda = bool(torch is not None and device.startswith("cuda") and getattr(torch.cuda, "is_available", lambda: False)())
+    use_cuda = bool(
+        torch is not None and device.startswith("cuda") and getattr(torch.cuda, "is_available", lambda: False)()
+    )
     if torch is not None:
         target_device = torch.device("cuda" if use_cuda else "cpu")
         model.to(target_device)
@@ -1299,7 +1318,7 @@ def translate_srt_to_english(
         raise RuntimeError("Translation produced an unexpected cue count.")
 
     translated_cues: list[SRTCue] = []
-    for cue, translated_block, meta in zip(cues, translated_blocks, block_meta):
+    for cue, translated_block, meta in zip(cues, translated_blocks, block_meta, strict=True):
         prefix, placeholders, original = meta
         translated_text = replace_glossary_placeholders(translated_block, placeholders)
         extracted = extract_between_markers(translated_text, TRANSLATION_MARKER_START, TRANSLATION_MARKER_END)
@@ -1316,9 +1335,7 @@ def translate_srt_to_english(
         translated_text = normalize_subtitle_whitespace(extracted)
         if prefix:
             translated_text = f"{prefix}{translated_text}".strip()
-        translated_cues.append(
-            SRTCue(index=cue.index, start_ms=cue.start_ms, end_ms=cue.end_ms, text=translated_text)
-        )
+        translated_cues.append(SRTCue(index=cue.index, start_ms=cue.start_ms, end_ms=cue.end_ms, text=translated_text))
 
     rewrapped: list[SRTCue] = []
     for cue in translated_cues:
@@ -1366,12 +1383,7 @@ def finalize_srt_file(srt_path: Path) -> None:
 
 
 def build_lock_payload(input_path: Path) -> str:
-    return (
-        f"source_path={input_path}\n"
-        f"created_at={utc_now_iso()}\n"
-        f"pid={os.getpid()}\n"
-        f"hostname={socket.gethostname()}\n"
-    )
+    return f"source_path={input_path}\ncreated_at={utc_now_iso()}\npid={os.getpid()}\nhostname={socket.gethostname()}\n"
 
 
 def temp_dir_candidates(base_dir: Path) -> list[Path]:
@@ -1434,9 +1446,7 @@ def configure_temp_dir(base_dir: Path) -> Path:
         tempfile.tempdir = temp_path
         return resolved
 
-    raise RuntimeError(
-        "Could not create a usable temporary directory for WhisperX. Check TMP/TEMP permissions."
-    )
+    raise RuntimeError("Could not create a usable temporary directory for WhisperX. Check TMP/TEMP permissions.")
 
 
 def build_audio_preprocess_command(input_path: Path, output_path: Path) -> list[str]:
@@ -1470,7 +1480,7 @@ def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Repo
     command = build_audio_preprocess_command(input_path, output_path)
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(command, check=True, capture_output=True, text=True)
     except FileNotFoundError:
         report("[transcriber] ffmpeg not found; using the original input audio.")
         return input_path
@@ -1576,7 +1586,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         choices=("float16", "float32", "int8"),
         help="Computation dtype (default: float16).",
     )
-    parser.add_argument("--watch", action="store_true", help="Continuously watch a folder and transcribe new media files.")
+    parser.add_argument(
+        "--watch", action="store_true", help="Continuously watch a folder and transcribe new media files."
+    )
     parser.add_argument(
         "--watch-dir",
         default=str(DEFAULT_WATCH_DIR),
@@ -1606,10 +1618,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             f"(default: {DEFAULT_STALE_LOCK_SECONDS:g})."
         ),
     )
-    parser.add_argument("--dry-run", action="store_true", help="Show planned actions without running WhisperX or writing outputs.")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show planned actions without running WhisperX or writing outputs."
+    )
     diarize_group = parser.add_mutually_exclusive_group()
     diarize_group.add_argument("--diarize", dest="force_diarize", action="store_true", help="Force diarization on.")
-    diarize_group.add_argument("--no-diarize", dest="force_no_diarize", action="store_true", help="Force diarization off.")
+    diarize_group.add_argument(
+        "--no-diarize", dest="force_no_diarize", action="store_true", help="Force diarization off."
+    )
     parser.add_argument("--no-diarize-smoothing", action="store_true", help="Disable speaker diarization smoothing.")
     parser.add_argument(
         "--min-speaker-turn-ms",
@@ -1783,6 +1799,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
     if interactive and not mode_locked:
         mode = prompt_mode(mode)
 
+    temperature_schedule: tuple[float, ...]
     if mode == "fast":
         if not model_locked:
             model = "medium"
@@ -1879,6 +1896,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
     return RunConfig(
         language=language,
         translate_to_english=translate_to_english,
+        write_llm_txt=True,
         mode=mode,
         model=model or "large-v3",
         batch_size=batch_size,
@@ -1928,6 +1946,53 @@ def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool =
         log_path=log_dir / f"{base}_whisperx.log",
         lock_path=output_dir / f"{base}{LOCK_SUFFIX}",
     )
+
+
+def path_identity(path: Path) -> str:
+    expanded = path.expanduser()
+    try:
+        resolved = expanded.resolve(strict=False)
+    except OSError:
+        resolved = Path(os.path.abspath(str(expanded)))
+    return os.path.normcase(str(resolved))
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return path_identity(left) == path_identity(right)
+
+
+def make_watch_target(cfg: RunConfig, watch_dir: Path) -> WatchTarget:
+    normalized = watch_dir.expanduser()
+    if same_path(normalized, DEFAULT_ESCUELA_WATCH_DIR):
+        return WatchTarget(
+            watch_dir=normalized,
+            cfg=replace(
+                cfg,
+                language="es",
+                translate_to_english=True,
+                write_llm_txt=False,
+                diarize=False,
+            ),
+            allowed_extensions=frozenset(VIDEO_EXTENSIONS),
+            move_completed_files_to=DEFAULT_ESCUELA_DEST_DIR,
+            rename_strategy=ESCUELA_RENAME_STRATEGY,
+        )
+    return WatchTarget(
+        watch_dir=normalized,
+        cfg=cfg,
+        allowed_extensions=frozenset(MEDIA_EXTENSIONS),
+    )
+
+
+def build_watch_targets(cfg: RunConfig, watch_dir: Path) -> list[WatchTarget]:
+    targets = [make_watch_target(cfg, watch_dir)]
+    if not same_path(watch_dir, DEFAULT_WATCH_DIR):
+        return targets
+
+    escuela_target = make_watch_target(cfg, DEFAULT_ESCUELA_WATCH_DIR)
+    if not same_path(escuela_target.watch_dir, targets[0].watch_dir):
+        targets.append(escuela_target)
+    return targets
 
 
 def is_stale_lock(lock_path: Path, stale_lock_seconds: float) -> bool:
@@ -2045,7 +2110,7 @@ def add_common_safe_globals() -> None:
 
 
 @contextlib.contextmanager
-def allow_trusted_checkpoint_loads() -> Iterable[None]:
+def allow_trusted_checkpoint_loads() -> Iterator[None]:
     try:
         import torch
     except Exception:
@@ -2249,7 +2314,7 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
     report("")
     report(f'Input:     "{input_path}"')
     report(f'Output:    "{outputs.srt_path}"')
-    report(f'LLM:       "{outputs.llm_path}"')
+    report(f'LLM:       "{outputs.llm_path}"' if cfg.write_llm_txt else "LLM:       disabled")
     report(f'Log:       "{outputs.log_path}"')
     report(f'Lock:      "{outputs.lock_path}"')
     report(f'OutDir:    "{outputs.output_dir}"')
@@ -2263,8 +2328,8 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
         report(f"Translate: {'whisperx direct' if cfg.translate_to_english else 'off'}")
     report(f"Mode:      {cfg.mode}")
     report(f"Model:     {cfg.model}")
-    report(f'Diarize:   {"on" if cfg.diarize else "off"}')
-    report(f'Smooth:    {"on" if (cfg.diarize and cfg.diarize_smoothing) else "off"}')
+    report(f"Diarize:   {'on' if cfg.diarize else 'off'}")
+    report(f"Smooth:    {'on' if (cfg.diarize and cfg.diarize_smoothing) else 'off'}")
     report(
         f"Cleanup:   {'on' if cfg.confidence_cleanup else 'off'}"
         f"{' (' + cfg.confidence_cleanup_mode + ')' if cfg.confidence_cleanup else ''}"
@@ -2292,7 +2357,10 @@ def describe_dry_run_plan(cfg: RunConfig, input_path: Path, outputs: OutputPaths
     report(f'Would acquire lock: "{outputs.lock_path}"')
     report(f'Would run WhisperX with output dir: "{outputs.output_dir}"')
     report(f'Would write transcript: "{outputs.srt_path}"')
-    report(f'Would write LLM prompt file: "{outputs.llm_path}"')
+    if cfg.write_llm_txt:
+        report(f'Would write LLM prompt file: "{outputs.llm_path}"')
+    else:
+        report("Would skip the LLM prompt file for this run.")
     report(f'Would write log: "{outputs.log_path}"')
     report(f'Would leave the source file in place: "{input_path}"')
 
@@ -2393,7 +2461,8 @@ def transcribe_file(
                     report("Keeping the original transcript text.")
                     report("")
             try:
-                build_llm_file(outputs.srt_path, outputs.llm_path)
+                if cfg.write_llm_txt:
+                    build_llm_file(outputs.srt_path, outputs.llm_path)
                 finalize_srt_file(outputs.srt_path)
             except Exception:
                 pass
@@ -2409,7 +2478,8 @@ def transcribe_file(
             report("")
             report("Done.")
             report(f'SRT: "{outputs.srt_path}"')
-            report(f'LLM: "{outputs.llm_path}"')
+            if cfg.write_llm_txt:
+                report(f'LLM: "{outputs.llm_path}"')
             if cfg.mode == "fast" and not cfg.diarize:
                 report("Note: fast mode used (speaker diarization disabled).")
             if fallback_no_diarize:
@@ -2456,17 +2526,18 @@ def make_watch_reporter(log_path: Path) -> Reporter:
     return report
 
 
-def is_watchable_media(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+def is_watchable_media(path: Path, allowed_extensions: Collection[str] | None = None) -> bool:
+    extensions = allowed_extensions or MEDIA_EXTENSIONS
+    return path.is_file() and path.suffix.lower() in extensions
 
 
-def iter_watch_candidates(watch_dir: Path) -> Iterable[Path]:
+def iter_watch_candidates(watch_dir: Path, allowed_extensions: Collection[str] | None = None) -> Iterable[Path]:
     try:
         candidates = sorted(watch_dir.iterdir(), key=lambda path: path.name.lower())
     except FileNotFoundError:
         return
     for path in candidates:
-        if is_watchable_media(path):
+        if is_watchable_media(path, allowed_extensions):
             yield path
 
 
@@ -2487,32 +2558,239 @@ def needs_transcription(input_path: Path, cfg: RunConfig) -> bool:
     return input_mtime_ns > output_mtime_ns
 
 
-def run_watch_loop(
+def prettify_media_title(text: str) -> str:
+    cleaned = re.sub(r"[._]+", " ", text)
+    cleaned = re.sub(r"\s*-\s*", " - ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.")
+    return cleaned or text.strip() or "Untitled"
+
+
+def strip_escuela_source_title(text: str) -> str:
+    cleaned = prettify_media_title(text)
+    patterns = (
+        r"(?i)^escuela\s+de\s+nada\b[\s\-_:|]*",
+        r"(?i)^(episodio|episode|ep)\s*\d+\b[\s\-_:|]*",
+        r"(?i)^#?\d+\b[\s\-_:|]*",
+    )
+    for _ in range(3):
+        previous = cleaned
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", cleaned).strip(" -_:|")
+        if cleaned == previous:
+            break
+    return cleaned or prettify_media_title(text)
+
+
+def sanitize_filename_part(text: str) -> str:
+    cleaned = normalize_subtitle_whitespace(text)
+    cleaned = re.sub(r'[<>:"/\\|?*]+', "-", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .-")
+    return cleaned or "Untitled"
+
+
+def read_escuela_last_episode(destination_dir: Path, report: Reporter) -> int:
+    counter_path = destination_dir / ESCUELA_EPISODE_COUNTER_FILE_NAME
+    highest = DEFAULT_ESCUELA_LAST_EPISODE
+    try:
+        if counter_path.exists():
+            raw = counter_path.read_text(encoding="utf-8", errors="ignore")
+            match = re.search(r"(\d+)", raw)
+            if match:
+                highest = max(highest, int(match.group(1)))
+            else:
+                report(f'Could not parse "{counter_path.name}". Falling back to the existing destination files.')
+    except OSError as exc:
+        report(f'Could not read "{counter_path.name}": {exc}')
+
+    pattern = re.compile(rf"^{re.escape(ESCUELA_SERIES_NAME)} - s01e(\d+)\b", re.IGNORECASE)
+    try:
+        for path in destination_dir.iterdir():
+            match = pattern.match(path.stem)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    except OSError:
+        pass
+    return highest
+
+
+def translate_escuela_title(input_path: Path, cfg: RunConfig, report: Reporter) -> str:
+    source_title = strip_escuela_source_title(input_path.stem)
+    fallback_title = sanitize_filename_part(source_title)
+    try:
+        translated = translate_spanish_texts([source_title], device=cfg.device, batch_size=1)
+    except Exception as exc:
+        report(f'Could not translate the title from "{input_path.name}": {exc}. Using the source title text instead.')
+        return fallback_title
+
+    translated_title = sanitize_filename_part(translated[0] if translated else "")
+    return translated_title or fallback_title
+
+
+def build_escuela_destination_paths(
+    input_path: Path,
+    outputs: OutputPaths,
+    destination_dir: Path,
     cfg: RunConfig,
-    watch_dir: Path,
+    report: Reporter,
+) -> tuple[Path, Path, Path, int]:
+    title = translate_escuela_title(input_path, cfg, report)
+    counter_path = destination_dir / ESCUELA_EPISODE_COUNTER_FILE_NAME
+    episode_number = read_escuela_last_episode(destination_dir, report)
+
+    while True:
+        episode_number += 1
+        base_name = sanitize_filename_part(f"{ESCUELA_SERIES_NAME} - s01e{episode_number} - {title}")
+        destination_media = destination_dir / f"{base_name}{input_path.suffix}"
+        destination_srt = destination_dir / f"{base_name}{outputs.srt_path.suffix}"
+        if not destination_media.exists() and not destination_srt.exists():
+            return destination_media, destination_srt, counter_path, episode_number
+
+
+def move_completed_watch_outputs(
+    input_path: Path,
+    outputs: OutputPaths,
+    destination_dir: Path,
+    report: Reporter,
+    dry_run: bool = False,
+    cfg: RunConfig | None = None,
+    rename_strategy: str | None = None,
+) -> bool:
+    destination_dir = destination_dir.expanduser()
+    counter_path: Path | None = None
+    episode_number: int | None = None
+
+    if rename_strategy == ESCUELA_RENAME_STRATEGY:
+        if cfg is None:
+            report("Escuela rename strategy requires a run configuration.")
+            return False
+        destination_media, destination_srt, counter_path, episode_number = build_escuela_destination_paths(
+            input_path,
+            outputs,
+            destination_dir,
+            cfg,
+            report,
+        )
+    else:
+        destination_media = destination_dir / input_path.name
+        destination_srt = destination_dir / outputs.srt_path.name
+
+    if dry_run:
+        report(f'Would move "{input_path.name}" to "{destination_media.name}".')
+        report(f'Would move "{outputs.srt_path.name}" to "{destination_srt.name}".')
+        return True
+
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        report(f'Could not access move destination "{destination_dir}": {exc}')
+        return False
+
+    collisions = [path for path in (destination_media, destination_srt) if path.exists()]
+    if collisions:
+        report(f'Could not move "{input_path.name}" because destination already exists: "{collisions[0]}"')
+        return False
+
+    if not outputs.srt_path.exists():
+        report(f'Could not move "{input_path.name}" because "{outputs.srt_path.name}" is missing.')
+        return False
+
+    try:
+        shutil.move(str(input_path), str(destination_media))
+    except Exception as exc:
+        report(f'Could not move "{input_path.name}" to "{destination_media}": {exc}')
+        return False
+
+    try:
+        shutil.move(str(outputs.srt_path), str(destination_srt))
+    except Exception as exc:
+        rollback_note = ""
+        if destination_media.exists() and not input_path.exists():
+            try:
+                shutil.move(str(destination_media), str(input_path))
+                rollback_note = f' Rolled "{input_path.name}" back to the source folder.'
+            except Exception as rollback_exc:
+                rollback_note = f' Could not roll "{destination_media.name}" back: {rollback_exc}'
+        report(
+            f'Video moved to "{destination_media}", but could not move "{outputs.srt_path.name}" '
+            f'to "{destination_srt}": {exc}.{rollback_note}'
+        )
+        return False
+
+    if counter_path is not None and episode_number is not None:
+        try:
+            counter_path.write_text(f"{episode_number}\n", encoding="utf-8")
+        except OSError as exc:
+            report(f'Moved the files, but could not update "{counter_path.name}" to {episode_number}: {exc}')
+
+    report(f'Moved "{destination_media.name}" and "{destination_srt.name}" to "{destination_dir}".')
+    return True
+
+
+def move_completed_outputs_for_target(
+    input_path: Path,
+    outputs: OutputPaths,
+    target: WatchTarget,
+    report: Reporter,
+) -> bool:
+    destination_dir = target.move_completed_files_to
+    if destination_dir is None:
+        return True
+
+    return move_completed_watch_outputs(
+        input_path,
+        outputs,
+        destination_dir,
+        report,
+        dry_run=target.cfg.dry_run,
+        cfg=target.cfg,
+        rename_strategy=target.rename_strategy,
+    )
+
+
+def run_watch_loop(
+    watch_targets: Sequence[WatchTarget],
     poll_interval: float,
     settle_seconds: float,
 ) -> int:
-    watch_dir = watch_dir.expanduser()
-    try:
-        watch_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        print(
-            "\nCould not create or access watch directory:\n"
-            f'  "{watch_dir}"\n'
-            f"  {exc}\n"
+    prepared_targets: list[WatchTarget] = []
+    for target in watch_targets:
+        watch_dir = target.watch_dir.expanduser()
+        try:
+            watch_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f'\nCould not create or access watch directory:\n  "{watch_dir}"\n  {exc}\n')
+            return 1
+        prepared_targets.append(
+            WatchTarget(
+                watch_dir=watch_dir,
+                cfg=target.cfg,
+                allowed_extensions=target.allowed_extensions,
+                move_completed_files_to=target.move_completed_files_to,
+                rename_strategy=target.rename_strategy,
+            )
         )
-        return 1
 
     watcher_log_path = project_dir() / LOG_DIR_NAME / WATCHER_LOG_NAME
     report = make_watch_reporter(watcher_log_path)
-    report(f'Watcher started for "{watch_dir}".')
-    report(
-        "Defaults: "
-        f"lang={cfg.language}, mode={cfg.mode}, model={cfg.model}, "
-        f'diarize={"on" if cfg.diarize else "off"}, device={cfg.device}, '
-        f"compute_type={cfg.compute_type}."
-    )
+    for target in prepared_targets:
+        report(f'Watcher started for "{target.watch_dir}".')
+        report(
+            "Defaults: "
+            f"lang={target.cfg.language}, mode={target.cfg.mode}, model={target.cfg.model}, "
+            f"diarize={'on' if target.cfg.diarize else 'off'}, device={target.cfg.device}, "
+            f"compute_type={target.cfg.compute_type}, "
+            f"translate={'on' if target.cfg.translate_to_english else 'auto'}, "
+            f"llm={'on' if target.cfg.write_llm_txt else 'off'}."
+        )
+        if target.allowed_extensions == frozenset(VIDEO_EXTENSIONS):
+            report("Media filter: video files only.")
+        if target.move_completed_files_to is not None:
+            report(f'Post-process: move the source media and SRT to "{target.move_completed_files_to}".')
+        if target.rename_strategy == ESCUELA_RENAME_STRATEGY:
+            report(
+                f'Naming: "{ESCUELA_SERIES_NAME} - s01e<next> - <translated title>" '
+                f'using "{ESCUELA_EPISODE_COUNTER_FILE_NAME}" (starting from {DEFAULT_ESCUELA_LAST_EPISODE}).'
+            )
     report(
         f"Polling every {poll_interval:g}s. A file must stay unchanged for {settle_seconds:g}s before transcription starts."
     )
@@ -2523,51 +2801,79 @@ def run_watch_loop(
             current_paths: set[str] = set()
             now = time.monotonic()
 
-            for path in iter_watch_candidates(watch_dir):
-                key = str(path.resolve())
-                current_paths.add(key)
+            for target in prepared_targets:
+                for path in iter_watch_candidates(target.watch_dir, target.allowed_extensions):
+                    key = str(path.resolve())
+                    current_paths.add(key)
 
-                if not needs_transcription(path, cfg):
-                    pending.pop(key, None)
-                    continue
-
-                try:
-                    size, mtime_ns = file_signature(path)
-                except OSError:
-                    pending.pop(key, None)
-                    continue
-
-                pending_file = pending.get(key)
-                if pending_file is None:
-                    pending[key] = PendingWatchFile(size=size, mtime_ns=mtime_ns, stable_since=now)
-                    report(f'Detected "{path.name}". Waiting for the file to settle.')
-                    continue
-
-                if pending_file.size != size or pending_file.mtime_ns != mtime_ns:
-                    pending_file.size = size
-                    pending_file.mtime_ns = mtime_ns
-                    pending_file.stable_since = now
-                    pending_file.last_attempt_at = None
-                    continue
-
-                if now - pending_file.stable_since < settle_seconds:
-                    continue
-
-                if pending_file.last_attempt_at is not None:
-                    if now - pending_file.last_attempt_at < WATCH_RETRY_COOLDOWN_SECONDS:
+                    outputs = output_paths_for_input(path, target.cfg)
+                    should_transcribe = needs_transcription(path, target.cfg)
+                    should_move = (
+                        target.move_completed_files_to is not None and path.exists() and outputs.srt_path.exists()
+                    )
+                    if not should_transcribe and not should_move:
+                        pending.pop(key, None)
                         continue
 
-                pending_file.last_attempt_at = now
-                report(f'Starting transcription for "{path.name}".')
-                rc = transcribe_file(cfg, path, report=report)
-                outputs = output_paths_for_input(path, cfg)
-                if rc == 0 and outputs.srt_path.exists():
-                    pending.pop(key, None)
-                    report(f'Finished "{path.name}" -> "{outputs.srt_path.name}".')
-                else:
-                    report(
-                        f'Failed "{path.name}". Will retry in {WATCH_RETRY_COOLDOWN_SECONDS:g}s if the transcript is still missing.'
-                    )
+                    try:
+                        size, mtime_ns = file_signature(path)
+                    except OSError:
+                        pending.pop(key, None)
+                        continue
+
+                    pending_file = pending.get(key)
+                    if pending_file is None:
+                        pending[key] = PendingWatchFile(size=size, mtime_ns=mtime_ns, stable_since=now)
+                        if should_transcribe:
+                            report(f'Detected "{path.name}". Waiting for the file to settle.')
+                        else:
+                            report(f'Queued "{path.name}" for move after the file settles.')
+                        continue
+
+                    if pending_file.size != size or pending_file.mtime_ns != mtime_ns:
+                        pending_file.size = size
+                        pending_file.mtime_ns = mtime_ns
+                        pending_file.stable_since = now
+                        pending_file.last_attempt_at = None
+                        continue
+
+                    if now - pending_file.stable_since < settle_seconds:
+                        continue
+
+                    if pending_file.last_attempt_at is not None:
+                        if now - pending_file.last_attempt_at < WATCH_RETRY_COOLDOWN_SECONDS:
+                            continue
+
+                    pending_file.last_attempt_at = now
+                    if should_transcribe:
+                        report(f'Starting transcription for "{path.name}".')
+                        rc = transcribe_file(target.cfg, path, report=report)
+                        outputs = output_paths_for_input(path, target.cfg)
+                        if rc == 0 and outputs.srt_path.exists():
+                            if target.move_completed_files_to is not None:
+                                if move_completed_outputs_for_target(path, outputs, target, report):
+                                    pending.pop(key, None)
+                                    report(f'Finished "{path.name}" and moved the completed files.')
+                                else:
+                                    report(
+                                        f'Finished "{path.name}", but the move step failed. '
+                                        f"Will retry in {WATCH_RETRY_COOLDOWN_SECONDS:g}s while the source remains."
+                                    )
+                            else:
+                                pending.pop(key, None)
+                                report(f'Finished "{path.name}" -> "{outputs.srt_path.name}".')
+                        else:
+                            report(
+                                f'Failed "{path.name}". Will retry in {WATCH_RETRY_COOLDOWN_SECONDS:g}s if the transcript is still missing.'
+                            )
+                        continue
+
+                    if move_completed_outputs_for_target(path, outputs, target, report):
+                        pending.pop(key, None)
+                    else:
+                        report(
+                            f'Could not move "{path.name}". Will retry in {WATCH_RETRY_COOLDOWN_SECONDS:g}s while the source remains.'
+                        )
 
             for key in list(pending):
                 if key not in current_paths:
@@ -2605,8 +2911,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.watch:
         return run_watch_loop(
-            cfg=cfg,
-            watch_dir=Path(args.watch_dir),
+            watch_targets=build_watch_targets(cfg, Path(args.watch_dir)),
             poll_interval=args.poll_interval,
             settle_seconds=args.settle_seconds,
         )
