@@ -139,6 +139,41 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(no_diarize_cfg.speaker_labels)
         self.assertFalse(no_diarize_cfg.diarize)
 
+    @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", return_value="n")
+    def test_interactive_prompt_can_disable_quality_speaker_labels(
+        self,
+        _input: MagicMock,
+        _isatty: MagicMock,
+    ) -> None:
+        cfg = build_config(parse_args(["--lang", "en", "--mode", "quality"]), interactive=True)
+
+        self.assertFalse(cfg.speaker_labels)
+        self.assertFalse(cfg.diarize)
+
+    @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", return_value="y")
+    def test_interactive_prompt_can_enable_fast_speaker_labels(
+        self,
+        _input: MagicMock,
+        _isatty: MagicMock,
+    ) -> None:
+        cfg = build_config(parse_args(["--lang", "en", "--mode", "fast"]), interactive=True)
+
+        self.assertTrue(cfg.speaker_labels)
+        self.assertTrue(cfg.diarize)
+
+    @patch("builtins.input")
+    def test_speaker_label_flags_skip_interactive_prompt(self, prompt: MagicMock) -> None:
+        cfg = build_config(
+            parse_args(["--lang", "en", "--mode", "quality", "--no-speaker-labels"]),
+            interactive=True,
+        )
+
+        self.assertFalse(cfg.speaker_labels)
+        self.assertFalse(cfg.diarize)
+        prompt.assert_not_called()
+
     def test_translate_flag_enables_direct_whisperx_output(self) -> None:
         cfg = build_config(parse_args(["--translate-to-english"]), interactive=False)
         self.assertTrue(cfg.translate_to_english)

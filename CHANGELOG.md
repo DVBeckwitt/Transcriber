@@ -13,6 +13,7 @@
 - Added watcher support for the Escuela video folder policy from the recordings watcher.
 - Added `merge_transcripts.py` for recursive transcript text merging.
 - Added `--speaker-labels` and `--no-speaker-labels` to control whether generated SRT files include diarization speaker labels.
+- Added an interactive speaker-label prompt after the language and quality/fast prompts for one-off CLI runs.
 
 ### Fixed
 - Fixed watcher completed-file movement so missing `.srt` files leave media in place for retry.
@@ -30,7 +31,7 @@
 
 ### Status
 - Feature status: agentic legibility hardening is shipped as tooling and governance only.
-- Feature status: SRT speaker label option is ready for release and covered by config, watcher, summary, token cue, and fallback cue regression tests.
+- Feature status: SRT speaker label option is ready for release and covered by config, interactive prompt, watcher, summary, token cue, and fallback cue regression tests.
 - Local quality gates pass: pytest with coverage, Ruff lint, Ruff format check, mypy, CLI help, uv lock sync, package build, dependency audit, pre-commit hooks, and secret scanning.
 - Release type: local CLI/tooling update.
 - Migration: none required; old diarization flags remain supported while the clearer speaker-label flags are preferred.

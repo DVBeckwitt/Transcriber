@@ -70,7 +70,7 @@ Project workflow and governance:
 - A+ hardening: shipped on 2026-05-11. `Makefile` validation, coverage gate, pre-commit hooks, and Gitleaks secret scanning are in place. This is a tooling/governance feature; public CLI behavior is unchanged.
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
-- Speaker label option: ready for release. `--speaker-labels` and `--no-speaker-labels` now control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
+- Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, and transcript merge collection were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
 - Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. No migration or deprecation is required. Rollback is `git revert` of the release commit.
@@ -162,6 +162,8 @@ Manual file-picker flow from the CLI:
 transcriber
 ```
 
+This prompts for language, quality/fast mode, and whether to add speaker labels before transcription starts.
+
 Watch mode from the CLI:
 
 ```powershell
@@ -214,6 +216,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - If preprocessing fails, the launcher falls back to the original source file.
 - WhisperX receives an initial prompt built from `--asr-prompt`, `--asr-prompt-file`, and glossary terms when present.
 - Quality mode uses a fallback temperature schedule by default; fast mode uses a single-pass decode.
+- Interactive one-off runs prompt for language, quality/fast mode, and speaker labels unless those choices are already provided with CLI arguments.
 - Watch mode monitors the top level of the watched folder for supported media files.
 - The default recordings watcher also monitors `%USERPROFILE%\Videos\escuela` for supported video files.
 - Watch mode waits for a file to stop changing before transcription starts.
