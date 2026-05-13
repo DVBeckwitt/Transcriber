@@ -23,6 +23,7 @@
 
 ### Changed
 - Simplified config preset setup, temporary directory candidate de-duplication, SRT finalization, confidence cleanup, and transcript merge collection without changing public behavior.
+- Simplified the speaker-label prompt/config control flow without changing interactive prompts, CLI flags, or diarization behavior.
 - Changed the user-facing speaker label path so `--no-speaker-labels` skips diarization and Hugging Face token loading.
 - Kept `--diarize` and `--no-diarize` as backward-compatible aliases; no deprecation or migration is required.
 
@@ -32,6 +33,7 @@
 ### Status
 - Feature status: agentic legibility hardening is shipped as tooling and governance only.
 - Feature status: SRT speaker label option is ready for release and covered by config, interactive prompt, watcher, summary, token cue, and fallback cue regression tests.
+- Refactor status: speaker-label prompt simplification is ready for release; no bug fix, user migration, deprecation, or CI contract change is required.
 - Local quality gates pass: pytest with coverage, Ruff lint, Ruff format check, mypy, CLI help, uv lock sync, package build, dependency audit, pre-commit hooks, and secret scanning.
 - Release type: local CLI/tooling update.
 - Migration: none required; old diarization flags remain supported while the clearer speaker-label flags are preferred.

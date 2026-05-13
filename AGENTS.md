@@ -69,7 +69,7 @@ If using `$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"`, keep that variable set for 
 - Watcher move failure handling is fixed and covered by regression tests. Missing or locked `.srt` files no longer strand moved media without a retryable source.
 - Transcript merge secret filtering is fixed and covered by regression tests. Token files are skipped case-insensitively, and generated/cache directories are excluded from recursive scans.
 - Speaker label option is ready for release and covered by regression tests. Interactive one-off runs prompt for speaker labels after language and quality/fast mode. `--speaker-labels` / `--no-speaker-labels` control SRT `SPEAKER_00:` labels; disabling labels skips diarization and Hugging Face token loading. Existing `--diarize` / `--no-diarize` remain backward-compatible aliases.
-- Code simplification is complete for the current refactor slice. Public CLI behavior, watcher policy, and merge output contracts are unchanged.
+- Code simplification is complete for the current refactor slice. The speaker-label prompt/config flow was simplified without changing public CLI behavior, watcher policy, or merge output contracts.
 - Dependency audit is strict in CI through `pip-audit`; secret scanning is enforced with Gitleaks; Dependabot is configured for GitHub Actions and uv.
 - Coverage is enforced through pytest-cov. Start at the current baseline and ratchet up only when tests improve.
 - No deprecation or migration is required for this release; old diarization flags remain supported.

@@ -71,7 +71,7 @@ Project workflow and governance:
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
-- Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, and transcript merge collection were simplified without changing public CLI behavior.
+- Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, transcript merge collection, and speaker-label prompt/config control flow were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
 - Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. No migration or deprecation is required. Rollback is `git revert` of the release commit.
 

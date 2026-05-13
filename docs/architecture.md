@@ -47,6 +47,7 @@ build_watch_targets
 
 - SRT speaker label control is a user-facing CLI feature, not a pipeline migration. Interactive one-off runs prompt for speaker labels after language and quality/fast mode. `--speaker-labels` and `--no-speaker-labels` are the preferred flag names; `--diarize` and `--no-diarize` remain supported aliases.
 - Disabling speaker labels skips diarization, Hugging Face token loading, speaker smoothing, and `SPEAKER_00:` rendering while preserving subtitle timing, cleanup, translation, watcher, and movement behavior.
+- The speaker-label prompt/config simplification is an internal refactor only. It does not change CLI options, prompt wording, defaults, watcher behavior, CI gates, or migration posture.
 - Rollback is git-based: revert the release commit and rerun the full validation gate.
 
 ## Change Guide

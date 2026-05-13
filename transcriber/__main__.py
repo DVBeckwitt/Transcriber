@@ -1750,8 +1750,6 @@ def prompt_speaker_labels(current: bool) -> bool:
         return current
     default = "yes" if current else "no"
     choice = input(f"Speaker labels [Enter={default}, y=yes, n=no]: ").strip().lower()
-    if choice in {"", "default"}:
-        return current
     if choice in {"y", "yes", "on", "speaker", "speakers", "speaker-labels", "diarize"}:
         return True
     if choice in {"n", "no", "off", "none", "no-speaker-labels", "no-diarize"}:
@@ -1870,14 +1868,14 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
     if args.condition_on_previous_text is not None:
         condition_on_previous_text = bool(args.condition_on_previous_text)
 
-    speaker_labels = speaker_labels_default
-    speaker_labels_locked = bool(args.force_speaker_labels or args.force_no_speaker_labels)
-    if interactive and not speaker_labels_locked:
-        speaker_labels = prompt_speaker_labels(speaker_labels)
     if args.force_speaker_labels:
         speaker_labels = True
     elif args.force_no_speaker_labels:
         speaker_labels = False
+    elif interactive:
+        speaker_labels = prompt_speaker_labels(speaker_labels_default)
+    else:
+        speaker_labels = speaker_labels_default
     diarize = speaker_labels
 
     diarize_smoothing = not args.no_diarize_smoothing
