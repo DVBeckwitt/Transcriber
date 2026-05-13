@@ -70,13 +70,14 @@ Project workflow and governance:
 - A+ hardening: shipped on 2026-05-11. `Makefile` validation, coverage gate, pre-commit hooks, and Gitleaks secret scanning are in place. This is a tooling/governance feature; public CLI behavior is unchanged.
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
+- Speaker label option: ready for release. `--speaker-labels` and `--no-speaker-labels` now control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, and transcript merge collection were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
-- Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/tooling release. No migration is required. Rollback is `git revert` of the release commit.
+- Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. No migration or deprecation is required. Rollback is `git revert` of the release commit.
 
-## Hugging Face token (for diarization)
+## Hugging Face token (for speaker labels)
 
-Diarization requires a token and accepted model terms.
+Diarization is only needed when SRT speaker labels are enabled. It requires a token and accepted model terms.
 
 1. Copy `HF_TOKEN.example.txt` to `HF_TOKEN.txt`.
 2. Replace the placeholder with your own Hugging Face token.
@@ -94,6 +95,7 @@ Optional:
 - Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology during Spanish-to-English translation.
 - Add `--asr-prompt` or `--asr-prompt-file` to bias WhisperX toward names and jargon during transcription.
 - Add `--translate-to-english` to use WhisperX translation mode so the `.srt` is written in English directly instead of generating a Spanish SRT first.
+- Add `--no-speaker-labels` when you do not want `SPEAKER_00:` style labels in the SRT; this also skips diarization and the Hugging Face token requirement.
 - Use `--temperature-schedule`, `--best-of`, `--logprob-threshold`, and related options to control decode fallbacks.
 
 ## Run
@@ -192,10 +194,10 @@ Spanish audio translated to English:
 transcriber --input "C:\media\call.wav" --lang auto
 ```
 
-Force no diarization:
+Write subtitles without speaker labels:
 
 ```powershell
-transcriber --input "C:\media\meeting.mp4" --no-diarize
+transcriber --input "C:\media\meeting.mp4" --no-speaker-labels
 ```
 
 Watch a folder and wait for files to stop changing before transcribing:
@@ -219,11 +221,12 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - When `%USERPROFILE%\Videos\escuela` already has both the video and `.srt`, watch mode will still try to move them to `\\BECKWITT-SERVER\Plex\TV\Escuela de Nada`.
 - `%USERPROFILE%\Videos\escuela` files are renamed into `Escuela de Nada - s01e<next> - <translated title>` and tracked with `episode_counter.txt` in the destination folder.
 - Default mode presets:
-  - `quality`: model `large-v3`, diarization on by default
-  - `fast`: model `medium`, diarization off by default
+  - `quality`: model `large-v3`, speaker labels and diarization on by default
+  - `fast`: model `medium`, speaker labels and diarization off by default
 - Language is auto-detected unless you force `--lang en` or `--lang es`.
 - If you pass `--translate-to-english`, WhisperX writes English subtitle text directly.
 - If the detected language is Spanish and `--translate-to-english` is not set, the launcher falls back to the existing post-translation step.
+- If speaker labels are disabled, the launcher skips diarization and writes SRT text without `SPEAKER_00:` prefixes.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
@@ -253,8 +256,10 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 --watch-dir        Folder to watch (default: %USERPROFILE%\OneDrive\recordings)
 --poll-interval    Seconds between folder scans in watch mode
 --settle-seconds   Delay after file changes before watch mode starts a run
---diarize          Force diarization on
---no-diarize       Force diarization off
+--speaker-labels   Add diarization speaker labels to SRT output
+--no-speaker-labels  Do not add speaker labels; skips diarization
+--diarize          Backward-compatible alias for --speaker-labels
+--no-diarize       Backward-compatible alias for --no-speaker-labels
 --no-diarize-smoothing     Disable speaker diarization smoothing
 --min-speaker-turn-ms      Minimum speaker turn duration for smoothing
 --min-speaker-turn-tokens  Minimum speaker turn size (in tokens) for smoothing

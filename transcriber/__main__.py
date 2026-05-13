@@ -130,6 +130,7 @@ class RunConfig:
     logprob_threshold: float | None
     no_speech_threshold: float | None
     condition_on_previous_text: bool
+    speaker_labels: bool
     diarize: bool
     diarize_smoothing: bool
     min_speaker_turn_ms: int
@@ -884,7 +885,7 @@ def finalize_timed_cue(index: int, prefix: str, tokens: Sequence[TimedToken]) ->
     return SRTCue(index=index, start_ms=start_ms, end_ms=end_ms, text=wrapped_text)
 
 
-def build_segment_fallback_cues(result: dict[str, Any]) -> list[SRTCue]:
+def build_segment_fallback_cues(result: dict[str, Any], speaker_labels: bool = True) -> list[SRTCue]:
     cues: list[SRTCue] = []
     for raw_segment in result.get("segments", []):
         if not isinstance(raw_segment, dict):
@@ -896,7 +897,7 @@ def build_segment_fallback_cues(result: dict[str, Any]) -> list[SRTCue]:
         text = normalize_subtitle_whitespace(str(raw_segment.get("text") or ""))
         if not text:
             continue
-        prefix = speaker_prefix(raw_segment.get("speaker"))
+        prefix = speaker_prefix(raw_segment.get("speaker")) if speaker_labels else ""
         cues.extend(split_cue_for_subtitles(SRTCue(index=0, start_ms=start_ms, end_ms=end_ms, text=f"{prefix}{text}")))
 
     for idx, cue in enumerate(cues, start=1):
@@ -905,9 +906,10 @@ def build_segment_fallback_cues(result: dict[str, Any]) -> list[SRTCue]:
 
 
 def build_srt_cues_from_result(result: dict[str, Any], cfg: RunConfig | None = None) -> list[SRTCue]:
+    speaker_labels = cfg is None or cfg.speaker_labels
     tokens = extract_timed_tokens(result, cfg)
     if not tokens:
-        return build_segment_fallback_cues(result)
+        return build_segment_fallback_cues(result, speaker_labels=speaker_labels)
 
     cues: list[SRTCue] = []
     current_tokens: list[TimedToken] = []
@@ -922,7 +924,7 @@ def build_srt_cues_from_result(result: dict[str, Any], cfg: RunConfig | None = N
         current_prefix = ""
 
     for token in tokens:
-        token_prefix = speaker_prefix(token.speaker)
+        token_prefix = speaker_prefix(token.speaker) if speaker_labels else ""
         if not current_tokens:
             current_tokens = [token]
             current_prefix = token_prefix
@@ -951,7 +953,7 @@ def build_srt_cues_from_result(result: dict[str, Any], cfg: RunConfig | None = N
     flush_current()
 
     if not cues:
-        return build_segment_fallback_cues(result)
+        return build_segment_fallback_cues(result, speaker_labels=speaker_labels)
 
     for idx, cue in enumerate(cues, start=1):
         cue.index = idx
@@ -1611,10 +1613,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run", action="store_true", help="Show planned actions without running WhisperX or writing outputs."
     )
-    diarize_group = parser.add_mutually_exclusive_group()
-    diarize_group.add_argument("--diarize", dest="force_diarize", action="store_true", help="Force diarization on.")
-    diarize_group.add_argument(
-        "--no-diarize", dest="force_no_diarize", action="store_true", help="Force diarization off."
+    speaker_label_group = parser.add_mutually_exclusive_group()
+    speaker_label_group.add_argument(
+        "--speaker-labels",
+        "--diarize",
+        dest="force_speaker_labels",
+        action="store_true",
+        help="Add diarization speaker labels to SRT output.",
+    )
+    speaker_label_group.add_argument(
+        "--no-speaker-labels",
+        "--no-diarize",
+        dest="force_no_speaker_labels",
+        action="store_true",
+        help="Do not add speaker labels; skips diarization.",
     )
     parser.add_argument("--no-diarize-smoothing", action="store_true", help="Disable speaker diarization smoothing.")
     parser.add_argument(
@@ -1811,7 +1823,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         temperature_schedule = (0.0,)
         best_of = 1
         condition_on_previous_text = False
-        diarize_default = False
+        speaker_labels_default = False
     else:
         batch_size = 8
         beam_size = 8
@@ -1819,7 +1831,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         temperature_schedule = (0.0, 0.2, 0.4, 0.6, 0.8)
         best_of = 5
         condition_on_previous_text = True
-        diarize_default = True
+        speaker_labels_default = True
 
     if args.temperature is not None:
         temperature = float(args.temperature)
@@ -1844,12 +1856,13 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
     if args.condition_on_previous_text is not None:
         condition_on_previous_text = bool(args.condition_on_previous_text)
 
-    if args.force_diarize:
-        diarize = True
-    elif args.force_no_diarize:
-        diarize = False
+    if args.force_speaker_labels:
+        speaker_labels = True
+    elif args.force_no_speaker_labels:
+        speaker_labels = False
     else:
-        diarize = diarize_default
+        speaker_labels = speaker_labels_default
+    diarize = speaker_labels
 
     diarize_smoothing = not args.no_diarize_smoothing
 
@@ -1891,6 +1904,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         logprob_threshold=logprob_threshold,
         no_speech_threshold=no_speech_threshold,
         condition_on_previous_text=condition_on_previous_text,
+        speaker_labels=speaker_labels,
         diarize=diarize,
         diarize_smoothing=diarize_smoothing,
         min_speaker_turn_ms=max(0, int(args.min_speaker_turn_ms)),
@@ -1953,6 +1967,7 @@ def make_watch_target(cfg: RunConfig, watch_dir: Path) -> WatchTarget:
                 language="es",
                 translate_to_english=True,
                 write_llm_txt=False,
+                speaker_labels=False,
                 diarize=False,
             ),
             allowed_extensions=frozenset(VIDEO_EXTENSIONS),
@@ -2310,6 +2325,7 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
         report(f"Translate: {'whisperx direct' if cfg.translate_to_english else 'off'}")
     report(f"Mode:      {cfg.mode}")
     report(f"Model:     {cfg.model}")
+    report(f"Speakers:  {'on' if cfg.speaker_labels else 'off'}")
     report(f"Diarize:   {'on' if cfg.diarize else 'off'}")
     report(f"Smooth:    {'on' if (cfg.diarize and cfg.diarize_smoothing) else 'off'}")
     report(
@@ -2759,6 +2775,7 @@ def run_watch_loop(
         report(
             "Defaults: "
             f"lang={target.cfg.language}, mode={target.cfg.mode}, model={target.cfg.model}, "
+            f"speakers={'on' if target.cfg.speaker_labels else 'off'}, "
             f"diarize={'on' if target.cfg.diarize else 'off'}, device={target.cfg.device}, "
             f"compute_type={target.cfg.compute_type}, "
             f"translate={'on' if target.cfg.translate_to_english else 'auto'}, "

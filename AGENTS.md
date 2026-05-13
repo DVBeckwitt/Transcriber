@@ -64,14 +64,15 @@ If using `$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"`, keep that variable set for 
 
 ## Current Ship Status
 
-- Status date: 2026-05-11.
+- Status date: 2026-05-13.
 - Agentic legibility hardening is ready for release: reproducible uv environment, `Makefile` validation, coverage gate, CI quality gates, agent guide, governance docs, security policy, architecture docs, and generated-artifact cleanup are in place.
 - Watcher move failure handling is fixed and covered by regression tests. Missing or locked `.srt` files no longer strand moved media without a retryable source.
 - Transcript merge secret filtering is fixed and covered by regression tests. Token files are skipped case-insensitively, and generated/cache directories are excluded from recursive scans.
+- Speaker label option is ready for release and covered by regression tests. `--speaker-labels` / `--no-speaker-labels` control SRT `SPEAKER_00:` labels; disabling labels skips diarization and Hugging Face token loading. Existing `--diarize` / `--no-diarize` remain backward-compatible aliases.
 - Code simplification is complete for the current refactor slice. Public CLI behavior, watcher policy, and merge output contracts are unchanged.
 - Dependency audit is strict in CI through `pip-audit`; secret scanning is enforced with Gitleaks; Dependabot is configured for GitHub Actions and uv.
 - Coverage is enforced through pytest-cov. Start at the current baseline and ratchet up only when tests improve.
-- No deprecation or migration is required for this release.
+- No deprecation or migration is required for this release; old diarization flags remain supported.
 - Rollback path is git-based: revert the release commit to restore the previous behavior and docs.
 
 ## Conventions

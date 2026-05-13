@@ -38,10 +38,16 @@ build_watch_targets
 ## Stable Interfaces
 
 - CLI options documented in `README.md` are user-facing. Preserve them unless a change explicitly deprecates behavior.
-- `RunConfig` is the internal configuration object passed through transcription and watcher flows.
+- `RunConfig` is the internal configuration object passed through transcription and watcher flows. `speaker_labels` records the user-facing SRT display choice; `diarize` records whether WhisperX diarization should run.
 - `OutputPaths` defines where `.srt`, `*_llm.txt`, logs, and lock files are expected.
 - `WatchTarget` defines per-folder watcher policy, including allowed extensions, destination moves, and rename strategy.
 - The CI workflow is a repository contract. Update `README.md`, `AGENTS.md`, and `CONTRIBUTING.md` when changing validation commands.
+
+## Release Notes
+
+- SRT speaker label control is a user-facing CLI feature, not a pipeline migration. `--speaker-labels` and `--no-speaker-labels` are the preferred names; `--diarize` and `--no-diarize` remain supported aliases.
+- Disabling speaker labels skips diarization, Hugging Face token loading, speaker smoothing, and `SPEAKER_00:` rendering while preserving subtitle timing, cleanup, translation, watcher, and movement behavior.
+- Rollback is git-based: revert the release commit and rerun the full validation gate.
 
 ## Change Guide
 

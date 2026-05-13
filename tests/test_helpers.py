@@ -26,6 +26,8 @@ from transcriber.__main__ import (
     build_asr_prompt,
     build_audio_preprocess_command,
     build_config,
+    build_segment_fallback_cues,
+    build_srt_cues_from_result,
     build_translation_prompt,
     build_watch_targets,
     is_watchable_media,
@@ -35,6 +37,7 @@ from transcriber.__main__ import (
     parse_args,
     parse_glossary_entries,
     parse_temperature_schedule,
+    print_summary,
     project_dir,
     render_uncertain_markup,
     run_whisperx_direct_logged,
@@ -61,6 +64,7 @@ def make_cfg(**overrides: object) -> RunConfig:
         logprob_threshold=-1.0,
         no_speech_threshold=0.6,
         condition_on_previous_text=True,
+        speaker_labels=True,
         diarize=True,
         diarize_smoothing=True,
         min_speaker_turn_ms=900,
@@ -87,11 +91,53 @@ def make_cfg(**overrides: object) -> RunConfig:
     return cfg
 
 
+def speaker_labeled_result() -> dict[str, Any]:
+    return {
+        "segments": [
+            {
+                "text": "Hello there",
+                "start": 0.0,
+                "end": 1.0,
+                "speaker": "SPEAKER_00",
+                "words": [
+                    {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "SPEAKER_00"},
+                    {"word": "there", "start": 0.5, "end": 1.0, "speaker": "SPEAKER_00"},
+                ],
+            }
+        ]
+    }
+
+
 class HelperTests(unittest.TestCase):
     def test_build_config_defaults_to_auto(self) -> None:
         cfg = build_config(parse_args([]), interactive=False)
         self.assertEqual(cfg.language, "auto")
         self.assertFalse(cfg.translate_to_english)
+        self.assertTrue(cfg.speaker_labels)
+        self.assertTrue(cfg.diarize)
+
+    def test_fast_mode_defaults_to_no_speaker_labels(self) -> None:
+        cfg = build_config(parse_args(["--mode", "fast"]), interactive=False)
+        self.assertFalse(cfg.speaker_labels)
+        self.assertFalse(cfg.diarize)
+
+    def test_speaker_label_flags_control_diarization(self) -> None:
+        labels_cfg = build_config(parse_args(["--speaker-labels"]), interactive=False)
+        no_labels_cfg = build_config(parse_args(["--no-speaker-labels"]), interactive=False)
+
+        self.assertTrue(labels_cfg.speaker_labels)
+        self.assertTrue(labels_cfg.diarize)
+        self.assertFalse(no_labels_cfg.speaker_labels)
+        self.assertFalse(no_labels_cfg.diarize)
+
+    def test_existing_diarize_flags_control_speaker_labels(self) -> None:
+        diarize_cfg = build_config(parse_args(["--diarize"]), interactive=False)
+        no_diarize_cfg = build_config(parse_args(["--no-diarize"]), interactive=False)
+
+        self.assertTrue(diarize_cfg.speaker_labels)
+        self.assertTrue(diarize_cfg.diarize)
+        self.assertFalse(no_diarize_cfg.speaker_labels)
+        self.assertFalse(no_diarize_cfg.diarize)
 
     def test_translate_flag_enables_direct_whisperx_output(self) -> None:
         cfg = build_config(parse_args(["--translate-to-english"]), interactive=False)
@@ -172,6 +218,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(targets[0].cfg.language, "auto")
         self.assertTrue(targets[1].cfg.translate_to_english)
         self.assertEqual(targets[1].cfg.language, "es")
+        self.assertFalse(targets[1].cfg.speaker_labels)
         self.assertFalse(targets[1].cfg.diarize)
         self.assertFalse(targets[1].cfg.write_llm_txt)
         self.assertEqual(targets[1].allowed_extensions, frozenset(VIDEO_EXTENSIONS))
@@ -185,6 +232,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(targets[0].watch_dir, DEFAULT_ESCUELA_WATCH_DIR)
         self.assertEqual(targets[0].cfg.language, "es")
         self.assertTrue(targets[0].cfg.translate_to_english)
+        self.assertFalse(targets[0].cfg.speaker_labels)
         self.assertFalse(targets[0].cfg.diarize)
         self.assertFalse(targets[0].cfg.write_llm_txt)
         self.assertEqual(targets[0].move_completed_files_to, DEFAULT_ESCUELA_DEST_DIR)
@@ -202,6 +250,18 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(outputs.llm_path.parent, source.parent)
             self.assertEqual(outputs.lock_path.parent, source.parent)
             self.assertEqual(outputs.log_path.parent, project_dir() / "logs")
+
+    def test_summary_reports_speaker_label_choice(self) -> None:
+        cfg = make_cfg(speaker_labels=False, diarize=False)
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.mp4"
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+
+            messages: list[str] = []
+            print_summary(cfg, source, outputs, report=messages.append)
+
+        self.assertIn("Speakers:  off", messages)
+        self.assertIn("Diarize:   off", messages)
 
     def test_move_completed_watch_outputs_moves_video_and_srt(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -302,7 +362,13 @@ class HelperTests(unittest.TestCase):
                 outputs,
                 dest_dir,
                 messages.append,
-                cfg=make_cfg(language="es", translate_to_english=True, diarize=False, write_llm_txt=False),
+                cfg=make_cfg(
+                    language="es",
+                    translate_to_english=True,
+                    speaker_labels=False,
+                    diarize=False,
+                    write_llm_txt=False,
+                ),
                 rename_strategy=ESCUELA_RENAME_STRATEGY,
             )
 
@@ -346,7 +412,13 @@ class HelperTests(unittest.TestCase):
                 outputs,
                 dest_dir,
                 lambda _: None,
-                cfg=make_cfg(language="es", translate_to_english=True, diarize=False, write_llm_txt=False),
+                cfg=make_cfg(
+                    language="es",
+                    translate_to_english=True,
+                    speaker_labels=False,
+                    diarize=False,
+                    write_llm_txt=False,
+                ),
                 rename_strategy=ESCUELA_RENAME_STRATEGY,
             )
 
@@ -473,6 +545,32 @@ class HelperTests(unittest.TestCase):
         smoothed = smooth_timed_tokens(tokens)
 
         self.assertEqual([token.speaker for token in smoothed], ["SPEAKER_00", "SPEAKER_00", "SPEAKER_00"])
+
+    def test_srt_cues_omit_speaker_prefixes_when_labels_are_disabled(self) -> None:
+        cues = build_srt_cues_from_result(speaker_labeled_result(), make_cfg(speaker_labels=False, diarize=False))
+
+        self.assertEqual([cue.text for cue in cues], ["Hello there"])
+
+    def test_srt_cues_preserve_speaker_prefixes_when_labels_are_enabled(self) -> None:
+        cues = build_srt_cues_from_result(speaker_labeled_result(), make_cfg(speaker_labels=True, diarize=True))
+
+        self.assertEqual([cue.text for cue in cues], ["SPEAKER_00: Hello there"])
+
+    def test_segment_fallback_cues_omit_speaker_prefixes_when_labels_are_disabled(self) -> None:
+        result: dict[str, Any] = {
+            "segments": [
+                {
+                    "text": "Fallback text",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "SPEAKER_00",
+                }
+            ]
+        }
+
+        cues = build_segment_fallback_cues(result, speaker_labels=False)
+
+        self.assertEqual([cue.text for cue in cues], ["Fallback text"])
 
     def test_merge_transcripts_recursively_skips_output_and_non_transcripts(self) -> None:
         with TemporaryDirectory() as tmpdir:
