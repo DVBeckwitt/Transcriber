@@ -26,7 +26,9 @@ Keep live dependencies in the `live` optional dependency group. Keep the existin
 
 Start WhisperLiveKit with the LocalAgreement backend policy. This keeps the repo on a documented WhisperLiveKit streaming policy while avoiding the current SimulStreaming encoder failure observed with CTranslate2 `StorageView` values on the local Windows CPU environment.
 
-Preserve committed bilingual caption pairs in `CaptionState` and expose `--live-save-bilingual-transcript PATH` as an additive live-mode output. Keep `--live-save-transcript` as English-only, and have `live_translate.bat` write the bilingual log to ignored `logs\live_bilingual_transcript.txt` by default.
+Preserve committed bilingual caption pairs in `CaptionState` and expose `--live-save-bilingual-transcript PATH` as an additive live-mode output. Keep `--live-save-transcript` as English-only, and have `live_translate.bat` write the default direct-mode English log to ignored `logs\live_english_transcript.txt`.
+
+Make live translation mode explicit. Direct mode starts WhisperLiveKit with `--direct-english-translation`; in that mode committed `text` is already English, so bilingual transcript output is rejected. Cascade mode starts WhisperLiveKit with `--target-language en`; in that mode committed `text` is Spanish source text and `translation` is English, so bilingual transcript output is allowed.
 
 The live runtime path is:
 
@@ -68,8 +70,8 @@ WASAPI loopback audio
 ## Consequences
 
 - Live mode is additive and does not deprecate existing CLI behavior.
-- `--live-save-transcript` remains English-only; `--live-save-bilingual-transcript` writes numbered Spanish and English pairs.
-- `logs\live_bilingual_transcript.txt` is generated local output, ignored by git, and not part of release artifacts.
+- `--live-save-transcript` remains English-only; `--live-save-bilingual-transcript` writes numbered Spanish and English pairs only in cascade mode.
+- `logs\live_english_transcript.txt` and `logs\live_bilingual_transcript.txt` are generated local output, ignored by git, and not part of release artifacts.
 - The `live` extra and runtime guard are required for Python 3.11+ live use.
 - CI covers live parsing, conversion, CLI, and lifecycle logic without Windows audio hardware or model downloads.
 - No deprecation or migration path is required for this feature because the old transcript flag and file/watch pipelines remain unchanged.

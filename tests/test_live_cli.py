@@ -10,7 +10,7 @@ from unittest.mock import patch
 from transcriber.__main__ import main, parse_args
 from transcriber.live import _state_handler, _write_bilingual_transcript, build_live_config, run_live_mode
 from transcriber.live_audio import LoopbackDevice
-from transcriber.live_wlk import CaptionPair, CaptionState
+from transcriber.live_wlk import CaptionPair, CaptionState, LiveTranslationMode
 
 
 class LiveCliTests(unittest.TestCase):
@@ -27,26 +27,73 @@ class LiveCliTests(unittest.TestCase):
         self.assertEqual(cfg.model, "small")
         self.assertEqual(cfg.engine, "whisperlivekit")
         self.assertEqual(cfg.source, "system")
-        self.assertEqual(cfg.chunk_ms, 500)
+        self.assertEqual(cfg.translation_mode, LiveTranslationMode.DIRECT)
+        self.assertEqual(cfg.preset, "latency")
+        self.assertEqual(cfg.chunk_ms, 250)
         self.assertTrue(cfg.show_window)
         self.assertTrue(cfg.translate_to_english)
         self.assertFalse(cfg.speaker_labels)
         self.assertFalse(cfg.diarize)
         self.assertIsNone(cfg.save_bilingual_transcript_path)
 
-    def test_live_bilingual_transcript_path_reaches_config(self) -> None:
+    def test_live_cascade_bilingual_transcript_path_reaches_config(self) -> None:
         cfg = build_live_config(
-            parse_args(["--live", "--live-save-bilingual-transcript", "logs/live_bilingual_transcript.txt"])
+            parse_args(
+                [
+                    "--live",
+                    "--live-translation-mode",
+                    "cascade",
+                    "--live-save-bilingual-transcript",
+                    "logs/live_bilingual_transcript.txt",
+                ]
+            )
         )
 
+        self.assertEqual(cfg.translation_mode, LiveTranslationMode.CASCADE)
         self.assertEqual(cfg.save_bilingual_transcript_path, "logs/live_bilingual_transcript.txt")
 
-    def test_live_translate_launcher_enables_bilingual_transcript_log(self) -> None:
+    def test_live_quality_preset_defaults_to_cascade(self) -> None:
+        cfg = build_live_config(parse_args(["--live", "--live-preset", "quality"]))
+
+        self.assertEqual(cfg.preset, "quality")
+        self.assertEqual(cfg.translation_mode, LiveTranslationMode.CASCADE)
+        self.assertEqual(cfg.chunk_ms, 500)
+
+    def test_live_explicit_translation_mode_overrides_quality_preset(self) -> None:
+        cfg = build_live_config(parse_args(["--live", "--live-preset", "quality", "--live-translation-mode", "direct"]))
+
+        self.assertEqual(cfg.translation_mode, LiveTranslationMode.DIRECT)
+
+    def test_live_direct_mode_rejects_bilingual_transcript_path(self) -> None:
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch("transcriber.live.run_live_session", return_value=0) as run_session,
+        ):
+            rc = run_live_mode(
+                parse_args(["--live", "--live-save-bilingual-transcript", "logs/live_bilingual_transcript.txt"])
+            )
+
+        self.assertEqual(rc, 1)
+        self.assertIn("requires --live-translation-mode cascade", stdout.getvalue())
+        run_session.assert_not_called()
+
+    def test_live_direct_mode_allows_english_transcript_path(self) -> None:
+        with patch("transcriber.live.run_live_session", return_value=0) as run_session:
+            rc = run_live_mode(parse_args(["--live", "--live-save-transcript", "logs/live_english_transcript.txt"]))
+
+        self.assertEqual(rc, 0)
+        run_session.assert_called_once()
+
+    def test_live_translate_launcher_uses_direct_english_log(self) -> None:
         launcher = Path(__file__).resolve().parents[1] / "live_translate.bat"
         text = launcher.read_text(encoding="utf-8")
 
-        self.assertIn("--live-save-bilingual-transcript", text)
-        self.assertIn("logs\\live_bilingual_transcript.txt", text)
+        self.assertIn("--live-preset latency", text)
+        self.assertIn("--live-translation-mode direct", text)
+        self.assertIn("--live-save-transcript", text)
+        self.assertIn("logs\\live_english_transcript.txt", text)
+        self.assertNotIn("--live-save-bilingual-transcript", text)
 
     def test_write_bilingual_transcript_formats_spanish_and_english_pairs(self) -> None:
         with TemporaryDirectory() as tmpdir:

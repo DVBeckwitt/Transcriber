@@ -85,7 +85,7 @@ Project workflow and governance:
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
-- Live caption mode: startup smoke passed with the `live` extra installed. The launcher now resolves the active Python environment's WhisperLiveKit executable before PATH, starts WLK with the LocalAgreement backend policy, avoids the observed SimulStreaming `StorageView` encoder crash, and writes committed Spanish/English caption pairs to `logs\live_bilingual_transcript.txt` by default. Full live audio validation with Windows loopback input is still pending.
+- Live caption mode: startup smoke passed with the `live` extra installed. The launcher now resolves the active Python environment's WhisperLiveKit executable before PATH, starts WLK with the LocalAgreement backend policy, avoids the observed SimulStreaming `StorageView` encoder crash, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default. The previous direct-mode bilingual log bug is fixed by rejecting bilingual transcript output unless cascade mode is selected. Full live audio validation with Windows loopback input is still pending.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, transcript merge collection, and speaker-label prompt/config control flow were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
 - Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. No migration or deprecation is required. Rollback is `git revert` of the release commit.
@@ -139,10 +139,10 @@ Live Spanish-to-English system-audio captions:
 The live launcher changes to the repository root before starting, uses `VIRTUAL_ENV` when active, then falls back to repo-local `.uv-venv`, repo-local `.venv`, or `%USERPROFILE%\.venv`. It is a thin wrapper around:
 
 ```powershell
-python -m transcriber --live --lang es --model small --live-source system --no-speaker-labels --live-save-bilingual-transcript logs\live_bilingual_transcript.txt
+python -m transcriber --live --lang es --model small --live-source system --no-speaker-labels --live-preset latency --live-translation-mode direct --live-save-transcript logs\live_english_transcript.txt
 ```
 
-Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, bilingual transcript formatting, window text formatting, dependency diagnostics, executable resolution, and WLK startup cleanup. Startup smoke has passed with the `live` extra installed; full live audio validation still requires Windows audio hardware.
+Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, direct/cascade transcript semantics, bilingual transcript formatting, window text formatting, dependency diagnostics, executable resolution, and WLK startup cleanup. Startup smoke has passed with the `live` extra installed; full live audio validation still requires Windows audio hardware.
 
 ### Watch `C:\Users\Kenpo\OneDrive\recordings`
 
@@ -274,10 +274,12 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
-- Live mode is separate from file/watch transcription. It captures Windows PC speaker output through WASAPI loopback, converts it to 16 kHz mono signed 16-bit PCM, streams it to a local WhisperLiveKit server at `/asr` with the LocalAgreement backend policy, requests direct English translation for Spanish speech, and displays committed captions plus one replaceable partial line in a small always-on-top Tkinter window.
+- Live mode is separate from file/watch transcription. It captures Windows PC speaker output through WASAPI loopback, converts it to 16 kHz mono signed 16-bit PCM, streams it to a local WhisperLiveKit server at `/asr` with the LocalAgreement backend policy, and displays committed captions plus one replaceable partial line in a small always-on-top Tkinter window.
+- `--live-translation-mode direct` uses WhisperLiveKit direct English translation for fastest captions. In this mode WLK committed `text` is already English, so bilingual transcript output is rejected to avoid labeling English as Spanish.
+- `--live-translation-mode cascade` uses WhisperLiveKit `--target-language en` so committed `text` is Spanish source text and `translation` is English. Use this mode when a real Spanish/English transcript is required.
 - Live mode never enables diarization, never renders speaker labels, never loads Hugging Face tokens, and does not write SRT or `*_llm.txt` files.
 - `--live-save-transcript` can write the current committed English caption lines to a text file while live mode runs.
-- `--live-save-bilingual-transcript` writes committed Spanish source and English translation pairs to a text file. `live_translate.bat` enables this by default at `logs\live_bilingual_transcript.txt`.
+- `--live-save-bilingual-transcript` writes committed Spanish source and English translation pairs to a text file, and requires `--live-translation-mode cascade`.
 - Closing the caption window or pressing `Ctrl+C` stops capture and terminates the local WhisperLiveKit subprocess.
 
 ## CLI options
@@ -324,7 +326,9 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 --live-loopback-test       Record a short loopback test WAV and exit
 --live-device-index        Explicit WASAPI loopback device index
 --live-port                Local WhisperLiveKit server port
---live-chunk-ms            Live audio chunk size in milliseconds
+--live-chunk-ms            Override live audio chunk size in milliseconds
+--live-translation-mode    direct | cascade
+--live-preset              latency | quality | custom
 --live-no-window           Run live mode without the caption popup
 --live-save-transcript     Write committed live captions to a text file
 --live-save-bilingual-transcript  Write committed Spanish/English live caption pairs to a text file

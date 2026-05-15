@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from transcriber.live_wlk import CaptionPair, CaptionState
+from transcriber.live_wlk import CaptionPair, CaptionState, LiveTranslationMode
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,8 @@ class LiveConfig:
     device_index: int | None
     port: int
     chunk_ms: int
+    preset: str
+    translation_mode: LiveTranslationMode
     show_window: bool
     save_transcript_path: str | None
     save_bilingual_transcript_path: str | None
@@ -61,7 +63,27 @@ def build_live_asr_prompt(args: argparse.Namespace) -> str | None:
     )
 
 
+def _effective_live_translation_mode(args: argparse.Namespace) -> LiveTranslationMode:
+    if args.live_translation_mode:
+        return LiveTranslationMode(args.live_translation_mode)
+    if args.live_preset == "quality":
+        return LiveTranslationMode.CASCADE
+    return LiveTranslationMode.DIRECT
+
+
+def _effective_live_chunk_ms(args: argparse.Namespace) -> int:
+    if args.live_chunk_ms is not None:
+        return max(20, int(args.live_chunk_ms))
+    if args.live_preset == "latency":
+        return 250
+    return 500
+
+
 def build_live_config(args: argparse.Namespace) -> LiveConfig:
+    translation_mode = _effective_live_translation_mode(args)
+    if translation_mode == LiveTranslationMode.DIRECT and args.live_save_bilingual_transcript:
+        raise RuntimeError("--live-save-bilingual-transcript requires --live-translation-mode cascade.")
+
     return LiveConfig(
         language=args.lang or "es",
         model=args.model or "small",
@@ -69,7 +91,9 @@ def build_live_config(args: argparse.Namespace) -> LiveConfig:
         source=args.live_source,
         device_index=args.live_device_index,
         port=max(1, int(args.live_port)),
-        chunk_ms=max(20, int(args.live_chunk_ms)),
+        chunk_ms=_effective_live_chunk_ms(args),
+        preset=args.live_preset,
+        translation_mode=translation_mode,
         show_window=not bool(args.live_no_window),
         save_transcript_path=args.live_save_transcript,
         save_bilingual_transcript_path=args.live_save_bilingual_transcript,
@@ -182,6 +206,7 @@ def _stream_loop(
                 host="127.0.0.1",
                 port=config.port,
                 language=config.language,
+                translation_mode=config.translation_mode,
                 audio_queue=audio_queue,
                 stop_event=stop_event,
                 on_state=_state_handler(
@@ -213,6 +238,7 @@ def run_live_session(config: LiveConfig) -> int:
             port=config.port,
             model=config.model,
             language=config.language,
+            translation_mode=config.translation_mode,
             asr_prompt=config.asr_prompt,
         )
         capture_thread = threading.Thread(
@@ -287,7 +313,7 @@ def run_live_mode(args: argparse.Namespace) -> int:
                 output_path,
                 seconds=max(0.0, float(args.seconds)),
                 device_index=args.live_device_index,
-                chunk_ms=args.live_chunk_ms,
+                chunk_ms=_effective_live_chunk_ms(args),
             )
             print(f'\nWrote loopback test WAV: "{output_path}"\n')
             return 0

@@ -13,12 +13,18 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 
 class WhisperLiveKitProtocolError(RuntimeError):
     pass
+
+
+class LiveTranslationMode(str, Enum):
+    DIRECT = "direct"
+    CASCADE = "cascade"
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,7 @@ def build_wlk_command(
     port: int,
     model: str,
     language: str,
+    translation_mode: LiveTranslationMode,
     asr_prompt: str | None = None,
 ) -> list[str]:
     command = [
@@ -73,8 +80,11 @@ def build_wlk_command(
         "--backend-policy",
         "localagreement",
         "--pcm-input",
-        "--direct-english-translation",
     ]
+    if translation_mode == LiveTranslationMode.DIRECT:
+        command.append("--direct-english-translation")
+    else:
+        command.extend(["--target-language", "en"])
     if asr_prompt:
         command.extend(["--init-prompt", asr_prompt])
     return command
@@ -107,6 +117,7 @@ def start_wlk_server(
     port: int,
     model: str,
     language: str,
+    translation_mode: LiveTranslationMode,
     asr_prompt: str | None,
 ) -> subprocess.Popen[Any]:
     executable = resolve_wlk_executable()
@@ -116,6 +127,7 @@ def start_wlk_server(
         port=port,
         model=model,
         language=language,
+        translation_mode=translation_mode,
         asr_prompt=asr_prompt,
     )
     process = subprocess.Popen(command)
@@ -149,15 +161,23 @@ def is_ready_to_stop(message: Mapping[str, Any]) -> bool:
     return message.get("type") == "ready_to_stop"
 
 
-def caption_state_from_full_update(message: Mapping[str, Any]) -> CaptionState:
+def caption_state_from_full_update(
+    message: Mapping[str, Any],
+    *,
+    translation_mode: LiveTranslationMode,
+) -> CaptionState:
     committed_pairs: list[CaptionPair] = []
     for raw_line in message.get("lines") or []:
         if not isinstance(raw_line, Mapping):
             continue
         if raw_line.get("speaker") == -2:
             continue
-        source_text = str(raw_line.get("text") or "").strip()
-        translated_text = str(raw_line.get("translation") or "").strip()
+        if translation_mode == LiveTranslationMode.DIRECT:
+            source_text = ""
+            translated_text = str(raw_line.get("translation") or raw_line.get("text") or "").strip()
+        else:
+            source_text = str(raw_line.get("text") or "").strip()
+            translated_text = str(raw_line.get("translation") or "").strip()
         display_text = translated_text or source_text
         if display_text:
             committed_pairs.append(CaptionPair(source_text=source_text, translated_text=translated_text))
@@ -193,6 +213,7 @@ async def stream_pcm_queue(
     host: str,
     port: int,
     language: str,
+    translation_mode: LiveTranslationMode,
     audio_queue: queue.Queue[bytes],
     stop_event: Any,
     on_state: Callable[[CaptionState], None],
@@ -216,7 +237,7 @@ async def stream_pcm_queue(
                     validate_config_message(message)
                     continue
                 if "lines" in message:
-                    on_state(caption_state_from_full_update(message))
+                    on_state(caption_state_from_full_update(message, translation_mode=translation_mode))
 
         receiver = asyncio.create_task(receive_updates())
         try:

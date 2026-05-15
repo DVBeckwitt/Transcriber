@@ -42,7 +42,7 @@ CLI live args
 ## Module Map
 
 - `transcriber/__main__.py`: CLI surface, `RunConfig`, output path contracts, WhisperX execution, subtitle cleanup, Spanish-to-English translation, watch mode, and completed-file movement.
-- `transcriber/live.py`: live-mode configuration and coordinator. It starts/stops capture, WhisperLiveKit streaming, caption updates, and optional English-only or bilingual transcript saving.
+- `transcriber/live.py`: live-mode configuration and coordinator. It starts/stops capture, WhisperLiveKit streaming, caption updates, translation-mode validation, and optional English-only or bilingual transcript saving.
 - `transcriber/live_audio.py`: Windows WASAPI loopback device discovery, loopback test WAV writing, and PCM conversion to 16 kHz mono signed 16-bit little-endian audio.
 - `transcriber/live_wlk.py`: WhisperLiveKit subprocess command construction, readiness polling, WebSocket protocol handling, and caption-state extraction.
 - `transcriber/live_window.py`: Tkinter always-on-top caption window fed through a thread-safe queue.
@@ -59,7 +59,7 @@ CLI live args
 - `OutputPaths` defines where `.srt`, `*_llm.txt`, logs, and lock files are expected.
 - `WatchTarget` defines per-folder watcher policy, including allowed extensions, destination moves, and rename strategy.
 - Live mode is only entered through `--live`, `--live-list-devices`, or `--live-loopback-test`. It does not call `transcribe_file`, WhisperX alignment, PyAnnote diarization, SRT cue generation, or Helsinki-NLP post-translation.
-- `CaptionState` is the live UI and live transcript contract. Full-mode WhisperLiveKit updates replace the partial caption line instead of appending it, and committed bilingual pairs preserve each line's Spanish source text with its English translation.
+- `CaptionState` is the live UI and live transcript contract. Full-mode WhisperLiveKit updates replace the partial caption line instead of appending it. In direct mode, committed pairs intentionally have empty Spanish source text because WLK committed `text` is already English; in cascade mode, committed pairs preserve each line's Spanish source text with its English translation.
 - The CI workflow is a repository contract. Update `README.md`, `AGENTS.md`, and `CONTRIBUTING.md` when changing validation commands.
 
 ## Release Notes
@@ -67,7 +67,8 @@ CLI live args
 - SRT speaker label control is a user-facing CLI feature, not a pipeline migration. Interactive one-off runs prompt for speaker labels after language and quality/fast mode. `--speaker-labels` and `--no-speaker-labels` are the preferred flag names; `--diarize` and `--no-diarize` remain supported aliases.
 - Disabling speaker labels skips diarization, Hugging Face token loading, speaker smoothing, and `SPEAKER_00:` rendering while preserving subtitle timing, cleanup, translation, watcher, and movement behavior.
 - The speaker-label prompt/config simplification is an internal refactor only. It does not change CLI options, prompt wording, defaults, watcher behavior, CI gates, or migration posture.
-- Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live` and a WASAPI loopback device. The launcher resolves WhisperLiveKit's `wlk` or `whisperlivekit-server` executable from the active Python environment's Scripts directory before falling back to `PATH`, starts it with the LocalAgreement backend policy, and writes committed Spanish/English caption pairs to `logs\live_bilingual_transcript.txt` by default.
+- Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live` and a WASAPI loopback device. The launcher resolves WhisperLiveKit's `wlk` or `whisperlivekit-server` executable from the active Python environment's Scripts directory before falling back to `PATH`, starts it with the LocalAgreement backend policy, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default.
+- Live translation mode is explicit. `direct` uses WhisperLiveKit `--direct-english-translation` and rejects `--live-save-bilingual-transcript`; `cascade` uses `--target-language en` and allows real Spanish/English transcript pairs.
 - Live-mode error status: missing optional live dependencies now report a clear install message instead of a traceback, and WLK subprocess startup failures terminate the child process before returning an error.
 - Live-mode rollout status: additive local beta. Startup smoke has passed with the `live` extra installed, but full Windows loopback audio validation is still pending. No existing file transcription/watch behavior is migrated or deprecated.
 - Rollback is git-based: revert the release commit and rerun the full validation gate.

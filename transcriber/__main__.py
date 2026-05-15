@@ -1515,7 +1515,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--live-device-index", type=int, help="Explicit WASAPI loopback device index.")
     parser.add_argument("--live-port", type=int, default=8000, help="Local WhisperLiveKit server port (default: 8000).")
-    parser.add_argument("--live-chunk-ms", type=int, default=500, help="Live audio chunk size in milliseconds.")
+    parser.add_argument("--live-chunk-ms", type=int, help="Override live audio chunk size in milliseconds.")
+    parser.add_argument(
+        "--live-translation-mode",
+        choices=("direct", "cascade"),
+        help="Live translation mode: direct English captions or cascade Spanish source plus English translation.",
+    )
+    parser.add_argument(
+        "--live-preset",
+        choices=("latency", "quality", "custom"),
+        default="latency",
+        help="Live mode preset (default: latency).",
+    )
     parser.add_argument("--live-no-window", action="store_true", help="Run live mode without the caption popup window.")
     parser.add_argument("--live-save-transcript", help="Write committed live English captions to this text file.")
     parser.add_argument(

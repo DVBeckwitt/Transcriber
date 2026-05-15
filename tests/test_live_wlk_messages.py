@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from transcriber.live_wlk import (
     CaptionPair,
+    LiveTranslationMode,
     WhisperLiveKitProtocolError,
     _decode_json_message,
     build_wlk_command,
@@ -36,7 +37,8 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
                 "buffer_translation": "how are",
                 "buffer_transcription": "como estan",
                 "remaining_time_transcription": 1.25,
-            }
+            },
+            translation_mode=LiveTranslationMode.CASCADE,
         )
 
         self.assertEqual(state.committed_lines, ("hello", "mundo"))
@@ -56,7 +58,8 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
                 "lines": [
                     {"speaker": 1, "text": None, "translation": "hello"},
                 ],
-            }
+            },
+            translation_mode=LiveTranslationMode.CASCADE,
         )
 
         self.assertEqual(state.committed_lines, ("hello",))
@@ -69,17 +72,56 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
                 "lines": [],
                 "buffer_translation": "",
                 "buffer_transcription": "partial source",
-            }
+            },
+            translation_mode=LiveTranslationMode.CASCADE,
         )
 
         self.assertEqual(state.partial_line, "partial source")
 
     def test_partial_replaces_previous_update_instead_of_appending(self) -> None:
-        first = caption_state_from_full_update({"lines": [], "buffer_translation": "hello wor"})
-        second = caption_state_from_full_update({"lines": [], "buffer_translation": "hello world"})
+        first = caption_state_from_full_update(
+            {"lines": [], "buffer_translation": "hello wor"},
+            translation_mode=LiveTranslationMode.DIRECT,
+        )
+        second = caption_state_from_full_update(
+            {"lines": [], "buffer_translation": "hello world"},
+            translation_mode=LiveTranslationMode.DIRECT,
+        )
 
         self.assertEqual(first.partial_line, "hello wor")
         self.assertEqual(second.partial_line, "hello world")
+
+    def test_direct_full_update_treats_text_as_english_not_spanish_source(self) -> None:
+        state = caption_state_from_full_update(
+            {
+                "lines": [
+                    {"speaker": 1, "text": "Rafa, could you do me a favor, please?", "translation": ""},
+                ],
+            },
+            translation_mode=LiveTranslationMode.DIRECT,
+        )
+
+        self.assertEqual(state.committed_lines, ("Rafa, could you do me a favor, please?",))
+        self.assertEqual(
+            state.committed_pairs,
+            (CaptionPair(source_text="", translated_text="Rafa, could you do me a favor, please?"),),
+        )
+
+    def test_direct_bad_sample_does_not_write_english_under_spanish(self) -> None:
+        state = caption_state_from_full_update(
+            {
+                "lines": [
+                    {"speaker": 1, "text": "Let's hunt the three of us on the beach.", "translation": ""},
+                ],
+            },
+            translation_mode=LiveTranslationMode.DIRECT,
+        )
+
+        self.assertEqual(state.committed_lines, ("Let's hunt the three of us on the beach.",))
+        self.assertEqual(
+            state.committed_pairs,
+            (CaptionPair(source_text="", translated_text="Let's hunt the three of us on the beach."),),
+        )
 
     def test_ready_to_stop_is_recognized(self) -> None:
         self.assertTrue(is_ready_to_stop({"type": "ready_to_stop"}))
@@ -140,11 +182,18 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
             patch("transcriber.live_wlk.wait_for_wlk_health", side_effect=RuntimeError("not ready")),
         ):
             with self.assertRaisesRegex(RuntimeError, "not ready"):
-                start_wlk_server(host="127.0.0.1", port=8123, model="small", language="es", asr_prompt=None)
+                start_wlk_server(
+                    host="127.0.0.1",
+                    port=8123,
+                    model="small",
+                    language="es",
+                    asr_prompt=None,
+                    translation_mode=LiveTranslationMode.DIRECT,
+                )
 
         self.assertTrue(process.terminated)
 
-    def test_build_wlk_command_uses_localagreement_pcm_translation_without_diarization(self) -> None:
+    def test_build_wlk_command_uses_direct_translation_without_diarization(self) -> None:
         command = build_wlk_command(
             "wlk",
             host="127.0.0.1",
@@ -152,16 +201,35 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
             model="small",
             language="es",
             asr_prompt="OpenAI Codex",
+            translation_mode=LiveTranslationMode.DIRECT,
         )
 
         self.assertEqual(command[:2], ["wlk", "--host"])
         self.assertIn("--pcm-input", command)
         self.assertIn("--direct-english-translation", command)
+        self.assertNotIn("--target-language", command)
         self.assertIn("--backend-policy", command)
         self.assertIn("localagreement", command)
         self.assertNotIn("simulstreaming", command)
         self.assertNotIn("--beams", command)
         self.assertIn("--init-prompt", command)
+        self.assertNotIn("--diarization", command)
+
+    def test_build_wlk_command_uses_cascade_target_language_without_direct_translation(self) -> None:
+        command = build_wlk_command(
+            "wlk",
+            host="127.0.0.1",
+            port=8123,
+            model="small",
+            language="es",
+            asr_prompt=None,
+            translation_mode=LiveTranslationMode.CASCADE,
+        )
+
+        self.assertIn("--pcm-input", command)
+        self.assertIn("--target-language", command)
+        self.assertIn("en", command)
+        self.assertNotIn("--direct-english-translation", command)
         self.assertNotIn("--diarization", command)
 
 
