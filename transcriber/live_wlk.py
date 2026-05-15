@@ -22,10 +22,17 @@ class WhisperLiveKitProtocolError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class CaptionPair:
+    source_text: str
+    translated_text: str
+
+
+@dataclass(frozen=True)
 class CaptionState:
     committed_lines: tuple[str, ...]
     partial_line: str
     lag_seconds: float | None = None
+    committed_pairs: tuple[CaptionPair, ...] = ()
 
 
 def resolve_wlk_executable() -> str:
@@ -143,20 +150,27 @@ def is_ready_to_stop(message: Mapping[str, Any]) -> bool:
 
 
 def caption_state_from_full_update(message: Mapping[str, Any]) -> CaptionState:
-    committed: list[str] = []
+    committed_pairs: list[CaptionPair] = []
     for raw_line in message.get("lines") or []:
         if not isinstance(raw_line, Mapping):
             continue
         if raw_line.get("speaker") == -2:
             continue
-        text = str(raw_line.get("translation") or raw_line.get("text") or "").strip()
-        if text:
-            committed.append(text)
+        source_text = str(raw_line.get("text") or "").strip()
+        translated_text = str(raw_line.get("translation") or "").strip()
+        display_text = translated_text or source_text
+        if display_text:
+            committed_pairs.append(CaptionPair(source_text=source_text, translated_text=translated_text))
 
     partial = str(message.get("buffer_translation") or message.get("buffer_transcription") or "").strip()
     lag = message.get("remaining_time_transcription")
     lag_seconds = float(lag) if isinstance(lag, int | float) else None
-    return CaptionState(committed_lines=tuple(committed), partial_line=partial, lag_seconds=lag_seconds)
+    return CaptionState(
+        committed_lines=tuple(pair.translated_text or pair.source_text for pair in committed_pairs),
+        partial_line=partial,
+        lag_seconds=lag_seconds,
+        committed_pairs=tuple(committed_pairs),
+    )
 
 
 def _decode_json_message(raw_message: str | bytes) -> Mapping[str, Any]:

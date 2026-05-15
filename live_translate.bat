@@ -25,7 +25,7 @@ if not exist "%PY%" (
   exit /b 1
 )
 
-"%PY%" -m transcriber --live --lang es --model small --live-source system --no-speaker-labels
+"%PY%" -m transcriber --live --lang es --model small --live-source system --no-speaker-labels --live-save-bilingual-transcript "logs\live_bilingual_transcript.txt"
 set "RC=%ERRORLEVEL%"
 
 echo.

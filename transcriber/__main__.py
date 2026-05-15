@@ -1519,6 +1519,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--live-no-window", action="store_true", help="Run live mode without the caption popup window.")
     parser.add_argument("--live-save-transcript", help="Write committed live English captions to this text file.")
     parser.add_argument(
+        "--live-save-bilingual-transcript",
+        help="Write committed live Spanish source and English translation pairs to this text file.",
+    )
+    parser.add_argument(
         "--live-engine",
         choices=("whisperlivekit",),
         default="whisperlivekit",

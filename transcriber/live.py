@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from transcriber.live_wlk import CaptionState
+from transcriber.live_wlk import CaptionPair, CaptionState
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ class LiveConfig:
     chunk_ms: int
     show_window: bool
     save_transcript_path: str | None
+    save_bilingual_transcript_path: str | None
     speaker_labels: bool
     diarize: bool
     translate_to_english: bool
@@ -71,6 +72,7 @@ def build_live_config(args: argparse.Namespace) -> LiveConfig:
         chunk_ms=max(20, int(args.live_chunk_ms)),
         show_window=not bool(args.live_no_window),
         save_transcript_path=args.live_save_transcript,
+        save_bilingual_transcript_path=args.live_save_bilingual_transcript,
         speaker_labels=False,
         diarize=False,
         translate_to_english=True,
@@ -115,6 +117,18 @@ def _write_committed_transcript(path: Path, state: CaptionState) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _write_bilingual_transcript(path: Path, state: CaptionState) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blocks = [
+        f"{index}.\nES: {pair.source_text}\nEN: {pair.translated_text}"
+        for index, pair in enumerate(state.committed_pairs, start=1)
+    ]
+    text = "\n\n".join(blocks)
+    if text:
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+
+
 def _put_latest_state(state_queue: queue.Queue[CaptionState], state: CaptionState) -> None:
     try:
         state_queue.put_nowait(state)
@@ -129,17 +143,25 @@ def _state_handler(
     *,
     state_queue: queue.Queue[CaptionState] | None,
     save_transcript_path: str | None,
+    save_bilingual_transcript_path: str | None,
 ) -> Callable[[CaptionState], None]:
     transcript_path = Path(save_transcript_path).expanduser() if save_transcript_path else None
+    bilingual_transcript_path = (
+        Path(save_bilingual_transcript_path).expanduser() if save_bilingual_transcript_path else None
+    )
     last_written_lines: tuple[str, ...] | None = None
+    last_written_pairs: tuple[CaptionPair, ...] | None = None
 
     def handle_state(state: CaptionState) -> None:
-        nonlocal last_written_lines
+        nonlocal last_written_lines, last_written_pairs
         if state_queue is not None:
             _put_latest_state(state_queue, state)
         if transcript_path is not None and state.committed_lines != last_written_lines:
             _write_committed_transcript(transcript_path, state)
             last_written_lines = state.committed_lines
+        if bilingual_transcript_path is not None and state.committed_pairs != last_written_pairs:
+            _write_bilingual_transcript(bilingual_transcript_path, state)
+            last_written_pairs = state.committed_pairs
 
     return handle_state
 
@@ -165,6 +187,7 @@ def _stream_loop(
                 on_state=_state_handler(
                     state_queue=state_queue,
                     save_transcript_path=config.save_transcript_path,
+                    save_bilingual_transcript_path=config.save_bilingual_transcript_path,
                 ),
             )
         )

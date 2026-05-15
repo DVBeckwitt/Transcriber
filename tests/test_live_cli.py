@@ -8,8 +8,9 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from transcriber.__main__ import main, parse_args
-from transcriber.live import build_live_config, run_live_mode
+from transcriber.live import _state_handler, _write_bilingual_transcript, build_live_config, run_live_mode
 from transcriber.live_audio import LoopbackDevice
+from transcriber.live_wlk import CaptionPair, CaptionState
 
 
 class LiveCliTests(unittest.TestCase):
@@ -31,6 +32,60 @@ class LiveCliTests(unittest.TestCase):
         self.assertTrue(cfg.translate_to_english)
         self.assertFalse(cfg.speaker_labels)
         self.assertFalse(cfg.diarize)
+        self.assertIsNone(cfg.save_bilingual_transcript_path)
+
+    def test_live_bilingual_transcript_path_reaches_config(self) -> None:
+        cfg = build_live_config(
+            parse_args(["--live", "--live-save-bilingual-transcript", "logs/live_bilingual_transcript.txt"])
+        )
+
+        self.assertEqual(cfg.save_bilingual_transcript_path, "logs/live_bilingual_transcript.txt")
+
+    def test_live_translate_launcher_enables_bilingual_transcript_log(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "live_translate.bat"
+        text = launcher.read_text(encoding="utf-8")
+
+        self.assertIn("--live-save-bilingual-transcript", text)
+        self.assertIn("logs\\live_bilingual_transcript.txt", text)
+
+    def test_write_bilingual_transcript_formats_spanish_and_english_pairs(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "nested" / "live_bilingual.txt"
+            state = CaptionState(
+                committed_lines=("hello world", "thanks"),
+                partial_line="",
+                committed_pairs=(
+                    CaptionPair(source_text="hola mundo", translated_text="hello world"),
+                    CaptionPair(source_text="gracias", translated_text="thanks"),
+                ),
+            )
+
+            _write_bilingual_transcript(output_path, state)
+
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "1.\nES: hola mundo\nEN: hello world\n\n2.\nES: gracias\nEN: thanks\n",
+            )
+
+    def test_state_handler_writes_english_and_bilingual_transcripts_independently(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            english_path = Path(tmpdir) / "english.txt"
+            bilingual_path = Path(tmpdir) / "bilingual.txt"
+            state = CaptionState(
+                committed_lines=("hello",),
+                partial_line="",
+                committed_pairs=(CaptionPair(source_text="hola", translated_text="hello"),),
+            )
+            handle_state = _state_handler(
+                state_queue=None,
+                save_transcript_path=str(english_path),
+                save_bilingual_transcript_path=str(bilingual_path),
+            )
+
+            handle_state(state)
+
+            self.assertEqual(english_path.read_text(encoding="utf-8"), "hello\n")
+            self.assertEqual(bilingual_path.read_text(encoding="utf-8"), "1.\nES: hola\nEN: hello\n")
 
     def test_live_extra_includes_whisperlivekit_server_dependencies(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"

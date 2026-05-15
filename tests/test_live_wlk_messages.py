@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from transcriber.live_wlk import (
+    CaptionPair,
     WhisperLiveKitProtocolError,
     _decode_json_message,
     build_wlk_command,
@@ -39,8 +40,27 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
         )
 
         self.assertEqual(state.committed_lines, ("hello", "mundo"))
+        self.assertEqual(
+            state.committed_pairs,
+            (
+                CaptionPair(source_text="hola", translated_text="hello"),
+                CaptionPair(source_text="mundo", translated_text=""),
+            ),
+        )
         self.assertEqual(state.partial_line, "how are")
         self.assertEqual(state.lag_seconds, 1.25)
+
+    def test_full_update_keeps_translated_text_when_source_is_missing(self) -> None:
+        state = caption_state_from_full_update(
+            {
+                "lines": [
+                    {"speaker": 1, "text": None, "translation": "hello"},
+                ],
+            }
+        )
+
+        self.assertEqual(state.committed_lines, ("hello",))
+        self.assertEqual(state.committed_pairs, (CaptionPair(source_text="", translated_text="hello"),))
 
     def test_full_update_falls_back_to_buffer_transcription(self) -> None:
         state = caption_state_from_full_update(
