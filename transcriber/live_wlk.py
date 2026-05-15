@@ -178,8 +178,7 @@ def caption_state_from_full_update(
         else:
             source_text = str(raw_line.get("text") or "").strip()
             translated_text = str(raw_line.get("translation") or "").strip()
-        display_text = translated_text or source_text
-        if display_text:
+        if translated_text or source_text:
             committed_pairs.append(CaptionPair(source_text=source_text, translated_text=translated_text))
 
     partial = str(message.get("buffer_translation") or message.get("buffer_transcription") or "").strip()

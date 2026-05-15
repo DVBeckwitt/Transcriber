@@ -66,17 +66,13 @@ def build_live_asr_prompt(args: argparse.Namespace) -> str | None:
 def _effective_live_translation_mode(args: argparse.Namespace) -> LiveTranslationMode:
     if args.live_translation_mode:
         return LiveTranslationMode(args.live_translation_mode)
-    if args.live_preset == "quality":
-        return LiveTranslationMode.CASCADE
-    return LiveTranslationMode.DIRECT
+    return LiveTranslationMode.CASCADE if args.live_preset == "quality" else LiveTranslationMode.DIRECT
 
 
 def _effective_live_chunk_ms(args: argparse.Namespace) -> int:
     if args.live_chunk_ms is not None:
         return max(20, int(args.live_chunk_ms))
-    if args.live_preset == "latency":
-        return 250
-    return 500
+    return 250 if args.live_preset == "latency" else 500
 
 
 def build_live_config(args: argparse.Namespace) -> LiveConfig:
