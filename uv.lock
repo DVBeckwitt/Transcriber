@@ -1956,6 +1956,15 @@ wheels = [
 ]
 
 [[package]]
+name = "python-multipart"
+version = "0.0.28"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/82/54/a85eb421fbdd5007bc5af39d0f4ed9fa609e0fedbfdc2adcf0b34526870e/python_multipart-0.0.28.tar.gz", hash = "sha256:8550da197eac0f7ab748961fc9509b999fa2662ea25cef857f05249f6893c0f8", size = 45314, upload-time = "2026-05-10T11:05:16.596Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/a2/43bbc5860b5034e2af4ef99a0e04d726ff329c43e192ef3abaa8d7ecfce5/python_multipart-0.0.28-py3-none-any.whl", hash = "sha256:10faac07eb966c3f48dc415f9dee46c04cb10d58d30a35677db8027c825ed9b6", size = 29438, upload-time = "2026-05-10T11:05:15.052Z" },
+]
+
+[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2878,6 +2887,7 @@ live = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyaudiowpatch", marker = "python_full_version >= '3.11' and sys_platform == 'win32'" },
+    { name = "python-multipart" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "websockets" },
@@ -2897,6 +2907,7 @@ dev = [
 requires-dist = [
     { name = "numpy", marker = "extra == 'live'", specifier = ">=1.26" },
     { name = "pyaudiowpatch", marker = "python_full_version >= '3.11' and sys_platform == 'win32' and extra == 'live'", specifier = ">=0.2.12.8" },
+    { name = "python-multipart", marker = "extra == 'live'", specifier = ">=0.0.20" },
     { name = "sacremoses" },
     { name = "scipy", marker = "extra == 'live'", specifier = ">=1.11" },
     { name = "sentencepiece" },

@@ -6,11 +6,14 @@ import json
 import queue
 import shutil
 import subprocess
+import sys
+import sysconfig
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -26,11 +29,19 @@ class CaptionState:
 
 
 def resolve_wlk_executable() -> str:
-    for executable in ("wlk", "whisperlivekit-server"):
-        resolved = shutil.which(executable)
-        if resolved:
-            return resolved
-    raise RuntimeError('Could not find WhisperLiveKit. Install live extras, then ensure "wlk" is on PATH.')
+    script_paths: list[str | None] = []
+    for raw_path in (sysconfig.get_path("scripts"), str(Path(sys.executable).parent), None):
+        if raw_path not in script_paths:
+            script_paths.append(raw_path)
+
+    for script_path in script_paths:
+        for executable in ("wlk", "whisperlivekit-server"):
+            resolved = shutil.which(executable, path=script_path)
+            if resolved:
+                return resolved
+    raise RuntimeError(
+        'Could not find WhisperLiveKit. Install live extras with: uv sync --extra live (or pip install -e ".[live]").'
+    )
 
 
 def build_wlk_command(
@@ -53,11 +64,9 @@ def build_wlk_command(
         "--language",
         language,
         "--backend-policy",
-        "simulstreaming",
+        "localagreement",
         "--pcm-input",
         "--direct-english-translation",
-        "--beams",
-        "1",
     ]
     if asr_prompt:
         command.extend(["--init-prompt", asr_prompt])

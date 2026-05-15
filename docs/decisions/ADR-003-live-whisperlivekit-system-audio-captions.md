@@ -22,6 +22,8 @@ Use WhisperLiveKit as the live ASR and translation engine, launched as a local s
 
 Keep live dependencies in the `live` optional dependency group. Keep the existing WhisperX file/watch pipeline isolated from live mode except for CLI entry points and shared prompt/glossary parsing.
 
+Start WhisperLiveKit with the LocalAgreement backend policy. This keeps the repo on a documented WhisperLiveKit streaming policy while avoiding the current SimulStreaming encoder failure observed with CTranslate2 `StorageView` values on the local Windows CPU environment.
+
 The live runtime path is:
 
 ```text
@@ -35,11 +37,11 @@ WASAPI loopback audio
 
 ## Alternatives Considered
 
-### Direct SimulStreaming integration
+### Direct streaming-policy integration
 
 - Pros: Avoids a local server subprocess.
 - Cons: Requires this repo to own more streaming ASR policy, protocol, and lifecycle logic.
-- Rejected: WhisperLiveKit is the maintained integration target and already wraps the relevant SimulStreaming policy.
+- Rejected: WhisperLiveKit is the maintained integration target and already wraps the relevant streaming policies.
 
 ### Extending the existing WhisperX file pipeline
 
@@ -58,5 +60,5 @@ WASAPI loopback audio
 - Live mode is additive and does not deprecate existing CLI behavior.
 - The `live` extra and runtime guard are required for Python 3.11+ live use.
 - CI covers live parsing, conversion, CLI, and lifecycle logic without Windows audio hardware or model downloads.
-- Manual validation is still required on Windows with the `live` extra installed before treating live captions as fully released.
+- A bounded startup smoke has passed with the `live` extra installed, but manual Windows loopback audio validation is still required before treating live captions as fully released.
 - Rollback is git-based: revert the live-mode commit and rerun the validation gate.

@@ -85,6 +85,7 @@ Project workflow and governance:
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
+- Live caption mode: startup smoke passed with the `live` extra installed. The launcher now resolves the active Python environment's WhisperLiveKit executable before PATH, starts WLK with the LocalAgreement backend policy, and avoids the observed SimulStreaming `StorageView` encoder crash. Full live audio validation with Windows loopback input is still pending.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, transcript merge collection, and speaker-label prompt/config control flow were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
 - Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. No migration or deprecation is required. Rollback is `git revert` of the release commit.
@@ -141,7 +142,7 @@ The live launcher changes to the repository root before starting, uses `VIRTUAL_
 python -m transcriber --live --lang es --model small --live-source system --no-speaker-labels
 ```
 
-Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, window text formatting, dependency diagnostics, and WLK startup cleanup. Manual validation still requires Windows audio hardware plus the `live` extra installed.
+Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, window text formatting, dependency diagnostics, executable resolution, and WLK startup cleanup. Startup smoke has passed with the `live` extra installed; full live audio validation still requires Windows audio hardware.
 
 ### Watch `C:\Users\Kenpo\OneDrive\recordings`
 
@@ -273,7 +274,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
-- Live mode is separate from file/watch transcription. It captures Windows PC speaker output through WASAPI loopback, converts it to 16 kHz mono signed 16-bit PCM, streams it to a local WhisperLiveKit server at `/asr`, requests direct English translation for Spanish speech, and displays committed captions plus one replaceable partial line in a small always-on-top Tkinter window.
+- Live mode is separate from file/watch transcription. It captures Windows PC speaker output through WASAPI loopback, converts it to 16 kHz mono signed 16-bit PCM, streams it to a local WhisperLiveKit server at `/asr` with the LocalAgreement backend policy, requests direct English translation for Spanish speech, and displays committed captions plus one replaceable partial line in a small always-on-top Tkinter window.
 - Live mode never enables diarization, never renders speaker labels, never loads Hugging Face tokens, and does not write SRT or `*_llm.txt` files.
 - `--live-save-transcript` can write the current committed English caption lines to a text file while live mode runs.
 - Closing the caption window or pressing `Ctrl+C` stops capture and terminates the local WhisperLiveKit subprocess.
@@ -345,8 +346,9 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - "Live mode requires Python 3.11 or newer"
   - Create or activate a Python 3.11, 3.12, or 3.13 environment and install `pip install -e ".[live]"`.
 
-- Live mode cannot find `wlk`
-  - Install the live extra in the active environment and confirm `wlk --help` works.
+- Live mode cannot find WhisperLiveKit
+  - Run `uv sync --extra live` from the repository root, or install `pip install -e ".[live]"` in the active environment.
+  - The launcher checks the active Python environment's Scripts directory before falling back to `PATH` for `wlk` or `whisperlivekit-server`.
 
 - Live loopback device missing
   - Run `python -m transcriber --live-list-devices`.

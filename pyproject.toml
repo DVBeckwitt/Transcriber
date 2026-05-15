@@ -16,6 +16,7 @@ live = [
     "websockets>=15",
     "numpy>=1.26",
     "scipy>=1.11",
+    "python-multipart>=0.0.20",
 ]
 
 [project.scripts]

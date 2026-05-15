@@ -33,7 +33,7 @@ CLI live args
   -> transcriber.live.build_live_config
   -> transcriber.live_audio WASAPI loopback capture
   -> 16 kHz mono signed 16-bit PCM chunks
-  -> local WhisperLiveKit subprocess
+  -> local WhisperLiveKit subprocess with LocalAgreement backend policy
   -> ws://127.0.0.1:<port>/asr?language=es&mode=full
   -> transcriber.live_wlk.CaptionState
   -> transcriber.live_window caption popup and optional text transcript
@@ -67,9 +67,9 @@ CLI live args
 - SRT speaker label control is a user-facing CLI feature, not a pipeline migration. Interactive one-off runs prompt for speaker labels after language and quality/fast mode. `--speaker-labels` and `--no-speaker-labels` are the preferred flag names; `--diarize` and `--no-diarize` remain supported aliases.
 - Disabling speaker labels skips diarization, Hugging Face token loading, speaker smoothing, and `SPEAKER_00:` rendering while preserving subtitle timing, cleanup, translation, watcher, and movement behavior.
 - The speaker-label prompt/config simplification is an internal refactor only. It does not change CLI options, prompt wording, defaults, watcher behavior, CI gates, or migration posture.
-- Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live`, a WASAPI loopback device, and WhisperLiveKit's `wlk` executable.
+- Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live` and a WASAPI loopback device. The launcher resolves WhisperLiveKit's `wlk` or `whisperlivekit-server` executable from the active Python environment's Scripts directory before falling back to `PATH` and starts it with the LocalAgreement backend policy.
 - Live-mode error status: missing optional live dependencies now report a clear install message instead of a traceback, and WLK subprocess startup failures terminate the child process before returning an error.
-- Live-mode rollout status: additive local beta. No existing file transcription/watch behavior is migrated or deprecated.
+- Live-mode rollout status: additive local beta. Startup smoke has passed with the `live` extra installed, but full Windows loopback audio validation is still pending. No existing file transcription/watch behavior is migrated or deprecated.
 - Rollback is git-based: revert the release commit and rerun the full validation gate.
 
 ## Change Guide

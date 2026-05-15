@@ -19,7 +19,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 MEDIA_FILTER = (
     "Audio/Video",
@@ -1213,16 +1213,19 @@ def translate_spanish_texts(
 
     tokenizer, model = load_spanish_to_english_translator()
 
+    torch_module: Any | None
     try:
-        import torch
+        import torch as torch_module
     except Exception:
-        torch = None
+        torch_module = None
 
     use_cuda = bool(
-        torch is not None and device.startswith("cuda") and getattr(torch.cuda, "is_available", lambda: False)()
+        torch_module is not None
+        and device.startswith("cuda")
+        and getattr(torch_module.cuda, "is_available", lambda: False)()
     )
-    if torch is not None:
-        target_device = torch.device("cuda" if use_cuda else "cpu")
+    if torch_module is not None:
+        target_device = torch_module.device("cuda" if use_cuda else "cpu")
         model.to(target_device)
         model.eval()
     else:
@@ -1239,7 +1242,7 @@ def translate_spanish_texts(
         )
         if target_device is not None:
             inputs = {key: value.to(target_device) for key, value in inputs.items()}
-        with torch.no_grad() if torch is not None else contextlib.nullcontext():
+        with torch_module.no_grad() if torch_module is not None else contextlib.nullcontext():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
@@ -2115,7 +2118,7 @@ def add_common_safe_globals() -> None:
     except Exception:
         return
 
-    safe: list[object] = []
+    safe: list[Any] = []
     try:
         import omegaconf
 
@@ -2138,7 +2141,7 @@ def add_common_safe_globals() -> None:
         pass
 
     if safe:
-        torch.serialization.add_safe_globals(safe)
+        torch.serialization.add_safe_globals(cast("list[Callable[..., Any] | tuple[Callable[..., Any], str]]", safe))
 
 
 @contextlib.contextmanager
@@ -2215,10 +2218,11 @@ def run_whisperx_direct(
 ) -> str | None:
     import whisperx
 
+    torch_module: Any | None
     try:
-        import torch
+        import torch as torch_module
     except Exception:
-        torch = None
+        torch_module = None
 
     whisper_language = None if cfg.language == "auto" else cfg.language
     whisper_task = "translate" if cfg.translate_to_english else "transcribe"
@@ -2308,9 +2312,9 @@ def run_whisperx_direct(
     print("[transcriber] Writing subtitle-sized SRT from in-memory timings...", flush=True)
     write_direct_srt_from_result(result, srt_path, cfg)
 
-    if torch is not None and getattr(torch, "cuda", None) is not None:
+    if torch_module is not None and getattr(torch_module, "cuda", None) is not None:
         with contextlib.suppress(Exception):
-            torch.cuda.empty_cache()
+            torch_module.cuda.empty_cache()
 
     return detected_language
 

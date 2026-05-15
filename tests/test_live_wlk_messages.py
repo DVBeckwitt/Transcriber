@@ -70,8 +70,34 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
             _decode_json_message("[]")
 
     def test_resolve_wlk_executable_prefers_wlk(self) -> None:
-        with patch("transcriber.live_wlk.shutil.which", side_effect=["C:/bin/wlk.exe", "C:/bin/alt.exe"]):
-            self.assertEqual(resolve_wlk_executable(), "C:/bin/wlk.exe")
+        def fake_which(executable: str, path: str | None = None) -> str | None:
+            if executable == "wlk" and path == "C:/repo/.uv-venv/Scripts":
+                return "C:/repo/.uv-venv/Scripts/wlk.exe"
+            if executable == "whisperlivekit-server" and path == "C:/repo/.uv-venv/Scripts":
+                return "C:/repo/.uv-venv/Scripts/whisperlivekit-server.exe"
+            return None
+
+        with (
+            patch("transcriber.live_wlk.shutil.which", side_effect=fake_which),
+            patch("transcriber.live_wlk.sysconfig.get_path", return_value="C:/repo/.uv-venv/Scripts"),
+            patch("transcriber.live_wlk.sys.executable", "C:/repo/.uv-venv/Scripts/python.exe"),
+        ):
+            self.assertEqual(resolve_wlk_executable(), "C:/repo/.uv-venv/Scripts/wlk.exe")
+
+    def test_resolve_wlk_executable_prefers_active_python_scripts_directory_over_path(self) -> None:
+        def fake_which(executable: str, path: str | None = None) -> str | None:
+            if executable == "wlk" and path == "C:/repo/.uv-venv/Scripts":
+                return "C:/repo/.uv-venv/Scripts/wlk.exe"
+            if executable == "wlk" and path is None:
+                return "C:/global/wlk.exe"
+            return None
+
+        with (
+            patch("transcriber.live_wlk.shutil.which", side_effect=fake_which),
+            patch("transcriber.live_wlk.sysconfig.get_path", return_value="C:/repo/.uv-venv/Scripts"),
+            patch("transcriber.live_wlk.sys.executable", "C:/repo/.uv-venv/Scripts/python.exe"),
+        ):
+            self.assertEqual(resolve_wlk_executable(), "C:/repo/.uv-venv/Scripts/wlk.exe")
 
     def test_start_wlk_server_terminates_process_when_health_check_fails(self) -> None:
         class FakeProcess:
@@ -98,7 +124,7 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
 
         self.assertTrue(process.terminated)
 
-    def test_build_wlk_command_uses_pcm_translation_without_diarization(self) -> None:
+    def test_build_wlk_command_uses_localagreement_pcm_translation_without_diarization(self) -> None:
         command = build_wlk_command(
             "wlk",
             host="127.0.0.1",
@@ -112,7 +138,9 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
         self.assertIn("--pcm-input", command)
         self.assertIn("--direct-english-translation", command)
         self.assertIn("--backend-policy", command)
-        self.assertIn("simulstreaming", command)
+        self.assertIn("localagreement", command)
+        self.assertNotIn("simulstreaming", command)
+        self.assertNotIn("--beams", command)
         self.assertIn("--init-prompt", command)
         self.assertNotIn("--diarization", command)
 

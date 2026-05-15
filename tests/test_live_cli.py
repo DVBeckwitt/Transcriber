@@ -32,6 +32,17 @@ class LiveCliTests(unittest.TestCase):
         self.assertFalse(cfg.speaker_labels)
         self.assertFalse(cfg.diarize)
 
+    def test_live_extra_includes_whisperlivekit_server_dependencies(self) -> None:
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        live_dependency_spec = (
+            pyproject.read_text(encoding="utf-8")
+            .split("[project.optional-dependencies]", maxsplit=1)[1]
+            .split("[project.scripts]", maxsplit=1)[0]
+        )
+
+        self.assertIn('"whisperlivekit[translation]', live_dependency_spec)
+        self.assertIn('"python-multipart', live_dependency_spec)
+
     def test_live_reuses_asr_prompt_and_glossary_flags(self) -> None:
         with TemporaryDirectory() as tmpdir:
             prompt_file = Path(tmpdir) / "prompt.txt"
