@@ -16,6 +16,7 @@ It generates:
 - `ffmpeg` available on PATH
 - Optional but recommended: NVIDIA GPU + CUDA-compatible PyTorch for speed
 - Hugging Face token if you want speaker diarization
+- Python 3.11+ plus the `live` extra if you want Windows live system-audio captions through WhisperLiveKit
 
 ## Install
 
@@ -25,6 +26,19 @@ It generates:
 
 ```powershell
 pip install -e .
+```
+
+Live caption mode has heavier optional dependencies and requires Python 3.11+:
+
+```powershell
+pip install -e ".[live]"
+```
+
+With `uv`, use a Python 3.11+ environment and install the optional live extra:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"
+uv sync --extra live
 ```
 
 ## Development
@@ -114,6 +128,20 @@ Notes:
 - `transcribe.bat` looks for Python at:
   - `%VIRTUAL_ENV%\Scripts\python.exe` (if `VIRTUAL_ENV` is set), else
   - `%USERPROFILE%\.venv\Scripts\python.exe`
+
+Live Spanish-to-English system-audio captions:
+
+```powershell
+.\live_translate.bat
+```
+
+The live launcher changes to the repository root before starting, uses `VIRTUAL_ENV` when active, then falls back to repo-local `.uv-venv`, repo-local `.venv`, or `%USERPROFILE%\.venv`. It is a thin wrapper around:
+
+```powershell
+python -m transcriber --live --lang es --model small --live-source system --no-speaker-labels
+```
+
+Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, window text formatting, dependency diagnostics, and WLK startup cleanup. Manual validation still requires Windows audio hardware plus the `live` extra installed.
 
 ### Watch `C:\Users\Kenpo\OneDrive\recordings`
 
@@ -208,6 +236,18 @@ Watch a folder and wait for files to stop changing before transcribing:
 transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-seconds 20
 ```
 
+List Windows WASAPI loopback devices for live captions:
+
+```powershell
+python -m transcriber --live-list-devices
+```
+
+Record a short loopback test WAV:
+
+```powershell
+python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.wav
+```
+
 ## Runtime behavior
 
 - Output files are written next to the input media file.
@@ -233,6 +273,10 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
+- Live mode is separate from file/watch transcription. It captures Windows PC speaker output through WASAPI loopback, converts it to 16 kHz mono signed 16-bit PCM, streams it to a local WhisperLiveKit server at `/asr`, requests direct English translation for Spanish speech, and displays committed captions plus one replaceable partial line in a small always-on-top Tkinter window.
+- Live mode never enables diarization, never renders speaker labels, never loads Hugging Face tokens, and does not write SRT or `*_llm.txt` files.
+- `--live-save-transcript` can write the current committed English caption lines to a text file while live mode runs.
+- Closing the caption window or pressing `Ctrl+C` stops capture and terminates the local WhisperLiveKit subprocess.
 
 ## CLI options
 
@@ -272,6 +316,18 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 --low-confidence-logprob   Avg logprob threshold for low confidence
 --high-no-speech-prob      No-speech probability threshold
 --low-confidence-word-prob Word confidence threshold
+--live                     Stream Windows system audio to live English captions
+--live-source              system
+--live-list-devices        List WASAPI loopback devices and exit
+--live-loopback-test       Record a short loopback test WAV and exit
+--live-device-index        Explicit WASAPI loopback device index
+--live-port                Local WhisperLiveKit server port
+--live-chunk-ms            Live audio chunk size in milliseconds
+--live-no-window           Run live mode without the caption popup
+--live-save-transcript     Write committed live captions to a text file
+--live-engine              whisperlivekit
+--seconds                  Seconds to record for --live-loopback-test
+--output                   WAV path for --live-loopback-test
 ```
 
 ## Troubleshooting
@@ -285,6 +341,16 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - Diarization blocked/unavailable
   - Accept both pyannote model terms (links above).
   - Confirm the token belongs to that same HF account.
+
+- "Live mode requires Python 3.11 or newer"
+  - Create or activate a Python 3.11, 3.12, or 3.13 environment and install `pip install -e ".[live]"`.
+
+- Live mode cannot find `wlk`
+  - Install the live extra in the active environment and confirm `wlk --help` works.
+
+- Live loopback device missing
+  - Run `python -m transcriber --live-list-devices`.
+  - Pick an explicit device with `--live-device-index`.
 
 - No `.srt` created
   - Check `logs\\*_whisperx.log` in the project folder for the underlying error.

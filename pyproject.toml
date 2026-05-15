@@ -9,6 +9,15 @@ dependencies = [
     "sacremoses",
 ]
 
+[project.optional-dependencies]
+live = [
+    "whisperlivekit[translation]>=0.2.20.post1; python_version >= '3.11'",
+    "pyaudiowpatch>=0.2.12.8; platform_system == 'Windows' and python_version >= '3.11'",
+    "websockets>=15",
+    "numpy>=1.26",
+    "scipy>=1.11",
+]
+
 [project.scripts]
 transcriber = "transcriber.__main__:main"
 

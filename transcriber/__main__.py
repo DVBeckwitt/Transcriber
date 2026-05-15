@@ -1502,6 +1502,27 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("legacy", nargs="*", help="Legacy tokens: [language] [model] [mode]")
     parser.add_argument("--input", "-i", help="Audio/video file path.")
     parser.add_argument("--lang", choices=("auto", "en", "es"), help="Language: auto, en, or es.")
+    parser.add_argument("--live", action="store_true", help="Stream Windows system audio to live English captions.")
+    parser.add_argument(
+        "--live-source", choices=("system",), default="system", help="Live audio source (default: system)."
+    )
+    parser.add_argument("--live-list-devices", action="store_true", help="List live WASAPI loopback devices and exit.")
+    parser.add_argument(
+        "--live-loopback-test", action="store_true", help="Record a short live loopback test WAV and exit."
+    )
+    parser.add_argument("--live-device-index", type=int, help="Explicit WASAPI loopback device index.")
+    parser.add_argument("--live-port", type=int, default=8000, help="Local WhisperLiveKit server port (default: 8000).")
+    parser.add_argument("--live-chunk-ms", type=int, default=500, help="Live audio chunk size in milliseconds.")
+    parser.add_argument("--live-no-window", action="store_true", help="Run live mode without the caption popup window.")
+    parser.add_argument("--live-save-transcript", help="Write committed live English captions to this text file.")
+    parser.add_argument(
+        "--live-engine",
+        choices=("whisperlivekit",),
+        default="whisperlivekit",
+        help="Live transcription engine (default: whisperlivekit).",
+    )
+    parser.add_argument("--seconds", type=float, default=10.0, help="Seconds to record for --live-loopback-test.")
+    parser.add_argument("--output", default="loopback_test.wav", help="Output WAV path for --live-loopback-test.")
     parser.add_argument(
         "--glossary",
         action="append",
@@ -2903,6 +2924,19 @@ def run_watch_loop(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(list(argv) if argv is not None else sys.argv[1:])
+    live_requested = bool(args.live or args.live_list_devices or args.live_loopback_test)
+
+    if args.live and args.input:
+        print("\n--live cannot be combined with --input.\n")
+        return 2
+    if args.live and args.watch:
+        print("\n--live cannot be combined with --watch.\n")
+        return 2
+    if args.live and args.force_speaker_labels:
+        print("\n--live does not support speaker labels or diarization.\n")
+        return 2
+    if args.live and not args.force_no_speaker_labels:
+        args.force_no_speaker_labels = True
 
     if args.watch and args.input:
         print("\nUse --watch-dir with --watch instead of --input.\n")
@@ -2919,6 +2953,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"\n{exc}\n")
         return 1
+
+    if live_requested:
+        from transcriber.live import run_live_mode
+
+        return run_live_mode(args)
 
     cfg = build_config(args, interactive=not args.watch)
 

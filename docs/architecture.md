@@ -26,9 +26,26 @@ build_watch_targets
   -> move_completed_watch_outputs
 ```
 
+Live mode is a separate runtime path:
+
+```text
+CLI live args
+  -> transcriber.live.build_live_config
+  -> transcriber.live_audio WASAPI loopback capture
+  -> 16 kHz mono signed 16-bit PCM chunks
+  -> local WhisperLiveKit subprocess
+  -> ws://127.0.0.1:<port>/asr?language=es&mode=full
+  -> transcriber.live_wlk.CaptionState
+  -> transcriber.live_window caption popup and optional text transcript
+```
+
 ## Module Map
 
 - `transcriber/__main__.py`: CLI surface, `RunConfig`, output path contracts, WhisperX execution, subtitle cleanup, Spanish-to-English translation, watch mode, and completed-file movement.
+- `transcriber/live.py`: live-mode configuration and coordinator. It starts/stops capture, WhisperLiveKit streaming, caption updates, and optional transcript saving.
+- `transcriber/live_audio.py`: Windows WASAPI loopback device discovery, loopback test WAV writing, and PCM conversion to 16 kHz mono signed 16-bit little-endian audio.
+- `transcriber/live_wlk.py`: WhisperLiveKit subprocess command construction, readiness polling, WebSocket protocol handling, and caption-state extraction.
+- `transcriber/live_window.py`: Tkinter always-on-top caption window fed through a thread-safe queue.
 - `merge_transcripts.py`: standalone text utility for recursively merging transcript `.txt` files while skipping token files and generated/cache directories.
 - `tests/test_helpers.py`: unit tests for config, prompts, watcher policy, file movement failure handling, translation helpers, confidence cleanup, and transcript merging.
 - `*.bat`: Windows launchers. They should stay thin wrappers around `python -m transcriber`.
@@ -41,6 +58,8 @@ build_watch_targets
 - `RunConfig` is the internal configuration object passed through transcription and watcher flows. `speaker_labels` records the user-facing SRT display choice; `diarize` records whether WhisperX diarization should run.
 - `OutputPaths` defines where `.srt`, `*_llm.txt`, logs, and lock files are expected.
 - `WatchTarget` defines per-folder watcher policy, including allowed extensions, destination moves, and rename strategy.
+- Live mode is only entered through `--live`, `--live-list-devices`, or `--live-loopback-test`. It does not call `transcribe_file`, WhisperX alignment, PyAnnote diarization, SRT cue generation, or Helsinki-NLP post-translation.
+- `CaptionState` is the live UI contract. Full-mode WhisperLiveKit updates replace the partial caption line instead of appending it.
 - The CI workflow is a repository contract. Update `README.md`, `AGENTS.md`, and `CONTRIBUTING.md` when changing validation commands.
 
 ## Release Notes
@@ -48,11 +67,15 @@ build_watch_targets
 - SRT speaker label control is a user-facing CLI feature, not a pipeline migration. Interactive one-off runs prompt for speaker labels after language and quality/fast mode. `--speaker-labels` and `--no-speaker-labels` are the preferred flag names; `--diarize` and `--no-diarize` remain supported aliases.
 - Disabling speaker labels skips diarization, Hugging Face token loading, speaker smoothing, and `SPEAKER_00:` rendering while preserving subtitle timing, cleanup, translation, watcher, and movement behavior.
 - The speaker-label prompt/config simplification is an internal refactor only. It does not change CLI options, prompt wording, defaults, watcher behavior, CI gates, or migration posture.
+- Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live`, a WASAPI loopback device, and WhisperLiveKit's `wlk` executable.
+- Live-mode error status: missing optional live dependencies now report a clear install message instead of a traceback, and WLK subprocess startup failures terminate the child process before returning an error.
+- Live-mode rollout status: additive local beta. No existing file transcription/watch behavior is migrated or deprecated.
 - Rollback is git-based: revert the release commit and rerun the full validation gate.
 
 ## Change Guide
 
 - CLI argument or config behavior: update `parse_args`, `build_config`, README CLI options, and tests.
+- Live-mode behavior: update `transcriber/live.py`, `transcriber/live_audio.py`, `transcriber/live_wlk.py`, `transcriber/live_window.py`, README live commands, and live tests.
 - Transcription execution: update `transcribe_file`, WhisperX helpers, and tests that mock execution.
 - Translation behavior: update translation helpers and tests around prompts/context/beam settings.
 - Watch folder policy: update `build_watch_targets`, `run_watch_loop`, watcher docs, and tests.
