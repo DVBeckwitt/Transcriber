@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import math
 import platform
 import struct
 import wave
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,15 @@ class LoopbackDevice:
     name: str
     sample_rate: int
     channels: int
+
+
+@dataclass(frozen=True)
+class LiveAudioDiagnostics:
+    input_sample_rate: int
+    input_channels: int
+    output_bytes: int
+    rms_level: float
+    peak_level: int
 
 
 def _ensure_windows() -> None:
@@ -48,6 +58,86 @@ def _clip_int16(value: float) -> int:
     return max(-32_768, min(32_767, int(round(value))))
 
 
+def _rms(values: list[float] | tuple[int, ...]) -> float:
+    if not values:
+        return 0.0
+    return math.sqrt(sum(float(value) * float(value) for value in values) / len(values))
+
+
+def _channel_values(values: tuple[int, ...], input_channels: int) -> list[list[float]]:
+    return [
+        [float(values[offset]) for offset in range(channel_index, len(values), input_channels)]
+        for channel_index in range(input_channels)
+    ]
+
+
+def downmix_to_mono(values: tuple[int, ...], input_channels: int) -> list[float]:
+    if input_channels == 1:
+        return [float(value) for value in values]
+
+    channels = _channel_values(values, input_channels)
+    channel_rms = [_rms(channel) for channel in channels]
+    strongest_index = max(range(len(channel_rms)), key=channel_rms.__getitem__)
+    strongest_rms = channel_rms[strongest_index]
+
+    mono = [
+        sum(channel[frame_index] for channel in channels) / input_channels for frame_index in range(len(channels[0]))
+    ]
+    if strongest_rms <= 0:
+        return mono
+    if min(channel_rms) < strongest_rms * 0.15 or _rms(mono) < strongest_rms * 0.25:
+        return channels[strongest_index]
+    return mono
+
+
+def _linear_resample(mono: list[float], input_sample_rate: int, output_frames: int) -> list[float]:
+    input_frames = len(mono)
+    ratio = input_sample_rate / LIVE_SAMPLE_RATE
+    output: list[float] = []
+    for output_index in range(output_frames):
+        position = output_index * ratio
+        left_index = min(int(position), input_frames - 1)
+        right_index = min(left_index + 1, input_frames - 1)
+        fraction = position - left_index
+        output.append(mono[left_index] * (1.0 - fraction) + mono[right_index] * fraction)
+    return output
+
+
+def _resample_mono(mono: list[float], input_sample_rate: int, output_frames: int) -> list[float]:
+    if mono and all(sample == mono[0] for sample in mono):
+        return [mono[0]] * output_frames
+
+    try:
+        signal = importlib.import_module("scipy.signal")
+    except ImportError:
+        return _linear_resample(mono, input_sample_rate, output_frames)
+
+    gcd = math.gcd(input_sample_rate, LIVE_SAMPLE_RATE)
+    up = LIVE_SAMPLE_RATE // gcd
+    down = input_sample_rate // gcd
+    resampled = [float(sample) for sample in signal.resample_poly(mono, up, down)]
+    if len(resampled) < output_frames:
+        resampled.extend([resampled[-1] if resampled else 0.0] * (output_frames - len(resampled)))
+    return resampled[:output_frames]
+
+
+def _audio_diagnostics(
+    raw: bytes,
+    *,
+    input_sample_rate: int,
+    input_channels: int,
+    output_bytes: int,
+) -> LiveAudioDiagnostics:
+    values = struct.unpack(f"<{len(raw) // PCM_SAMPLE_WIDTH_BYTES}h", raw) if raw else ()
+    return LiveAudioDiagnostics(
+        input_sample_rate=input_sample_rate,
+        input_channels=input_channels,
+        output_bytes=output_bytes,
+        rms_level=round(_rms(values), 2),
+        peak_level=max((abs(value) for value in values), default=0),
+    )
+
+
 def convert_to_pcm16_mono_16k(
     raw: bytes,
     *,
@@ -67,10 +157,7 @@ def convert_to_pcm16_mono_16k(
 
     values = struct.unpack(f"<{len(raw) // PCM_SAMPLE_WIDTH_BYTES}h", raw)
     input_frames = len(values) // input_channels
-    mono = [
-        sum(values[offset : offset + input_channels]) / input_channels
-        for offset in range(0, len(values), input_channels)
-    ]
+    mono = downmix_to_mono(values, input_channels)
 
     if input_sample_rate == LIVE_SAMPLE_RATE:
         return struct.pack(f"<{len(mono)}h", *(_clip_int16(sample) for sample in mono))
@@ -79,16 +166,7 @@ def convert_to_pcm16_mono_16k(
     if output_frames <= 0:
         return b""
 
-    ratio = input_sample_rate / LIVE_SAMPLE_RATE
-    output: list[int] = []
-    for output_index in range(output_frames):
-        position = output_index * ratio
-        left_index = min(int(position), input_frames - 1)
-        right_index = min(left_index + 1, input_frames - 1)
-        fraction = position - left_index
-        sample = mono[left_index] * (1.0 - fraction) + mono[right_index] * fraction
-        output.append(_clip_int16(sample))
-
+    output = [_clip_int16(sample) for sample in _resample_mono(mono, input_sample_rate, output_frames)]
     return struct.pack(f"<{len(output)}h", *output)
 
 
@@ -124,7 +202,11 @@ def select_loopback_device(device_index: int | None = None) -> LoopbackDevice:
         return _device_from_info(_select_loopback_info(audio, device_index))
 
 
-def iter_loopback_pcm_chunks(device_index: int | None = None, chunk_ms: int = 500) -> Iterator[bytes]:
+def iter_loopback_pcm_chunks(
+    device_index: int | None = None,
+    chunk_ms: int = 500,
+    on_diagnostics: Callable[[LiveAudioDiagnostics], None] | None = None,
+) -> Iterator[bytes]:
     _ensure_windows()
     pyaudio = _load_pyaudiowpatch()
     with pyaudio.PyAudio() as audio:
@@ -145,11 +227,21 @@ def iter_loopback_pcm_chunks(device_index: int | None = None, chunk_ms: int = 50
                     raw = stream.read(frames_per_buffer, exception_on_overflow=False)
                 except TypeError:
                     raw = stream.read(frames_per_buffer)
-                yield convert_to_pcm16_mono_16k(
+                pcm = convert_to_pcm16_mono_16k(
                     raw,
                     input_sample_rate=device.sample_rate,
                     input_channels=device.channels,
                 )
+                if on_diagnostics is not None:
+                    on_diagnostics(
+                        _audio_diagnostics(
+                            raw,
+                            input_sample_rate=device.sample_rate,
+                            input_channels=device.channels,
+                            output_bytes=len(pcm),
+                        )
+                    )
+                yield pcm
         finally:
             with contextlib.suppress(Exception):
                 stream.stop_stream()
@@ -163,6 +255,7 @@ def write_loopback_test_wav(
     seconds: float,
     device_index: int | None,
     chunk_ms: int,
+    on_diagnostics: Callable[[LiveAudioDiagnostics], None] | None = None,
 ) -> None:
     target_bytes = max(0, int(seconds * LIVE_SAMPLE_RATE) * PCM_SAMPLE_WIDTH_BYTES)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,7 +264,11 @@ def write_loopback_test_wav(
         wav.setsampwidth(PCM_SAMPLE_WIDTH_BYTES)
         wav.setframerate(LIVE_SAMPLE_RATE)
         remaining = target_bytes
-        for chunk in iter_loopback_pcm_chunks(device_index=device_index, chunk_ms=chunk_ms):
+        for chunk in iter_loopback_pcm_chunks(
+            device_index=device_index,
+            chunk_ms=chunk_ms,
+            on_diagnostics=on_diagnostics,
+        ):
             if remaining <= 0:
                 break
             data = chunk[:remaining]

@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import contextlib
 import io
+import queue
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from transcriber.__main__ import main, parse_args
-from transcriber.live import _state_handler, _write_bilingual_transcript, build_live_config, run_live_mode
+from transcriber.live import (
+    LiveAudioQueueStats,
+    _live_audio_queue_maxsize,
+    _put_live_audio,
+    _state_handler,
+    _write_bilingual_transcript,
+    build_live_config,
+    run_live_mode,
+)
 from transcriber.live_audio import LoopbackDevice
 from transcriber.live_wlk import CaptionPair, CaptionState, LiveTranslationMode
 
@@ -35,6 +46,17 @@ class LiveCliTests(unittest.TestCase):
         self.assertFalse(cfg.speaker_labels)
         self.assertFalse(cfg.diarize)
         self.assertIsNone(cfg.save_bilingual_transcript_path)
+        self.assertEqual(cfg.backend, "auto")
+        self.assertEqual(cfg.backend_policy, "localagreement")
+        self.assertEqual(cfg.frame_threshold, 25)
+        self.assertEqual(cfg.beams, 1)
+        self.assertEqual(cfg.decoder, "auto")
+        self.assertEqual(cfg.audio_min_len, 0.0)
+        self.assertEqual(cfg.audio_max_len, 30.0)
+        self.assertEqual(cfg.nllb_backend, "transformers")
+        self.assertEqual(cfg.nllb_size, "600M")
+        self.assertIsNone(cfg.static_prompt)
+        self.assertFalse(cfg.audio_diagnostics)
 
     def test_live_cascade_bilingual_transcript_path_reaches_config(self) -> None:
         cfg = build_live_config(
@@ -58,6 +80,78 @@ class LiveCliTests(unittest.TestCase):
         self.assertEqual(cfg.preset, "quality")
         self.assertEqual(cfg.translation_mode, LiveTranslationMode.CASCADE)
         self.assertEqual(cfg.chunk_ms, 500)
+        self.assertEqual(cfg.model, "medium")
+        self.assertEqual(cfg.backend, "faster-whisper")
+        self.assertEqual(cfg.backend_policy, "localagreement")
+        self.assertEqual(cfg.frame_threshold, 35)
+        self.assertEqual(cfg.beams, 3)
+        self.assertEqual(cfg.decoder, "beam")
+        self.assertEqual(cfg.audio_min_len, 0.0)
+        self.assertEqual(cfg.audio_max_len, 30.0)
+        self.assertEqual(cfg.nllb_backend, "ctranslate2")
+        self.assertEqual(cfg.nllb_size, "600M")
+
+    def test_live_quality_preset_uses_unbounded_audio_queue(self) -> None:
+        cfg = build_live_config(parse_args(["--live", "--live-preset", "quality"]))
+
+        self.assertEqual(_live_audio_queue_maxsize(cfg), 0)
+
+    def test_live_latency_preset_uses_bounded_audio_queue(self) -> None:
+        cfg = build_live_config(parse_args(["--live"]))
+
+        self.assertEqual(_live_audio_queue_maxsize(cfg), 8)
+
+    def test_live_quality_preset_keeps_explicit_overrides(self) -> None:
+        cfg = build_live_config(
+            parse_args(
+                [
+                    "--live",
+                    "--live-preset",
+                    "quality",
+                    "--model",
+                    "small",
+                    "--live-backend",
+                    "whisper",
+                    "--live-frame-threshold",
+                    "50",
+                    "--live-beams",
+                    "5",
+                    "--live-decoder",
+                    "greedy",
+                    "--live-audio-max-len",
+                    "45",
+                    "--live-nllb-backend",
+                    "transformers",
+                    "--live-nllb-size",
+                    "1.3B",
+                    "--live-audio-diagnostics",
+                ]
+            )
+        )
+
+        self.assertEqual(cfg.model, "small")
+        self.assertEqual(cfg.backend, "whisper")
+        self.assertEqual(cfg.frame_threshold, 50)
+        self.assertEqual(cfg.beams, 5)
+        self.assertEqual(cfg.decoder, "greedy")
+        self.assertEqual(cfg.audio_max_len, 45.0)
+        self.assertEqual(cfg.nllb_backend, "transformers")
+        self.assertEqual(cfg.nllb_size, "1.3B")
+        self.assertTrue(cfg.audio_diagnostics)
+
+    def test_live_quality_spanish_uses_default_static_translation_prompt(self) -> None:
+        cfg = build_live_config(parse_args(["--live", "--live-preset", "quality", "--lang", "es"]))
+
+        self.assertIsNotNone(cfg.static_prompt)
+        self.assertIn("casarse", cfg.static_prompt or "")
+        self.assertIn("Do not translate", cfg.static_prompt or "")
+
+    def test_live_static_prompt_overrides_default_translation_prompt(self) -> None:
+        cfg = build_live_config(
+            parse_args(["--live", "--live-preset", "quality", "--lang", "es", "--live-static-prompt", "Custom"])
+        )
+
+        self.assertEqual(cfg.static_prompt, "Custom")
 
     def test_live_explicit_translation_mode_overrides_quality_preset(self) -> None:
         cfg = build_live_config(parse_args(["--live", "--live-preset", "quality", "--live-translation-mode", "direct"]))
@@ -76,6 +170,30 @@ class LiveCliTests(unittest.TestCase):
 
         self.assertEqual(rc, 1)
         self.assertIn("requires --live-translation-mode cascade", stdout.getvalue())
+        run_session.assert_not_called()
+
+    def test_live_rejects_zero_audio_max_len(self) -> None:
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch("transcriber.live.run_live_session", return_value=0) as run_session,
+        ):
+            rc = run_live_mode(parse_args(["--live", "--live-audio-max-len", "0"]))
+
+        self.assertEqual(rc, 1)
+        self.assertIn("--live-audio-max-len must be greater than 0", stdout.getvalue())
+        run_session.assert_not_called()
+
+    def test_live_rejects_audio_min_len_above_max_len(self) -> None:
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch("transcriber.live.run_live_session", return_value=0) as run_session,
+        ):
+            rc = run_live_mode(parse_args(["--live", "--live-audio-min-len", "45", "--live-audio-max-len", "5"]))
+
+        self.assertEqual(rc, 1)
+        self.assertIn("--live-audio-min-len cannot exceed --live-audio-max-len", stdout.getvalue())
         run_session.assert_not_called()
 
     def test_live_direct_mode_allows_english_transcript_path(self) -> None:
@@ -133,6 +251,47 @@ class LiveCliTests(unittest.TestCase):
 
             self.assertEqual(english_path.read_text(encoding="utf-8"), "hello\n")
             self.assertEqual(bilingual_path.read_text(encoding="utf-8"), "1.\nES: hola\nEN: hello\n")
+
+    def test_live_audio_latency_queue_drops_oldest_chunk_when_full(self) -> None:
+        audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=1)
+        stats = LiveAudioQueueStats()
+        audio_queue.put_nowait(b"old")
+
+        _put_live_audio(
+            audio_queue,
+            b"new",
+            drop_oldest=True,
+            stats=stats,
+            stop_event=threading.Event(),
+        )
+
+        self.assertEqual(stats.dropped_chunks, 1)
+        self.assertEqual(audio_queue.get_nowait(), b"new")
+
+    def test_live_audio_quality_queue_waits_for_space_without_counting_drop(self) -> None:
+        audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=1)
+        stats = LiveAudioQueueStats()
+        stop_event = threading.Event()
+        audio_queue.put_nowait(b"old")
+
+        thread = threading.Thread(
+            target=_put_live_audio,
+            kwargs={
+                "audio_queue": audio_queue,
+                "chunk": b"new",
+                "drop_oldest": False,
+                "stats": stats,
+                "stop_event": stop_event,
+            },
+        )
+        thread.start()
+        time.sleep(0.05)
+        self.assertEqual(stats.dropped_chunks, 0)
+        self.assertEqual(audio_queue.get_nowait(), b"old")
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(audio_queue.get_nowait(), b"new")
 
     def test_live_extra_includes_whisperlivekit_server_dependencies(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"

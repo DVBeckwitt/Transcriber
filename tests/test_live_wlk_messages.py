@@ -201,7 +201,17 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
             model="small",
             language="es",
             asr_prompt="OpenAI Codex",
+            static_prompt="Keep glossary stable",
             translation_mode=LiveTranslationMode.DIRECT,
+            backend="auto",
+            backend_policy="localagreement",
+            frame_threshold=25,
+            beams=1,
+            decoder="auto",
+            audio_min_len=0.0,
+            audio_max_len=30.0,
+            nllb_backend="transformers",
+            nllb_size="600M",
         )
 
         self.assertEqual(command[:2], ["wlk", "--host"])
@@ -213,6 +223,7 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
         self.assertNotIn("simulstreaming", command)
         self.assertNotIn("--beams", command)
         self.assertIn("--init-prompt", command)
+        self.assertIn("--static-init-prompt", command)
         self.assertNotIn("--diarization", command)
 
     def test_build_wlk_command_uses_cascade_target_language_without_direct_translation(self) -> None:
@@ -224,6 +235,16 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
             language="es",
             asr_prompt=None,
             translation_mode=LiveTranslationMode.CASCADE,
+            static_prompt=None,
+            backend="faster-whisper",
+            backend_policy="localagreement",
+            frame_threshold=35,
+            beams=3,
+            decoder="beam",
+            audio_min_len=1.0,
+            audio_max_len=45.0,
+            nllb_backend="ctranslate2",
+            nllb_size="600M",
         )
 
         self.assertIn("--pcm-input", command)
@@ -231,6 +252,20 @@ class WhisperLiveKitMessageTests(unittest.TestCase):
         self.assertIn("en", command)
         self.assertNotIn("--direct-english-translation", command)
         self.assertNotIn("--diarization", command)
+        self.assertIn("--backend", command)
+        self.assertIn("faster-whisper", command)
+        self.assertIn("--frame-threshold", command)
+        self.assertIn("35", command)
+        self.assertIn("--beams", command)
+        self.assertIn("3", command)
+        self.assertIn("--decoder", command)
+        self.assertIn("beam", command)
+        self.assertIn("--audio-min-len", command)
+        self.assertIn("1.0", command)
+        self.assertIn("--audio-max-len", command)
+        self.assertIn("45.0", command)
+        self.assertIn("--nllb-backend", command)
+        self.assertIn("ctranslate2", command)
 
 
 if __name__ == "__main__":

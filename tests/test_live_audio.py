@@ -10,7 +10,9 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from transcriber.live_audio import (
+    LiveAudioDiagnostics,
     LoopbackDevice,
+    _audio_diagnostics,
     convert_to_pcm16_mono_16k,
     list_loopback_devices,
     select_loopback_device,
@@ -48,6 +50,16 @@ class LiveAudioConversionTests(unittest.TestCase):
         self.assertEqual(len(samples), 8_000)
         self.assertTrue(all(sample == 9_000 for sample in samples[:100]))
 
+    def test_conversion_uses_stronger_channel_when_stereo_phase_cancels(self) -> None:
+        frames = 48_000 // 2
+        raw = struct.pack(f"<{frames * 2}h", *([12_000, -12_000] * frames))
+
+        pcm = convert_to_pcm16_mono_16k(raw, input_sample_rate=48_000, input_channels=2)
+        samples = self.decode_int16(pcm)
+
+        self.assertEqual(len(samples), 8_000)
+        self.assertTrue(all(sample == 12_000 for sample in samples[:100]))
+
     def test_conversion_clips_to_int16_range(self) -> None:
         frames = 48_000 // 2
         raw = struct.pack(f"<{frames}h", *([32_767] * frames))
@@ -57,6 +69,22 @@ class LiveAudioConversionTests(unittest.TestCase):
 
         self.assertTrue(all(-32_768 <= sample <= 32_767 for sample in samples))
         self.assertEqual(max(samples), 32_767)
+
+    def test_audio_diagnostics_reports_rms_and_peak(self) -> None:
+        raw = struct.pack("<4h", -10_000, 0, 10_000, 20_000)
+
+        diagnostics = _audio_diagnostics(raw, input_sample_rate=48_000, input_channels=1, output_bytes=8)
+
+        self.assertEqual(
+            diagnostics,
+            LiveAudioDiagnostics(
+                input_sample_rate=48_000,
+                input_channels=1,
+                output_bytes=8,
+                rms_level=12247.45,
+                peak_level=20000,
+            ),
+        )
 
 
 class LiveAudioLoopbackTests(unittest.TestCase):

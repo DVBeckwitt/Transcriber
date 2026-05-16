@@ -10,8 +10,19 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from transcriber.live_wlk import CaptionPair, CaptionState, LiveTranslationMode
+
+DEFAULT_SPANISH_TO_ENGLISH_STATIC_PROMPT = "\n".join(
+    (
+        "This is casual Spanish conversation.",
+        "Translate into natural English.",
+        "Spanish words casarse, casarnos, casarme, casar, boda, playa, and matrimonio refer to marriage or weddings when context fits.",
+        "Do not translate casarse/casarnos as hunting.",
+        "Preserve pronouns carefully.",
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,22 @@ class LiveConfig:
     diarize: bool
     translate_to_english: bool
     asr_prompt: str | None
+    static_prompt: str | None
+    backend: str
+    backend_policy: str
+    frame_threshold: int
+    beams: int
+    decoder: str
+    audio_min_len: float
+    audio_max_len: float
+    nllb_backend: str
+    nllb_size: str
+    audio_diagnostics: bool
+
+
+@dataclass
+class LiveAudioQueueStats:
+    dropped_chunks: int = 0
 
 
 def build_live_asr_prompt(args: argparse.Namespace) -> str | None:
@@ -75,14 +102,51 @@ def _effective_live_chunk_ms(args: argparse.Namespace) -> int:
     return 250 if args.live_preset == "latency" else 500
 
 
+def _effective_live_model(args: argparse.Namespace) -> str:
+    if args.model:
+        return str(args.model)
+    return "medium" if args.live_preset == "quality" else "small"
+
+
+def _quality_default(args: argparse.Namespace, attribute: str, quality_value: Any, fallback_value: Any) -> Any:
+    value = getattr(args, attribute)
+    if value is not None:
+        return value
+    return quality_value if args.live_preset == "quality" else fallback_value
+
+
+def _effective_live_static_prompt(args: argparse.Namespace, language: str) -> str | None:
+    if args.live_static_prompt:
+        return str(args.live_static_prompt)
+    if args.live_preset == "quality" and language == "es":
+        return DEFAULT_SPANISH_TO_ENGLISH_STATIC_PROMPT
+    return None
+
+
+def _effective_live_audio_lengths(args: argparse.Namespace) -> tuple[float, float]:
+    audio_min_len = max(0.0, float(_quality_default(args, "live_audio_min_len", 0.0, 0.0)))
+    audio_max_len = max(0.0, float(_quality_default(args, "live_audio_max_len", 30.0, 30.0)))
+    if audio_max_len <= 0.0:
+        raise RuntimeError("--live-audio-max-len must be greater than 0.")
+    if audio_min_len > audio_max_len:
+        raise RuntimeError("--live-audio-min-len cannot exceed --live-audio-max-len.")
+    return audio_min_len, audio_max_len
+
+
+def _live_audio_queue_maxsize(config: LiveConfig) -> int:
+    return 0 if config.preset == "quality" else 8
+
+
 def build_live_config(args: argparse.Namespace) -> LiveConfig:
     translation_mode = _effective_live_translation_mode(args)
     if translation_mode == LiveTranslationMode.DIRECT and args.live_save_bilingual_transcript:
         raise RuntimeError("--live-save-bilingual-transcript requires --live-translation-mode cascade.")
+    language = args.lang or "es"
+    audio_min_len, audio_max_len = _effective_live_audio_lengths(args)
 
     return LiveConfig(
-        language=args.lang or "es",
-        model=args.model or "small",
+        language=language,
+        model=_effective_live_model(args),
         engine=args.live_engine,
         source=args.live_source,
         device_index=args.live_device_index,
@@ -97,17 +161,69 @@ def build_live_config(args: argparse.Namespace) -> LiveConfig:
         diarize=False,
         translate_to_english=True,
         asr_prompt=build_live_asr_prompt(args),
+        static_prompt=_effective_live_static_prompt(args, language),
+        backend=str(_quality_default(args, "live_backend", "faster-whisper", "auto")),
+        backend_policy=str(_quality_default(args, "live_backend_policy", "localagreement", "localagreement")),
+        frame_threshold=max(1, int(_quality_default(args, "live_frame_threshold", 35, 25))),
+        beams=max(1, int(_quality_default(args, "live_beams", 3, 1))),
+        decoder=str(_quality_default(args, "live_decoder", "beam", "auto")),
+        audio_min_len=audio_min_len,
+        audio_max_len=audio_max_len,
+        nllb_backend=str(_quality_default(args, "live_nllb_backend", "ctranslate2", "transformers")),
+        nllb_size=str(_quality_default(args, "live_nllb_size", "600M", "600M")),
+        audio_diagnostics=bool(args.live_audio_diagnostics),
     )
 
 
-def _put_latest_audio(audio_queue: queue.Queue[bytes], chunk: bytes) -> None:
+def _put_live_audio(
+    audio_queue: queue.Queue[bytes],
+    chunk: bytes,
+    *,
+    drop_oldest: bool,
+    stats: LiveAudioQueueStats,
+    stop_event: threading.Event,
+) -> None:
     try:
         audio_queue.put(chunk, timeout=0.2)
     except queue.Full:
-        with contextlib.suppress(queue.Empty):
-            audio_queue.get_nowait()
-        with contextlib.suppress(queue.Full):
-            audio_queue.put_nowait(chunk)
+        if drop_oldest:
+            with contextlib.suppress(queue.Empty):
+                audio_queue.get_nowait()
+                stats.dropped_chunks += 1
+            with contextlib.suppress(queue.Full):
+                audio_queue.put_nowait(chunk)
+            return
+        while not stop_event.is_set():
+            try:
+                audio_queue.put(chunk, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
+
+def _print_live_audio_diagnostics(
+    *,
+    config: LiveConfig,
+    audio_queue: queue.Queue[bytes],
+    stats: LiveAudioQueueStats,
+    metrics: object,
+) -> None:
+    input_sample_rate = getattr(metrics, "input_sample_rate", "?")
+    input_channels = getattr(metrics, "input_channels", "?")
+    output_bytes = getattr(metrics, "output_bytes", "?")
+    rms_level = getattr(metrics, "rms_level", "?")
+    peak_level = getattr(metrics, "peak_level", "?")
+    queue_depth = audio_queue.qsize()
+    queue_delay_ms = queue_depth * config.chunk_ms
+    print(
+        "[live-audio] "
+        f"input={input_sample_rate}Hz/{input_channels}ch "
+        f"output_bytes={output_bytes} "
+        f"rms={rms_level} peak={peak_level} "
+        f"queue={queue_depth}/{audio_queue.maxsize} "
+        f"dropped={stats.dropped_chunks} "
+        f"queue_delay_ms={queue_delay_ms}"
+    )
 
 
 def _capture_loop(
@@ -117,13 +233,35 @@ def _capture_loop(
     stop_event: threading.Event,
     error_queue: queue.Queue[BaseException],
 ) -> None:
-    from transcriber.live_audio import iter_loopback_pcm_chunks
+    from transcriber.live_audio import LiveAudioDiagnostics, iter_loopback_pcm_chunks
+
+    stats = LiveAudioQueueStats()
+    on_metrics: Callable[[LiveAudioDiagnostics], None] | None = None
+    if config.audio_diagnostics:
+
+        def on_metrics(metrics: LiveAudioDiagnostics) -> None:
+            _print_live_audio_diagnostics(
+                config=config,
+                audio_queue=audio_queue,
+                stats=stats,
+                metrics=metrics,
+            )
 
     try:
-        for chunk in iter_loopback_pcm_chunks(device_index=config.device_index, chunk_ms=config.chunk_ms):
+        for chunk in iter_loopback_pcm_chunks(
+            device_index=config.device_index,
+            chunk_ms=config.chunk_ms,
+            on_diagnostics=on_metrics,
+        ):
             if stop_event.is_set():
                 break
-            _put_latest_audio(audio_queue, chunk)
+            _put_live_audio(
+                audio_queue,
+                chunk,
+                drop_oldest=config.preset != "quality",
+                stats=stats,
+                stop_event=stop_event,
+            )
     except BaseException as exc:
         error_queue.put(exc)
         stop_event.set()
@@ -164,6 +302,7 @@ def _state_handler(
     state_queue: queue.Queue[CaptionState] | None,
     save_transcript_path: str | None,
     save_bilingual_transcript_path: str | None,
+    audio_diagnostics: bool = False,
 ) -> Callable[[CaptionState], None]:
     transcript_path = Path(save_transcript_path).expanduser() if save_transcript_path else None
     bilingual_transcript_path = (
@@ -176,6 +315,8 @@ def _state_handler(
         nonlocal last_written_lines, last_written_pairs
         if state_queue is not None:
             _put_latest_state(state_queue, state)
+        if audio_diagnostics and state.lag_seconds is not None:
+            print(f"[live-audio] wlk_lag_seconds={state.lag_seconds:.2f}")
         if transcript_path is not None and state.committed_lines != last_written_lines:
             _write_committed_transcript(transcript_path, state)
             last_written_lines = state.committed_lines
@@ -209,6 +350,7 @@ def _stream_loop(
                     state_queue=state_queue,
                     save_transcript_path=config.save_transcript_path,
                     save_bilingual_transcript_path=config.save_bilingual_transcript_path,
+                    audio_diagnostics=config.audio_diagnostics,
                 ),
             )
         )
@@ -221,7 +363,7 @@ def run_live_session(config: LiveConfig) -> int:
     from transcriber.live_wlk import start_wlk_server, stop_wlk_server
 
     stop_event = threading.Event()
-    audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
+    audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=_live_audio_queue_maxsize(config))
     state_queue: queue.Queue[CaptionState] | None = queue.Queue(maxsize=16) if config.show_window else None
     error_queue: queue.Queue[BaseException] = queue.Queue()
     server = None
@@ -236,6 +378,16 @@ def run_live_session(config: LiveConfig) -> int:
             language=config.language,
             translation_mode=config.translation_mode,
             asr_prompt=config.asr_prompt,
+            static_prompt=config.static_prompt,
+            backend=config.backend,
+            backend_policy=config.backend_policy,
+            frame_threshold=config.frame_threshold,
+            beams=config.beams,
+            decoder=config.decoder,
+            audio_min_len=config.audio_min_len,
+            audio_max_len=config.audio_max_len,
+            nllb_backend=config.nllb_backend,
+            nllb_size=config.nllb_size,
         )
         capture_thread = threading.Thread(
             target=_capture_loop,
@@ -302,14 +454,26 @@ def run_live_mode(args: argparse.Namespace) -> int:
             return 0
 
         if args.live_loopback_test:
-            from transcriber.live_audio import write_loopback_test_wav
+            from transcriber.live_audio import LiveAudioDiagnostics, write_loopback_test_wav
 
             output_path = Path(args.output).expanduser()
+            on_metrics: Callable[[LiveAudioDiagnostics], None] | None = None
+            if args.live_audio_diagnostics:
+
+                def on_metrics(metrics: LiveAudioDiagnostics) -> None:
+                    print(
+                        "[live-audio] "
+                        f"input={metrics.input_sample_rate}Hz/{metrics.input_channels}ch "
+                        f"output_bytes={metrics.output_bytes} "
+                        f"rms={metrics.rms_level} peak={metrics.peak_level}"
+                    )
+
             write_loopback_test_wav(
                 output_path,
                 seconds=max(0.0, float(args.seconds)),
                 device_index=args.live_device_index,
                 chunk_ms=_effective_live_chunk_ms(args),
+                on_diagnostics=on_metrics,
             )
             print(f'\nWrote loopback test WAV: "{output_path}"\n')
             return 0

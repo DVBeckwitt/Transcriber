@@ -66,6 +66,16 @@ def build_wlk_command(
     language: str,
     translation_mode: LiveTranslationMode,
     asr_prompt: str | None = None,
+    static_prompt: str | None = None,
+    backend: str = "auto",
+    backend_policy: str = "localagreement",
+    frame_threshold: int = 25,
+    beams: int = 1,
+    decoder: str = "auto",
+    audio_min_len: float = 0.0,
+    audio_max_len: float = 30.0,
+    nllb_backend: str = "transformers",
+    nllb_size: str = "600M",
 ) -> list[str]:
     command = [
         executable,
@@ -78,15 +88,33 @@ def build_wlk_command(
         "--language",
         language,
         "--backend-policy",
-        "localagreement",
+        backend_policy,
         "--pcm-input",
     ]
+    if backend != "auto":
+        command.extend(["--backend", backend])
     if translation_mode == LiveTranslationMode.DIRECT:
         command.append("--direct-english-translation")
     else:
         command.extend(["--target-language", "en"])
+    if frame_threshold != 25:
+        command.extend(["--frame-threshold", str(frame_threshold)])
+    if beams != 1:
+        command.extend(["--beams", str(beams)])
+    if decoder != "auto":
+        command.extend(["--decoder", decoder])
+    if audio_min_len != 0.0:
+        command.extend(["--audio-min-len", str(audio_min_len)])
+    if audio_max_len != 30.0:
+        command.extend(["--audio-max-len", str(audio_max_len)])
+    if nllb_backend != "transformers":
+        command.extend(["--nllb-backend", nllb_backend])
+    if nllb_size != "600M":
+        command.extend(["--nllb-size", nllb_size])
     if asr_prompt:
         command.extend(["--init-prompt", asr_prompt])
+    if static_prompt:
+        command.extend(["--static-init-prompt", static_prompt])
     return command
 
 
@@ -119,6 +147,16 @@ def start_wlk_server(
     language: str,
     translation_mode: LiveTranslationMode,
     asr_prompt: str | None,
+    static_prompt: str | None = None,
+    backend: str = "auto",
+    backend_policy: str = "localagreement",
+    frame_threshold: int = 25,
+    beams: int = 1,
+    decoder: str = "auto",
+    audio_min_len: float = 0.0,
+    audio_max_len: float = 30.0,
+    nllb_backend: str = "transformers",
+    nllb_size: str = "600M",
 ) -> subprocess.Popen[Any]:
     executable = resolve_wlk_executable()
     command = build_wlk_command(
@@ -129,6 +167,16 @@ def start_wlk_server(
         language=language,
         translation_mode=translation_mode,
         asr_prompt=asr_prompt,
+        static_prompt=static_prompt,
+        backend=backend,
+        backend_policy=backend_policy,
+        frame_threshold=frame_threshold,
+        beams=beams,
+        decoder=decoder,
+        audio_min_len=audio_min_len,
+        audio_max_len=audio_max_len,
+        nllb_backend=nllb_backend,
+        nllb_size=nllb_size,
     )
     process = subprocess.Popen(command)
     try:

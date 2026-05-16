@@ -32,8 +32,8 @@ Live mode is a separate runtime path:
 CLI live args
   -> transcriber.live.build_live_config
   -> transcriber.live_audio WASAPI loopback capture
-  -> 16 kHz mono signed 16-bit PCM chunks
-  -> local WhisperLiveKit subprocess with LocalAgreement backend policy
+  -> downmixed/resampled 16 kHz mono signed 16-bit PCM chunks
+  -> local WhisperLiveKit subprocess with configured live quality flags
   -> ws://127.0.0.1:<port>/asr?language=es&mode=full
   -> transcriber.live_wlk.CaptionState
   -> transcriber.live_window caption popup and optional text transcripts
@@ -59,6 +59,7 @@ CLI live args
 - `OutputPaths` defines where `.srt`, `*_llm.txt`, logs, and lock files are expected.
 - `WatchTarget` defines per-folder watcher policy, including allowed extensions, destination moves, and rename strategy.
 - Live mode is only entered through `--live`, `--live-list-devices`, or `--live-loopback-test`. It does not call `transcribe_file`, WhisperX alignment, PyAnnote diarization, SRT cue generation, or Helsinki-NLP post-translation.
+- `LiveConfig` is the live-mode boundary between CLI parsing and runtime orchestration. New live quality controls should be added there first, then passed through to `live_wlk.build_wlk_command` without changing file/watch `RunConfig`.
 - `CaptionState` is the live UI and live transcript contract. Full-mode WhisperLiveKit updates replace the partial caption line instead of appending it. In direct mode, committed pairs intentionally have empty Spanish source text because WLK committed `text` is already English; in cascade mode, committed pairs preserve each line's Spanish source text with its English translation.
 - The CI workflow is a repository contract. Update `README.md`, `AGENTS.md`, and `CONTRIBUTING.md` when changing validation commands.
 
@@ -67,8 +68,10 @@ CLI live args
 - SRT speaker label control is a user-facing CLI feature, not a pipeline migration. Interactive one-off runs prompt for speaker labels after language and quality/fast mode. `--speaker-labels` and `--no-speaker-labels` are the preferred flag names; `--diarize` and `--no-diarize` remain supported aliases.
 - Disabling speaker labels skips diarization, Hugging Face token loading, speaker smoothing, and `SPEAKER_00:` rendering while preserving subtitle timing, cleanup, translation, watcher, and movement behavior.
 - The speaker-label prompt/config simplification is an internal refactor only. It does not change CLI options, prompt wording, defaults, watcher behavior, CI gates, or migration posture.
-- Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live` and a WASAPI loopback device. The launcher resolves WhisperLiveKit's `wlk` or `whisperlivekit-server` executable from the active Python environment's Scripts directory before falling back to `PATH`, starts it with the LocalAgreement backend policy, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default.
+- Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live` and a WASAPI loopback device. The launcher resolves WhisperLiveKit's `wlk` or `whisperlivekit-server` executable from the active Python environment's Scripts directory before falling back to `PATH`, starts it with the configured live backend policy, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default.
 - Live translation mode is explicit. `direct` uses WhisperLiveKit `--direct-english-translation` and rejects `--live-save-bilingual-transcript`; `cascade` uses `--target-language en` and allows real Spanish/English transcript pairs.
+- Live quality controls are additive. The latency preset keeps direct mode, model `small`, 250 ms chunks, greedy decoding, and a drop-oldest bounded queue policy. The quality preset uses cascade mode, model `medium` unless overridden, 500 ms chunks, Faster-Whisper backend, beam decoding, CTranslate2 NLLB translation, static Spanish-to-English prompt guidance, validated audio buffer lengths, and an unbounded no-intentional-drop queue policy.
+- Live audio diagnostics are observational only. They report sample rate, channels, output chunk bytes, RMS, peak, queue depth, dropped chunks, estimated queue delay, and WhisperLiveKit lag without changing transcript semantics.
 - The live translation-mode helper/parser cleanup is an internal refactor only. It does not change CLI options, defaults, direct/cascade transcript semantics, WLK command flags, CI gates, or migration posture.
 - Live-mode error status: missing optional live dependencies now report a clear install message instead of a traceback, and WLK subprocess startup failures terminate the child process before returning an error.
 - Live-mode rollout status: additive local beta. Startup smoke has passed with the `live` extra installed, but full Windows loopback audio validation is still pending. No existing file transcription/watch behavior is migrated or deprecated.

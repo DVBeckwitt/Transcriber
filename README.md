@@ -142,7 +142,13 @@ The live launcher changes to the repository root before starting, uses `VIRTUAL_
 python -m transcriber --live --lang es --model small --live-source system --no-speaker-labels --live-preset latency --live-translation-mode direct --live-save-transcript logs\live_english_transcript.txt
 ```
 
-Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, direct/cascade transcript semantics, bilingual transcript formatting, window text formatting, dependency diagnostics, executable resolution, and WLK startup cleanup. Startup smoke has passed with the `live` extra installed; full live audio validation still requires Windows audio hardware.
+Slower live mode with real Spanish/English transcript pairs:
+
+```powershell
+python -m transcriber --live --lang es --model medium --live-source system --no-speaker-labels --live-preset quality --live-translation-mode cascade --live-save-bilingual-transcript logs\live_bilingual_transcript.txt --live-audio-diagnostics
+```
+
+Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, direct/cascade transcript semantics, bilingual transcript formatting, quality preset flags, window text formatting, dependency diagnostics, executable resolution, and WLK startup cleanup. Startup smoke has passed with the `live` extra installed; full live audio validation still requires Windows audio hardware.
 
 ### Watch `C:\Users\Kenpo\OneDrive\recordings`
 
@@ -249,6 +255,12 @@ Record a short loopback test WAV:
 python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.wav
 ```
 
+Record a loopback test with levels:
+
+```powershell
+python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.wav --live-audio-diagnostics
+```
+
 ## Runtime behavior
 
 - Output files are written next to the input media file.
@@ -277,6 +289,12 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - Live mode is separate from file/watch transcription. It captures Windows PC speaker output through WASAPI loopback, converts it to 16 kHz mono signed 16-bit PCM, streams it to a local WhisperLiveKit server at `/asr` with the LocalAgreement backend policy, and displays committed captions plus one replaceable partial line in a small always-on-top Tkinter window.
 - `--live-translation-mode direct` uses WhisperLiveKit direct English translation for fastest captions. In this mode WLK committed `text` is already English, so bilingual transcript output is rejected to avoid labeling English as Spanish.
 - `--live-translation-mode cascade` uses WhisperLiveKit `--target-language en` so committed `text` is Spanish source text and `translation` is English. Use this mode when a real Spanish/English transcript is required.
+- `--live-preset quality` defaults to cascade mode, model `medium`, the Faster-Whisper backend, beam decoding, CTranslate2 NLLB translation, and a Spanish-to-English static prompt for the known `casarse` / `hunt` failure mode. Explicit live flags still override preset defaults.
+- `--live-static-prompt` is passed to WhisperLiveKit as a static prompt that does not scroll out of context. Existing `--asr-prompt`, `--asr-prompt-file`, and glossary flags still feed the regular initial prompt.
+- `--live-audio-diagnostics` prints input sample rate, channel count, output chunk bytes, RMS level, peak level, queue depth, dropped chunk count, queue-delay estimate, and WhisperLiveKit lag when available.
+- `--live-audio-min-len` and `--live-audio-max-len` are validated before WhisperLiveKit starts. Max length must be greater than zero, and min length cannot exceed max length.
+- Live audio downmixing averages normal stereo channels, but falls back to the stronger channel when one channel is nearly silent or phase cancellation would erase speech. Resampling uses SciPy's polyphase resampler when the live extra is installed, with the previous linear interpolation kept as a fallback.
+- The latency preset keeps a bounded queue and may drop the oldest chunk when behind. The quality preset uses an unbounded queue, does not intentionally drop audio, and may show growing lag when the machine cannot keep up.
 - Live mode never enables diarization, never renders speaker labels, never loads Hugging Face tokens, and does not write SRT or `*_llm.txt` files.
 - `--live-save-transcript` can write the current committed English caption lines to a text file while live mode runs.
 - `--live-save-bilingual-transcript` writes committed Spanish source and English translation pairs to a text file, and requires `--live-translation-mode cascade`.
@@ -329,6 +347,17 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 --live-chunk-ms            Override live audio chunk size in milliseconds
 --live-translation-mode    direct | cascade
 --live-preset              latency | quality | custom
+--live-backend             auto | faster-whisper | whisper
+--live-backend-policy      localagreement | simulstreaming
+--live-frame-threshold     AlignAtt frame threshold
+--live-beams               Beam search width
+--live-decoder             auto | greedy | beam
+--live-audio-min-len       Minimum audio length to process in seconds
+--live-audio-max-len       Maximum audio buffer length in seconds
+--live-nllb-backend        transformers | ctranslate2
+--live-nllb-size           600M | 1.3B
+--live-static-prompt       Static live prompt passed to WhisperLiveKit
+--live-audio-diagnostics   Print live audio levels, queue state, and lag
 --live-no-window           Run live mode without the caption popup
 --live-save-transcript     Write committed live captions to a text file
 --live-save-bilingual-transcript  Write committed Spanish/English live caption pairs to a text file

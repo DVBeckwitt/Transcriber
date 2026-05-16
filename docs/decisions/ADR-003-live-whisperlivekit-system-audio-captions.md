@@ -30,6 +30,10 @@ Preserve committed bilingual caption pairs in `CaptionState` and expose `--live-
 
 Make live translation mode explicit. Direct mode starts WhisperLiveKit with `--direct-english-translation`; in that mode committed `text` is already English, so bilingual transcript output is rejected. Cascade mode starts WhisperLiveKit with `--target-language en`; in that mode committed `text` is Spanish source text and `translation` is English, so bilingual transcript output is allowed.
 
+Expose WhisperLiveKit's documented live quality controls through additive CLI flags and `LiveConfig`: backend, backend policy, frame threshold, beams, decoder, audio min/max length, NLLB backend/size, and static prompt. Keep direct/latency mode as the default, but make `--live-preset quality` choose cascade mode, model `medium`, Faster-Whisper backend, beam decoding, and CTranslate2-backed NLLB translation unless explicitly overridden.
+
+Keep the quality preset slower rather than lossy. Latency mode may drop the oldest queued audio chunk when the stream falls behind; quality mode uses an unbounded audio queue and reports lag instead of intentionally deleting queued audio. Reject invalid audio buffer lengths before starting WhisperLiveKit. Live audio diagnostics are observational and do not change transcript output.
+
 The live runtime path is:
 
 ```text
@@ -71,6 +75,9 @@ WASAPI loopback audio
 
 - Live mode is additive and does not deprecate existing CLI behavior.
 - `--live-save-transcript` remains English-only; `--live-save-bilingual-transcript` writes numbered Spanish and English pairs only in cascade mode.
+- `--live-preset quality` is the recommended path when transcript accuracy matters more than speed.
+- Static live prompts can correct persistent phrase mistakes without changing file/watch prompt behavior.
+- Live audio diagnostics make silent, clipped, phase-cancelled, or backlogged capture visible before blaming WhisperLiveKit output quality.
 - `logs\live_english_transcript.txt` and `logs\live_bilingual_transcript.txt` are generated local output, ignored by git, and not part of release artifacts.
 - The `live` extra and runtime guard are required for Python 3.11+ live use.
 - CI covers live parsing, conversion, CLI, and lifecycle logic without Windows audio hardware or model downloads.

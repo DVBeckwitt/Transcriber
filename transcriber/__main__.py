@@ -1527,6 +1527,41 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default="latency",
         help="Live mode preset (default: latency).",
     )
+    parser.add_argument(
+        "--live-backend",
+        choices=("auto", "faster-whisper", "whisper"),
+        help="Live WhisperLiveKit ASR backend override.",
+    )
+    parser.add_argument(
+        "--live-backend-policy",
+        choices=("localagreement", "simulstreaming"),
+        help="Live WhisperLiveKit streaming policy override.",
+    )
+    parser.add_argument("--live-frame-threshold", type=int, help="Live AlignAtt frame threshold override.")
+    parser.add_argument("--live-beams", type=int, help="Live beam search width override.")
+    parser.add_argument(
+        "--live-decoder",
+        choices=("auto", "greedy", "beam"),
+        help="Live decoder override.",
+    )
+    parser.add_argument("--live-audio-min-len", type=float, help="Live minimum audio length to process in seconds.")
+    parser.add_argument("--live-audio-max-len", type=float, help="Live maximum audio buffer length in seconds.")
+    parser.add_argument(
+        "--live-nllb-backend",
+        choices=("transformers", "ctranslate2"),
+        help="Live cascade translation backend override.",
+    )
+    parser.add_argument(
+        "--live-nllb-size",
+        choices=("600M", "1.3B"),
+        help="Live cascade translation model size override.",
+    )
+    parser.add_argument("--live-static-prompt", help="Static live prompt passed to WhisperLiveKit.")
+    parser.add_argument(
+        "--live-audio-diagnostics",
+        action="store_true",
+        help="Print live audio level, queue, and lag diagnostics.",
+    )
     parser.add_argument("--live-no-window", action="store_true", help="Run live mode without the caption popup window.")
     parser.add_argument("--live-save-transcript", help="Write committed live English captions to this text file.")
     parser.add_argument(
