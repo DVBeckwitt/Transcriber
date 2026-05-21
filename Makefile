@@ -1,4 +1,4 @@
-.PHONY: sync test coverage lint format-check typecheck cli build audit hooks quality validate clean
+.PHONY: sync test coverage lint format-check typecheck cli build audit hooks quality validate clean export check-release
 
 sync:
 	uv sync --locked
@@ -34,4 +34,11 @@ quality: sync coverage lint format-check typecheck cli build
 validate: quality audit hooks
 
 clean:
-	python -c "import shutil; from pathlib import Path; [shutil.rmtree(path, ignore_errors=True) for path in [Path('.uv-venv'), Path('build'), Path('dist'), Path('htmlcov'), Path('transcriber_local.egg-info'), Path('.pytest_cache'), Path('.mypy_cache'), Path('.ruff_cache')]]; [path.unlink(missing_ok=True) for path in [Path('.coverage'), Path('coverage.xml')]]"
+	python -c "import shutil; from pathlib import Path; [shutil.rmtree(path, ignore_errors=True) for path in [Path('.venv'), Path('.uv-venv'), Path('build'), Path('dist'), Path('htmlcov'), Path('logs'), Path('.tmp_transcriber_temp'), Path('transcriber_local.egg-info'), Path('.pytest_cache'), Path('.mypy_cache'), Path('.ruff_cache'), Path('__pycache__'), Path('transcriber/__pycache__'), Path('tests/__pycache__')]]; [path.unlink(missing_ok=True) for path in [Path('.coverage'), Path('coverage.xml')]]"
+
+
+export: clean
+	python tools/export_clean.py
+
+check-release:
+	python tools/check_release_archive.py dist/transcriber-local-clean.zip

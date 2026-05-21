@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import importlib.util
+import shutil
+from dataclasses import dataclass
+from typing import Any
+
+from transcriber.errors import PreflightError
+
+
+@dataclass(frozen=True)
+class PreflightReport:
+    errors: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def raise_for_errors(self) -> None:
+        if self.errors:
+            raise PreflightError("\n".join(self.errors))
+
+    def format(self) -> list[str]:
+        lines: list[str] = []
+        if self.errors:
+            lines.append("Preflight failed:")
+            lines.extend(f"  - {message}" for message in self.errors)
+        if self.warnings:
+            lines.append("Preflight warnings:")
+            lines.extend(f"  - {message}" for message in self.warnings)
+        return lines
+
+
+def module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def executable_available(executable_name: str) -> bool:
+    return shutil.which(executable_name) is not None
+
+
+def cuda_available() -> bool:
+    if not module_available("torch"):
+        return False
+    try:
+        torch = importlib.import_module("torch")
+    except Exception:
+        return False
+    return bool(getattr(torch.cuda, "is_available", lambda: False)())
+
+
+def check_transcription_preflight(*, cfg: Any, hf_token_present: bool, require_ffmpeg: bool = True) -> PreflightReport:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not module_available("whisperx"):
+        errors.append("Missing Python package: whisperx. Install it before running file transcription.")
+    if require_ffmpeg and not executable_available("ffmpeg"):
+        errors.append("ffmpeg is not available on PATH. Install ffmpeg before file transcription.")
+
+    device = str(getattr(cfg, "device", ""))
+    if device.startswith("cuda") and not cuda_available():
+        errors.append(
+            "--device cuda was selected, but CUDA is not available to torch. Use --device cpu or install a CUDA-enabled torch stack."
+        )
+
+    if bool(getattr(cfg, "diarize", False)) and not hf_token_present:
+        errors.append("Speaker diarization requires HF_TOKEN or hf_token.txt/HF_TOKEN.txt.")
+
+    needs_post_translation = (not bool(getattr(cfg, "translate_to_english", False))) and str(
+        getattr(cfg, "language", "")
+    ) == "auto"
+    if needs_post_translation:
+        for module_name in ("transformers", "sentencepiece", "sacremoses"):
+            if not module_available(module_name):
+                warnings.append(f"Spanish auto-translation may be unavailable because {module_name} is not importable.")
+
+    return PreflightReport(errors=tuple(errors), warnings=tuple(warnings))
+
+
+def validate_run_config(cfg: Any | None = None, **values: float | None) -> PreflightReport:
+    errors: list[str] = []
+
+    if cfg is not None:
+        if str(getattr(cfg, "language", "")) not in {"auto", "en", "es"}:
+            errors.append("language must be one of: auto, en, es.")
+        if str(getattr(cfg, "mode", "")) not in {"quality", "fast"}:
+            errors.append("mode must be one of: quality, fast.")
+        for field in (
+            "batch_size",
+            "beam_size",
+            "translation_batch_size",
+            "translation_num_beams",
+            "translation_max_new_tokens",
+        ):
+            try:
+                if int(getattr(cfg, field)) <= 0:
+                    errors.append(f"{field} must be greater than 0.")
+            except Exception:
+                errors.append(f"{field} must be an integer.")
+        for field in ("min_speaker_turn_ms", "min_speaker_turn_tokens", "translation_no_repeat_ngram_size"):
+            try:
+                if int(getattr(cfg, field)) < 0:
+                    errors.append(f"{field} must be 0 or greater.")
+            except Exception:
+                errors.append(f"{field} must be an integer.")
+        for temp in getattr(cfg, "temperature_schedule", ()) or ():
+            try:
+                value = float(temp)
+            except Exception:
+                errors.append("temperature_schedule must contain numeric values.")
+                continue
+            if not 0.0 <= value <= 1.0:
+                errors.append("temperature_schedule values must be between 0 and 1.")
+        for field in ("temperature", "low_confidence_word_prob", "high_no_speech_prob"):
+            try:
+                value = float(getattr(cfg, field))
+            except Exception:
+                errors.append(f"{field} must be numeric.")
+                continue
+            if not 0.0 <= value <= 1.0:
+                errors.append(f"{field} must be between 0 and 1.")
+        if float(getattr(cfg, "patience", 0.0)) <= 0.0:
+            errors.append("patience must be greater than 0.")
+        if str(getattr(cfg, "compute_type", "")) not in {"float16", "float32", "int8"}:
+            errors.append("compute_type must be one of: float16, float32, int8.")
+
+    poll_interval = values.get("poll_interval")
+    settle_seconds = values.get("settle_seconds")
+    stale_lock_seconds = values.get("stale_lock_seconds")
+    if poll_interval is not None and poll_interval <= 0:
+        errors.append("--poll-interval must be greater than 0.")
+    if settle_seconds is not None and settle_seconds < 0:
+        errors.append("--settle-seconds must be 0 or greater.")
+    if stale_lock_seconds is not None and stale_lock_seconds <= 0:
+        errors.append("--stale-lock-seconds must be greater than 0.")
+
+    report = PreflightReport(errors=tuple(errors))
+    if errors:
+        raise ValueError("\n".join(errors))
+    return report

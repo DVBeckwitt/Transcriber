@@ -1,0 +1,28 @@
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.bat text eol=crlf
+uv.lock text eol=lf
+
+.git export-ignore
+.venv export-ignore
+.uv-venv export-ignore
+.mypy_cache export-ignore
+.pytest_cache export-ignore
+.ruff_cache export-ignore
+__pycache__ export-ignore
+**/__pycache__ export-ignore
+*.pyc export-ignore
+.coverage export-ignore
+coverage.xml export-ignore
+htmlcov export-ignore
+dist export-ignore
+build export-ignore
+*.egg-info export-ignore
+logs export-ignore
+HF_TOKEN.txt export-ignore
+hf_token.txt export-ignore
+.tmp_transcriber_temp export-ignore

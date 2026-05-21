@@ -30,3 +30,4 @@ logs/
 *.srt
 *_llm.txt
 *.transcribing.lock
+*.transcription.json

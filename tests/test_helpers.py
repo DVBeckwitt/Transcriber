@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from merge_transcripts import collect_transcript_files, merge_transcript_files
+from transcriber import status as status_utils
 from transcriber.__main__ import (
     DEFAULT_ESCUELA_DEST_DIR,
     DEFAULT_ESCUELA_LAST_EPISODE,
@@ -32,7 +33,9 @@ from transcriber.__main__ import (
     build_watch_targets,
     is_watchable_media,
     load_translation_glossary,
+    main,
     move_completed_watch_outputs,
+    needs_transcription,
     output_paths_for_input,
     parse_args,
     parse_glossary_entries,
@@ -42,9 +45,11 @@ from transcriber.__main__ import (
     render_uncertain_markup,
     run_whisperx_direct_logged,
     smooth_timed_tokens,
+    transcribe_file,
     translate_spanish_texts,
     translation_context_for_cue,
 )
+from transcriber.preflight import PreflightReport
 
 
 def make_cfg(**overrides: object) -> RunConfig:
@@ -285,6 +290,106 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(outputs.llm_path.parent, source.parent)
             self.assertEqual(outputs.lock_path.parent, source.parent)
             self.assertEqual(outputs.log_path.parent, project_dir() / "logs")
+
+    def test_output_paths_include_status_file(self) -> None:
+        cfg = make_cfg()
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.mp4"
+            source.write_bytes(b"data")
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+
+            self.assertEqual(outputs.status_path, source.parent / "meeting.transcription.json")
+
+    def test_needs_transcription_rejects_empty_partial_srt(self) -> None:
+        cfg = make_cfg(speaker_labels=False, diarize=False)
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+            outputs.srt_path.write_text("", encoding="utf-8")
+
+            self.assertTrue(needs_transcription(source, cfg))
+
+    def test_needs_transcription_accepts_matching_success_status(self) -> None:
+        cfg = make_cfg(speaker_labels=False, diarize=False)
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+            outputs.srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            status_utils.write_status_file(
+                outputs.status_path,
+                status_utils.build_status_record(
+                    status="succeeded",
+                    source_path=source,
+                    config=cfg,
+                    srt_path=outputs.srt_path,
+                    started_at="2026-01-01T00:00:00Z",
+                    finished_at="2026-01-01T00:00:01Z",
+                ),
+            )
+
+            self.assertFalse(needs_transcription(source, cfg))
+            self.assertTrue(needs_transcription(source, make_cfg(speaker_labels=False, diarize=False, model="medium")))
+
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_writes_atomic_outputs_and_status(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            speaker_labels=False,
+            diarize=False,
+            write_llm_txt=False,
+            confidence_cleanup=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+                return 0, "en"
+
+            run_logged.side_effect = fake_run
+            messages: list[str] = []
+
+            rc = transcribe_file(cfg, source, report=messages.append, stale_lock_seconds=1)
+            outputs = output_paths_for_input(source, cfg)
+            record = status_utils.read_status_file(outputs.status_path)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(outputs.srt_path.exists())
+            self.assertFalse(outputs.lock_path.exists())
+            self.assertFalse(list(source.parent.glob(".*.srt.tmp")))
+            self.assertIsNotNone(record)
+            self.assertEqual((record or {}).get("status"), "succeeded")
+
+    @patch("transcriber.__main__.resolve_input_path")
+    @patch("transcriber.__main__.transcribe_file")
+    def test_main_passes_stale_lock_seconds_to_transcribe(
+        self,
+        transcribe: MagicMock,
+        resolve_input: MagicMock,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            resolve_input.return_value = source
+            transcribe.return_value = 0
+
+            rc = main(["--input", str(source), "--no-speaker-labels", "--stale-lock-seconds", "3"])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(transcribe.call_args.kwargs["stale_lock_seconds"], 3)
 
     def test_summary_reports_speaker_label_choice(self) -> None:
         cfg = make_cfg(speaker_labels=False, diarize=False)

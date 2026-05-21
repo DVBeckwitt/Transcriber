@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from transcriber.io import atomic_write_text
 from transcriber.live_wlk import CaptionPair, CaptionState, LiveTranslationMode
 
 DEFAULT_SPANISH_TO_ENGLISH_STATIC_PROMPT = "\n".join(
@@ -272,7 +273,7 @@ def _write_committed_transcript(path: Path, state: CaptionState) -> None:
     text = "\n".join(state.committed_lines)
     if text:
         text += "\n"
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
 
 
 def _write_bilingual_transcript(path: Path, state: CaptionState) -> None:
@@ -284,7 +285,7 @@ def _write_bilingual_transcript(path: Path, state: CaptionState) -> None:
     text = "\n\n".join(blocks)
     if text:
         text += "\n"
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
 
 
 def _put_latest_state(state_queue: queue.Queue[CaptionState], state: CaptionState) -> None:

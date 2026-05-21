@@ -21,6 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+from transcriber import locks as lock_utils
+from transcriber import status as status_utils
+from transcriber.errors import OutputWriteError
+from transcriber.io import atomic_replace_path, atomic_write_text, temporary_sibling_path
+from transcriber.preflight import check_transcription_preflight, validate_run_config
+
 MEDIA_FILTER = (
     "Audio/Video",
     "*.wav *.mp3 *.m4a *.flac *.aac *.ogg *.opus *.wma *.mp4 *.mov *.mkv *.webm",
@@ -160,6 +166,7 @@ class OutputPaths:
     llm_path: Path
     log_path: Path
     lock_path: Path
+    status_path: Path
 
 
 @dataclass
@@ -216,6 +223,34 @@ def project_dir() -> Path:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def import_optional_module(module_name: str) -> Any | None:
+    try:
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+
+def srt_file_has_valid_cues(path: Path) -> bool:
+    try:
+        return bool(parse_srt_cues(path.read_text(encoding="utf-8", errors="ignore")))
+    except Exception:
+        return False
+
+
+def require_valid_srt_file(path: Path) -> None:
+    if not path.exists():
+        raise OutputWriteError(f'SRT was not written: "{path}"')
+    if not srt_file_has_valid_cues(path):
+        raise OutputWriteError(f'SRT is empty or invalid: "{path}"')
+
+
+def append_log_message(log_path: Path, message: str) -> None:
+    with contextlib.suppress(OSError):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8", errors="ignore") as log:
+            log.write(message.rstrip() + "\n")
 
 
 def timestamp_to_ms(value: str) -> int:
@@ -964,7 +999,7 @@ def write_direct_srt_from_result(result: dict[str, Any], srt_path: Path, cfg: Ru
     cues = build_srt_cues_from_result(result, cfg)
     if not cues:
         raise RuntimeError("WhisperX returned no subtitle cues.")
-    srt_path.write_text(render_srt_cues(cues), encoding="utf-8")
+    atomic_write_text(srt_path, render_srt_cues(cues))
 
 
 def parse_glossary_entries(raw_items: Sequence[str]) -> dict[str, str]:
@@ -1188,10 +1223,10 @@ def parse_temperature_schedule(value: str | None) -> tuple[float, ...]:
 
 @functools.lru_cache(maxsize=1)
 def load_spanish_to_english_translator() -> tuple[Any, Any]:
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    transformers_module: Any = importlib.import_module("transformers")
 
-    tokenizer = AutoTokenizer.from_pretrained(SPANISH_TRANSLATION_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(SPANISH_TRANSLATION_MODEL)
+    tokenizer = transformers_module.AutoTokenizer.from_pretrained(SPANISH_TRANSLATION_MODEL)
+    model = transformers_module.AutoModelForSeq2SeqLM.from_pretrained(SPANISH_TRANSLATION_MODEL)
     return tokenizer, model
 
 
@@ -1213,11 +1248,7 @@ def translate_spanish_texts(
 
     tokenizer, model = load_spanish_to_english_translator()
 
-    torch_module: Any | None
-    try:
-        import torch as torch_module
-    except Exception:
-        torch_module = None
+    torch_module = import_optional_module("torch")
 
     use_cuda = bool(
         torch_module is not None
@@ -1341,7 +1372,7 @@ def translate_srt_to_english(
     for cue in translated_cues:
         rewrapped.extend(split_cue_for_subtitles(cue))
 
-    srt_path.write_text(render_srt_cues(rewrapped or translated_cues), encoding="utf-8")
+    atomic_write_text(srt_path, render_srt_cues(rewrapped or translated_cues))
 
 
 def build_llm_file(srt_path: Path, llm_path: Path) -> None:
@@ -1368,7 +1399,7 @@ def build_llm_file(srt_path: Path, llm_path: Path) -> None:
         "Output only the refined transcript.\n\n"
         "TRANSCRIPT:\n"
     )
-    llm_path.write_text(preface + "\n".join(text_lines), encoding="utf-8")
+    atomic_write_text(llm_path, preface + "\n".join(text_lines))
 
 
 def finalize_srt_file(srt_path: Path) -> None:
@@ -1377,7 +1408,7 @@ def finalize_srt_file(srt_path: Path) -> None:
 
     text = srt_path.read_text(encoding="utf-8", errors="ignore")
     updated_lines = [render_uncertain_markup(line, "srt") for line in text.splitlines()]
-    srt_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+    atomic_write_text(srt_path, "\n".join(updated_lines).rstrip() + "\n")
 
 
 def build_lock_payload(input_path: Path) -> str:
@@ -1976,7 +2007,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
 
     translate_to_english = bool(args.translate_to_english) or language == "es"
 
-    return RunConfig(
+    cfg = RunConfig(
         language=language,
         translate_to_english=translate_to_english,
         write_llm_txt=True,
@@ -2014,6 +2045,8 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         asr_prompt=asr_prompt,
         dry_run=bool(args.dry_run),
     )
+    validate_run_config(cfg)
+    return cfg
 
 
 def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool = False) -> OutputPaths:
@@ -2023,12 +2056,14 @@ def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool =
         output_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
     base = input_path.stem
+    srt_path = output_dir / f"{base}.srt"
     return OutputPaths(
         output_dir=output_dir,
-        srt_path=output_dir / f"{base}.srt",
+        srt_path=srt_path,
         llm_path=output_dir / f"{base}_llm.txt",
         log_path=log_dir / f"{base}_whisperx.log",
         lock_path=output_dir / f"{base}{LOCK_SUFFIX}",
+        status_path=status_utils.status_path_for_srt(srt_path),
     )
 
 
@@ -2163,9 +2198,8 @@ def load_hf_token(base_dir: Path) -> str | None:
 
 
 def add_common_safe_globals() -> None:
-    try:
-        import torch
-    except Exception:
+    torch = import_optional_module("torch")
+    if torch is None:
         return
 
     safe: list[Any] = []
@@ -2177,9 +2211,9 @@ def add_common_safe_globals() -> None:
         pass
 
     try:
-        from torch.torch_version import TorchVersion
-
-        safe.append(TorchVersion)
+        torch_version = import_optional_module("torch.torch_version")
+        if torch_version is not None:
+            safe.append(torch_version.TorchVersion)
     except Exception:
         pass
 
@@ -2196,9 +2230,8 @@ def add_common_safe_globals() -> None:
 
 @contextlib.contextmanager
 def allow_trusted_checkpoint_loads() -> Iterator[None]:
-    try:
-        import torch
-    except Exception:
+    torch = import_optional_module("torch")
+    if torch is None:
         yield
         return
 
@@ -2217,9 +2250,8 @@ def allow_trusted_checkpoint_loads() -> Iterator[None]:
 
 
 def try_add_unsupported_global(exc: Exception) -> bool:
-    try:
-        import torch
-    except Exception:
+    torch = import_optional_module("torch")
+    if torch is None:
         return False
 
     match = UNSUPPORTED_GLOBAL_RE.search(str(exc))
@@ -2268,11 +2300,7 @@ def run_whisperx_direct(
 ) -> str | None:
     import whisperx
 
-    torch_module: Any | None
-    try:
-        import torch as torch_module
-    except Exception:
-        torch_module = None
+    torch_module = import_optional_module("torch")
 
     whisper_language = None if cfg.language == "auto" else cfg.language
     whisper_task = "translate" if cfg.translate_to_english else "transcribe"
@@ -2403,6 +2431,7 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
     report(f'LLM:       "{outputs.llm_path}"' if cfg.write_llm_txt else "LLM:       disabled")
     report(f'Log:       "{outputs.log_path}"')
     report(f'Lock:      "{outputs.lock_path}"')
+    report(f'Status:    "{outputs.status_path}"')
     report(f'OutDir:    "{outputs.output_dir}"')
     report(f"Lang:      {cfg.language}")
     if cfg.language == "auto":
@@ -2449,6 +2478,7 @@ def describe_dry_run_plan(cfg: RunConfig, input_path: Path, outputs: OutputPaths
     else:
         report("Would skip the LLM prompt file for this run.")
     report(f'Would write log: "{outputs.log_path}"')
+    report(f'Would write status: "{outputs.status_path}"')
     report(f'Would leave the source file in place: "{input_path}"')
 
 
@@ -2458,6 +2488,7 @@ def transcribe_file(
     report: Reporter = print,
     stale_lock_seconds: float = DEFAULT_STALE_LOCK_SECONDS,
 ) -> int:
+    started_at = utc_now_iso()
     if not input_path.exists():
         report("")
         report(f'File not found: "{input_path}"')
@@ -2467,61 +2498,124 @@ def transcribe_file(
     outputs = output_paths_for_input(input_path, cfg, create_dirs=not cfg.dry_run)
     print_summary(cfg, input_path, outputs, report=report)
 
+    fallback_no_diarize = False
+    current_diarize = cfg.diarize
+    detected_language: str | None = None
+    working_srt_path = temporary_sibling_path(outputs.srt_path, suffix=".srt.tmp")
+
+    def write_status(status: str, error: str | None = None) -> None:
+        try:
+            record = status_utils.build_status_record(
+                status=status,
+                source_path=input_path,
+                config=cfg,
+                srt_path=outputs.srt_path,
+                started_at=started_at,
+                finished_at=utc_now_iso(),
+                error=error,
+                fallback_no_diarize=fallback_no_diarize,
+                detected_language=detected_language,
+            )
+            status_utils.write_status_file(outputs.status_path, record)
+        except Exception as exc:
+            append_log_message(outputs.log_path, f"[transcriber] Could not write status file: {exc}")
+
+    try:
+        validate_run_config(cfg)
+    except ValueError as exc:
+        report("Configuration failed validation:")
+        for message in str(exc).splitlines():
+            report(f"  - {message}")
+        if not cfg.dry_run:
+            write_status("failed", str(exc))
+        return 2
+
     if cfg.dry_run:
         describe_dry_run_plan(cfg, input_path, outputs, report)
         return 0
 
-    if not acquire_lock(input_path, outputs.lock_path, stale_lock_seconds, report):
+    hf_token: str | None = load_hf_token(project_dir()) if cfg.diarize else None
+    preflight = check_transcription_preflight(cfg=cfg, hf_token_present=bool(hf_token))
+    for line in preflight.format():
+        report(line)
+    if not preflight.ok:
+        write_status("failed", "; ".join(preflight.errors))
+        return 1
+
+    if not lock_utils.acquire_lock(input_path, outputs.lock_path, stale_lock_seconds, report):
         return 0
 
-    hf_token: str | None = None
-    fallback_no_diarize = False
-    current_diarize = cfg.diarize
-    detected_language: str | None = None
     rc = 1
-
     try:
-        if cfg.diarize:
-            hf_token = load_hf_token(project_dir())
-            if not hf_token:
-                report("")
-                report("Missing Hugging Face token.")
-                report(f'Create "{project_dir() / "hf_token.txt"}" (or "HF_TOKEN.txt") or set HF_TOKEN.')
-                report("")
-                return 1
+        try:
+            with lock_utils.heartbeat_thread(outputs.lock_path, stale_lock_seconds):
+                with tempfile.TemporaryDirectory(prefix="transcriber-audio-") as temp_audio_dir:
+                    lock_utils.touch_lock(outputs.lock_path)
+                    prepared_input = preprocess_audio_for_whisperx(input_path, Path(temp_audio_dir), report=report)
+                    if prepared_input != input_path:
+                        report(f'Audio preprocessing: "{prepared_input}"')
 
-        with tempfile.TemporaryDirectory(prefix="transcriber-audio-") as temp_audio_dir:
-            prepared_input = preprocess_audio_for_whisperx(input_path, Path(temp_audio_dir), report=report)
-            if prepared_input != input_path:
-                report(f'Audio preprocessing: "{prepared_input}"')
+                    attempt = 0
+                    while True:
+                        lock_utils.touch_lock(outputs.lock_path)
+                        rc, detected_language = run_whisperx_direct_logged(
+                            cfg,
+                            prepared_input,
+                            working_srt_path,
+                            hf_token,
+                            diarize=current_diarize,
+                            log_path=outputs.log_path,
+                            append=attempt > 0,
+                        )
+                        lock_utils.touch_lock(outputs.lock_path)
+                        if rc == 0:
+                            break
 
-            attempt = 0
-            while True:
-                rc, detected_language = run_whisperx_direct_logged(
-                    cfg,
-                    prepared_input,
-                    outputs.srt_path,
-                    hf_token,
-                    diarize=current_diarize,
-                    log_path=outputs.log_path,
-                    append=attempt > 0,
-                )
-                if rc == 0:
-                    break
+                        if current_diarize and should_fallback_without_diarization(outputs.log_path):
+                            fallback_no_diarize = True
+                            current_diarize = False
+                            report("")
+                            report("Diarization unavailable or blocked. Retrying without diarization...")
+                            append_log_message(
+                                outputs.log_path,
+                                "\n[transcriber] Diarization unavailable or blocked; retrying without --diarize.",
+                            )
+                            attempt += 1
+                            continue
 
-                if current_diarize and should_fallback_without_diarization(outputs.log_path):
-                    fallback_no_diarize = True
-                    current_diarize = False
-                    report("")
-                    report("Diarization unavailable or blocked. Retrying without diarization...")
-                    with outputs.log_path.open("a", encoding="utf-8", errors="ignore") as log:
-                        log.write("\n[transcriber] Diarization unavailable or blocked; retrying without --diarize.\n")
-                    attempt += 1
-                    continue
+                        break
+        except Exception as exc:
+            import traceback
 
-                break
+            append_log_message(outputs.log_path, "[transcriber] Transcription raised an exception:")
+            append_log_message(outputs.log_path, "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            write_status("failed", str(exc))
+            report("")
+            report(f"Transcription failed: {exc}")
+            report(f'See the log: "{outputs.log_path}"')
+            report("")
+            return 1
 
-        if outputs.srt_path.exists():
+        if rc != 0:
+            write_status("failed", f"WhisperX failed with exit code {rc}")
+            report("")
+            report(f"WhisperX failed (exit code {rc}).")
+            report(f'See the log: "{outputs.log_path}"')
+            report("")
+            return rc
+
+        if not working_srt_path.exists():
+            write_status("failed", "WhisperX completed without writing an SRT file")
+            report("")
+            report("Done, but SRT not found where expected:")
+            report(f'  "{working_srt_path}"')
+            report("Check the log:")
+            report(f'  "{outputs.log_path}"')
+            report("")
+            return 1
+
+        try:
+            require_valid_srt_file(working_srt_path)
             should_translate = (not cfg.translate_to_english) and cfg.language == "auto" and detected_language == "es"
             if cfg.language == "auto":
                 report(f"Detected language: {detected_language or 'unknown'}.")
@@ -2531,7 +2625,7 @@ def transcribe_file(
                 report("Translating Spanish transcript to English text...")
                 try:
                     translate_srt_to_english(
-                        outputs.srt_path,
+                        working_srt_path,
                         cfg.device,
                         glossary=cfg.glossary,
                         glossary_spec=cfg.glossary_path,
@@ -2543,49 +2637,45 @@ def transcribe_file(
                         log_path=outputs.log_path,
                     )
                 except Exception as exc:
+                    append_log_message(outputs.log_path, f"[transcriber] Translation failed: {exc}")
                     report("")
                     report(f"Translation failed: {exc}")
                     report("Keeping the original transcript text.")
                     report("")
-            try:
-                if cfg.write_llm_txt:
-                    build_llm_file(outputs.srt_path, outputs.llm_path)
-                finalize_srt_file(outputs.srt_path)
-            except Exception:
-                pass
-
-        if rc != 0:
+            if cfg.write_llm_txt:
+                build_llm_file(working_srt_path, outputs.llm_path)
+            finalize_srt_file(working_srt_path)
+            require_valid_srt_file(working_srt_path)
+            atomic_replace_path(working_srt_path, outputs.srt_path)
+            write_status("succeeded")
+        except Exception as exc:
+            append_log_message(outputs.log_path, f"[transcriber] Output finalization failed: {exc}")
+            write_status("failed", str(exc))
             report("")
-            report(f"WhisperX failed (exit code {rc}).")
+            report(f"Output finalization failed: {exc}")
             report(f'See the log: "{outputs.log_path}"')
             report("")
-            return rc
-
-        if outputs.srt_path.exists():
-            report("")
-            report("Done.")
-            report(f'SRT: "{outputs.srt_path}"')
-            if cfg.write_llm_txt:
-                report(f'LLM: "{outputs.llm_path}"')
-            if cfg.mode == "fast" and not cfg.diarize:
-                report("Note: fast mode used (speaker diarization disabled).")
-            if fallback_no_diarize:
-                report("Note: completed without speaker diarization.")
-                report("To enable diarization, accept terms with the SAME HF account at:")
-                report("  https://hf.co/pyannote/speaker-diarization-3.1")
-                report("  https://hf.co/pyannote/segmentation-3.0")
-            report("")
-            return 0
+            return 1
 
         report("")
-        report("Done, but SRT not found where expected:")
-        report(f'  "{outputs.srt_path}"')
-        report("Check the log:")
-        report(f'  "{outputs.log_path}"')
+        report("Done.")
+        report(f'SRT: "{outputs.srt_path}"')
+        if cfg.write_llm_txt:
+            report(f'LLM: "{outputs.llm_path}"')
+        if cfg.mode == "fast" and not cfg.diarize:
+            report("Note: fast mode used (speaker diarization disabled).")
+        if fallback_no_diarize:
+            report("Note: completed without speaker diarization.")
+            report("To enable diarization, accept terms with the SAME HF account at:")
+            report("  https://hf.co/pyannote/speaker-diarization-3.1")
+            report("  https://hf.co/pyannote/segmentation-3.0")
         report("")
         return 0
     finally:
-        release_lock(outputs.lock_path, report=report)
+        lock_utils.release_lock(outputs.lock_path, report=report)
+        with contextlib.suppress(OSError):
+            if working_srt_path.exists():
+                working_srt_path.unlink()
 
 
 def watcher_log(log_path: Path, message: str) -> None:
@@ -2637,6 +2727,13 @@ def needs_transcription(input_path: Path, cfg: RunConfig) -> bool:
     outputs = output_paths_for_input(input_path, cfg)
     if not outputs.srt_path.exists():
         return True
+    if not srt_file_has_valid_cues(outputs.srt_path):
+        return True
+
+    status_record = status_utils.read_status_file(outputs.status_path)
+    if status_record is not None:
+        return not status_utils.status_matches_source_and_config(status_record, input_path, cfg)
+
     try:
         input_mtime_ns = input_path.stat().st_mtime_ns
         output_mtime_ns = outputs.srt_path.stat().st_mtime_ns
@@ -2838,6 +2935,7 @@ def run_watch_loop(
     watch_targets: Sequence[WatchTarget],
     poll_interval: float,
     settle_seconds: float,
+    stale_lock_seconds: float = DEFAULT_STALE_LOCK_SECONDS,
 ) -> int:
     prepared_targets: list[WatchTarget] = []
     for target in watch_targets:
@@ -2935,7 +3033,7 @@ def run_watch_loop(
                     pending_file.last_attempt_at = now
                     if should_transcribe:
                         report(f'Starting transcription for "{path.name}".')
-                        rc = transcribe_file(target.cfg, path, report=report)
+                        rc = transcribe_file(target.cfg, path, report=report, stale_lock_seconds=stale_lock_seconds)
                         outputs = output_paths_for_input(path, target.cfg)
                         if rc == 0 and outputs.srt_path.exists():
                             if target.move_completed_files_to is not None:
@@ -3001,6 +3099,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.settle_seconds < 0:
         print("\n--settle-seconds must be 0 or greater.\n")
         return 2
+    if args.stale_lock_seconds <= 0:
+        print("\n--stale-lock-seconds must be greater than 0.\n")
+        return 2
 
     try:
         configure_temp_dir(project_dir())
@@ -3013,13 +3114,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return run_live_mode(args)
 
-    cfg = build_config(args, interactive=not args.watch)
+    try:
+        cfg = build_config(args, interactive=not args.watch)
+    except ValueError as exc:
+        print("\nConfiguration failed validation:")
+        for message in str(exc).splitlines():
+            print(f"  - {message}")
+        print("")
+        return 2
 
     if args.watch:
         return run_watch_loop(
             watch_targets=build_watch_targets(cfg, Path(args.watch_dir)),
             poll_interval=args.poll_interval,
             settle_seconds=args.settle_seconds,
+            stale_lock_seconds=args.stale_lock_seconds,
         )
 
     input_path = resolve_input_path(args.input)
@@ -3027,7 +3136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\nNo file selected.\n")
         return 0
 
-    return transcribe_file(cfg, input_path)
+    return transcribe_file(cfg, input_path, stale_lock_seconds=args.stale_lock_seconds)
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ branch = true
 source = ["transcriber", "merge_transcripts"]
 
 [tool.coverage.report]
-fail_under = 34
+fail_under = 50
 show_missing = true
 skip_covered = true
 
@@ -60,8 +60,10 @@ check_untyped_defs = true
 warn_unused_configs = true
 
 [tool.setuptools]
-packages = ["transcriber"]
 py-modules = ["merge_transcripts"]
+
+[tool.setuptools.packages.find]
+include = ["transcriber*"]
 
 [build-system]
 requires = ["setuptools>=68"]
