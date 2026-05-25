@@ -3112,13 +3112,14 @@ wheels = [
 
 [[package]]
 name = "whisperlivekit"
-version = "0.2.20.post1"
+version = "0.2.21"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi", marker = "python_full_version >= '3.11'" },
     { name = "faster-whisper", marker = "python_full_version >= '3.11'" },
     { name = "huggingface-hub", marker = "python_full_version >= '3.11'" },
     { name = "librosa", marker = "python_full_version >= '3.11'" },
+    { name = "python-multipart", marker = "python_full_version >= '3.11'" },
     { name = "soundfile", marker = "python_full_version >= '3.11'" },
     { name = "tiktoken", marker = "python_full_version >= '3.11'" },
     { name = "torch", marker = "python_full_version >= '3.11'" },
@@ -3127,9 +3128,9 @@ dependencies = [
     { name = "uvicorn", marker = "python_full_version >= '3.11'" },
     { name = "websockets", marker = "python_full_version >= '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4b/c6/082707567d2c45fc86057d763d181a339cc140397a1a9bfcdc6fdd6a882d/whisperlivekit-0.2.20.post1.tar.gz", hash = "sha256:f383b82519479aa0774f9b09080f686c86430d941c21ead6197e4f42daaa5c89", size = 7092743, upload-time = "2026-03-13T23:15:27.983Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ae/f7/5b299df4ecc9012ffc473079544c460d274e8dc995397e781c236c867d5d/whisperlivekit-0.2.21.tar.gz", hash = "sha256:a3d8e64568b2a864189c66b2875b8b39519976cacb2eed5612b5fdda50dd2d9c", size = 7109628, upload-time = "2026-05-22T13:55:56.284Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/28/7a/ca036c7e9d79add9b6f2a0979c181309dc4eb125a5ab44c24fec47a242f0/whisperlivekit-0.2.20.post1-py3-none-any.whl", hash = "sha256:f7058bfb1e34ffdcf4731601782f30269ad8a31b4853a71d614bb865735d54aa", size = 7113226, upload-time = "2026-03-13T23:15:26.194Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/e5/b7bff9f79074fe6ad5877820e97ffc3175ece1348331b586c4e387dfd8a7/whisperlivekit-0.2.21-py3-none-any.whl", hash = "sha256:82ae34f913ebc80116e96660097cda9ffa883f97a5b3916a72d72fd486cc4166", size = 7124218, upload-time = "2026-05-22T13:55:53.677Z" },
 ]
 
 [package.optional-dependencies]

@@ -139,14 +139,27 @@ class LiveCliTests(unittest.TestCase):
         self.assertEqual(cfg.nllb_size, "1.3B")
         self.assertTrue(cfg.audio_diagnostics)
 
-    def test_live_quality_spanish_uses_default_static_translation_prompt(self) -> None:
+    def test_live_quality_spanish_cascade_uses_asr_static_prompt(self) -> None:
         cfg = build_live_config(parse_args(["--live", "--live-preset", "quality", "--lang", "es"]))
 
+        self.assertEqual(cfg.translation_mode, LiveTranslationMode.CASCADE)
         self.assertIsNotNone(cfg.static_prompt)
-        self.assertIn("casarse", cfg.static_prompt or "")
+        self.assertIn("Transcribe", cfg.static_prompt or "")
         self.assertIn("Do not translate", cfg.static_prompt or "")
+        self.assertIn("casarse", cfg.static_prompt or "")
+        self.assertNotIn("Translate into natural English", cfg.static_prompt or "")
 
-    def test_live_static_prompt_overrides_default_translation_prompt(self) -> None:
+    def test_live_quality_spanish_direct_uses_translation_static_prompt(self) -> None:
+        cfg = build_live_config(
+            parse_args(["--live", "--live-preset", "quality", "--live-translation-mode", "direct", "--lang", "es"])
+        )
+
+        self.assertEqual(cfg.translation_mode, LiveTranslationMode.DIRECT)
+        self.assertIsNotNone(cfg.static_prompt)
+        self.assertIn("Translate into natural English", cfg.static_prompt or "")
+        self.assertIn("casarse", cfg.static_prompt or "")
+
+    def test_live_static_prompt_overrides_default_prompt(self) -> None:
         cfg = build_live_config(
             parse_args(["--live", "--live-preset", "quality", "--lang", "es", "--live-static-prompt", "Custom"])
         )
@@ -212,6 +225,29 @@ class LiveCliTests(unittest.TestCase):
         self.assertIn("--live-save-transcript", text)
         self.assertIn("logs\\live_english_transcript.txt", text)
         self.assertNotIn("--live-save-bilingual-transcript", text)
+
+    def test_live_translate_quality_launcher_uses_cascade_quality_profile(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "live_translate_quality.bat"
+        text = launcher.read_text(encoding="utf-8")
+
+        self.assertIn("--live-preset quality", text)
+        self.assertIn("--live-translation-mode cascade", text)
+        self.assertIn("--live-save-bilingual-transcript", text)
+        self.assertIn("logs\\live_bilingual_transcript.txt", text)
+        self.assertIn("--live-beams", text)
+        self.assertIn("--live-frame-threshold", text)
+        self.assertIn("--live-audio-diagnostics", text)
+        self.assertIn("LIVE_MODEL", text)
+        self.assertIn("LIVE_NLLB_SIZE", text)
+        self.assertIn("LIVE_MODEL=medium", text)
+        self.assertIn("LIVE_NLLB_SIZE=600M", text)
+        self.assertIn("LIVE_CHUNK_MS=750", text)
+        self.assertIn("LIVE_FRAME_THRESHOLD=45", text)
+        self.assertIn("LIVE_BEAMS=5", text)
+        self.assertIn("LIVE_AUDIO_MIN_LEN=1.0", text)
+        self.assertIn("LIVE_AUDIO_MAX_LEN=45", text)
+        self.assertIn('if exist "transcriber_glossary.txt"', text)
+        self.assertIn("--glossary-file", text)
 
     def test_write_bilingual_transcript_formats_spanish_and_english_pairs(self) -> None:
         with TemporaryDirectory() as tmpdir:

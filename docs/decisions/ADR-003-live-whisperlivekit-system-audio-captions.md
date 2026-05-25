@@ -32,6 +32,10 @@ Make live translation mode explicit. Direct mode starts WhisperLiveKit with `--d
 
 Expose WhisperLiveKit's documented live quality controls through additive CLI flags and `LiveConfig`: backend, backend policy, frame threshold, beams, decoder, audio min/max length, NLLB backend/size, and static prompt. Keep direct/latency mode as the default, but make `--live-preset quality` choose cascade mode, model `medium`, Faster-Whisper backend, beam decoding, and CTranslate2-backed NLLB translation unless explicitly overridden.
 
+Provide two Windows live launchers instead of forcing one compromise profile. `live_translate.bat` remains the latency launcher: direct English translation, faster defaults, and an English-only committed transcript log. `live_translate_quality.bat` is the accuracy launcher: cascade Spanish source plus English translation, slower quality defaults, diagnostics, and both English-only and bilingual committed transcript logs.
+
+Make the automatic Spanish static prompt mode-aware. Direct mode receives translation guidance that asks for natural English. Cascade mode receives Spanish ASR guidance that explicitly says not to translate, because WhisperLiveKit performs the English translation through `--target-language en` after source transcription.
+
 Keep the quality preset slower rather than lossy. Latency mode may drop the oldest queued audio chunk when the stream falls behind; quality mode uses an unbounded audio queue and reports lag instead of intentionally deleting queued audio. Reject invalid audio buffer lengths before starting WhisperLiveKit. Live audio diagnostics are observational and do not change transcript output.
 
 The live runtime path is:

@@ -14,6 +14,9 @@
 - Added `merge_transcripts.py` for recursive transcript text merging.
 - Added `--speaker-labels` and `--no-speaker-labels` to control whether generated SRT files include diarization speaker labels.
 - Added an interactive speaker-label prompt after the language and quality/fast prompts for one-off CLI runs.
+- Added `live_translate_quality.bat` as an accuracy-first live Spanish-to-English launcher that uses cascade mode, writes English and bilingual logs, and prints live audio diagnostics.
+- Added live troubleshooting docs for loopback diagnostics and 16 kHz signed 16-bit mono PCM chunk-size sanity checks.
+- Added `tools/evaluate_live_transcript.py` for pure-Python CER/WER checks against live bilingual transcript files, covered by unit tests and mypy validation.
 
 ### Fixed
 - Fixed watcher completed-file movement so missing `.srt` files leave media in place for retry.
@@ -26,6 +29,8 @@
 - Simplified the speaker-label prompt/config control flow without changing interactive prompts, CLI flags, or diarization behavior.
 - Changed the user-facing speaker label path so `--no-speaker-labels` skips diarization and Hugging Face token loading.
 - Kept `--diarize` and `--no-diarize` as backward-compatible aliases; no deprecation or migration is required.
+- Changed automatic Spanish live static prompts to match translation mode: direct mode asks for English translation, while cascade mode asks for Spanish ASR and explicitly avoids translation.
+- Updated the locked WhisperLiveKit package from `0.2.20.post1` to `0.2.21`.
 
 ### Removed
 - Removed tracked generated artifacts: bytecode caches, sample media output, and sample WhisperX log output.

@@ -1,0 +1,7 @@
+Escuela de Nada => Escuela de Nada
+casarse => get married
+casarnos => get married
+casarme => get married
+boda => wedding
+matrimonio => marriage
+playa => beach

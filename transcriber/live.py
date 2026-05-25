@@ -15,13 +15,24 @@ from typing import Any
 from transcriber.io import atomic_write_text
 from transcriber.live_wlk import CaptionPair, CaptionState, LiveTranslationMode
 
-DEFAULT_SPANISH_TO_ENGLISH_STATIC_PROMPT = "\n".join(
+DIRECT_SPANISH_TO_ENGLISH_STATIC_PROMPT = "\n".join(
     (
         "This is casual Spanish conversation.",
         "Translate into natural English.",
-        "Spanish words casarse, casarnos, casarme, casar, boda, playa, and matrimonio refer to marriage or weddings when context fits.",
-        "Do not translate casarse/casarnos as hunting.",
-        "Preserve pronouns carefully.",
+        "Preserve names and pronouns carefully.",
+        "Spanish words casarse, casarnos, casarme, casar, boda, playa, and matrimonio usually refer to marriage or weddings when context fits.",
+        "Do not render casarse/casarnos/casar as hunting unless the actual word is cazar.",
+    )
+)
+
+CASCADE_SPANISH_ASR_STATIC_PROMPT = "\n".join(
+    (
+        "This is casual Spanish conversation.",
+        "Transcribe Spanish speech accurately.",
+        "Do not translate.",
+        "Preserve names, slang, repeated words, and Spanish wording.",
+        "Do not confuse casar/casarse/casarnos/casarme with cazar.",
+        "Boda and matrimonio are wedding and marriage terms.",
     )
 )
 
@@ -116,12 +127,16 @@ def _quality_default(args: argparse.Namespace, attribute: str, quality_value: An
     return quality_value if args.live_preset == "quality" else fallback_value
 
 
-def _effective_live_static_prompt(args: argparse.Namespace, language: str) -> str | None:
+def _effective_live_static_prompt(
+    args: argparse.Namespace, language: str, translation_mode: LiveTranslationMode
+) -> str | None:
     if args.live_static_prompt:
         return str(args.live_static_prompt)
-    if args.live_preset == "quality" and language == "es":
-        return DEFAULT_SPANISH_TO_ENGLISH_STATIC_PROMPT
-    return None
+    if args.live_preset != "quality" or language != "es":
+        return None
+    if translation_mode == LiveTranslationMode.DIRECT:
+        return DIRECT_SPANISH_TO_ENGLISH_STATIC_PROMPT
+    return CASCADE_SPANISH_ASR_STATIC_PROMPT
 
 
 def _effective_live_audio_lengths(args: argparse.Namespace) -> tuple[float, float]:
@@ -162,7 +177,7 @@ def build_live_config(args: argparse.Namespace) -> LiveConfig:
         diarize=False,
         translate_to_english=True,
         asr_prompt=build_live_asr_prompt(args),
-        static_prompt=_effective_live_static_prompt(args, language),
+        static_prompt=_effective_live_static_prompt(args, language, translation_mode),
         backend=str(_quality_default(args, "live_backend", "faster-whisper", "auto")),
         backend_policy=str(_quality_default(args, "live_backend_policy", "localagreement", "localagreement")),
         frame_threshold=max(1, int(_quality_default(args, "live_frame_threshold", 35, 25))),

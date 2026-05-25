@@ -29,7 +29,7 @@ build_watch_targets
 Live mode is a separate runtime path:
 
 ```text
-CLI live args
+CLI live args / live_translate*.bat
   -> transcriber.live.build_live_config
   -> transcriber.live_audio WASAPI loopback capture
   -> downmixed/resampled 16 kHz mono signed 16-bit PCM chunks
@@ -37,6 +37,14 @@ CLI live args
   -> ws://127.0.0.1:<port>/asr?language=es&mode=full
   -> transcriber.live_wlk.CaptionState
   -> transcriber.live_window caption popup and optional text transcripts
+```
+
+Live transcript evaluation is a source-repo developer tool:
+
+```text
+reference Spanish text + committed bilingual transcript
+  -> tools/evaluate_live_transcript.py
+  -> local Levenshtein CER/WER metrics
 ```
 
 ## Module Map
@@ -47,8 +55,9 @@ CLI live args
 - `transcriber/live_wlk.py`: WhisperLiveKit subprocess command construction, readiness polling, WebSocket protocol handling, and caption-state extraction.
 - `transcriber/live_window.py`: Tkinter always-on-top caption window fed through a thread-safe queue.
 - `merge_transcripts.py`: standalone text utility for recursively merging transcript `.txt` files while skipping token files and generated/cache directories.
+- `tools/evaluate_live_transcript.py`: source-repo developer tool for deterministic CER/WER checks against committed live bilingual transcript text. It is not a packaged console script.
 - `tests/test_helpers.py`: unit tests for config, prompts, watcher policy, file movement failure handling, translation helpers, confidence cleanup, and transcript merging.
-- `*.bat`: Windows launchers. They should stay thin wrappers around `python -m transcriber`.
+- `*.bat`: Windows launchers. They should stay thin wrappers around `python -m transcriber`; `live_translate.bat` is the latency/direct launcher and `live_translate_quality.bat` is the accuracy/cascade launcher.
 - `.github/workflows/ci.yml`: CI contract for tests with coverage, lint, format, type checking, CLI startup, package build, dependency audit, pre-commit hooks, and secret scanning.
 - `docs/decisions/`: ADRs for decisions that future agents should not re-decide from scratch.
 
@@ -61,6 +70,7 @@ CLI live args
 - Live mode is only entered through `--live`, `--live-list-devices`, or `--live-loopback-test`. It does not call `transcribe_file`, WhisperX alignment, PyAnnote diarization, SRT cue generation, or Helsinki-NLP post-translation.
 - `LiveConfig` is the live-mode boundary between CLI parsing and runtime orchestration. New live quality controls should be added there first, then passed through to `live_wlk.build_wlk_command` without changing file/watch `RunConfig`.
 - `CaptionState` is the live UI and live transcript contract. Full-mode WhisperLiveKit updates replace the partial caption line instead of appending it. In direct mode, committed pairs intentionally have empty Spanish source text because WLK committed `text` is already English; in cascade mode, committed pairs preserve each line's Spanish source text with its English translation.
+- `tools/evaluate_live_transcript.py` parses the committed bilingual transcript text format written by cascade mode: numbered entries with `ES:` and `EN:` lines. Keep it dependency-free and deterministic so it remains usable without WhisperLiveKit, audio hardware, network, GPU, or model downloads.
 - The CI workflow is a repository contract. Update `README.md`, `AGENTS.md`, and `CONTRIBUTING.md` when changing validation commands.
 
 ## Release Notes
@@ -70,17 +80,19 @@ CLI live args
 - The speaker-label prompt/config simplification is an internal refactor only. It does not change CLI options, prompt wording, defaults, watcher behavior, CI gates, or migration posture.
 - Live mode is an optional Windows-only feature path with Python 3.11+ runtime guard and optional `live` dependencies. Base package compatibility remains Python 3.10+. The mode is unit-tested without Windows audio hardware or model downloads; manual ship validation still requires `uv sync --extra live` and a WASAPI loopback device. The launcher resolves WhisperLiveKit's `wlk` or `whisperlivekit-server` executable from the active Python environment's Scripts directory before falling back to `PATH`, starts it with the configured live backend policy, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default.
 - Live translation mode is explicit. `direct` uses WhisperLiveKit `--direct-english-translation` and rejects `--live-save-bilingual-transcript`; `cascade` uses `--target-language en` and allows real Spanish/English transcript pairs.
-- Live quality controls are additive. The latency preset keeps direct mode, model `small`, 250 ms chunks, greedy decoding, and a drop-oldest bounded queue policy. The quality preset uses cascade mode, model `medium` unless overridden, 500 ms chunks, Faster-Whisper backend, beam decoding, CTranslate2 NLLB translation, static Spanish-to-English prompt guidance, validated audio buffer lengths, and an unbounded no-intentional-drop queue policy.
+- Live quality controls are additive. The latency preset keeps direct mode, model `small`, 250 ms chunks, greedy decoding, and a drop-oldest bounded queue policy. The quality preset uses cascade mode, model `medium` unless overridden, 500 ms chunks, Faster-Whisper backend, beam decoding, CTranslate2 NLLB translation, validated audio buffer lengths, and an unbounded no-intentional-drop queue policy. The quality launcher chooses a slower accuracy profile on top of that preset: 750 ms chunks, frame threshold 45, 5 beams, 1.0-45 second audio buffer bounds, diagnostics, and optional local glossary injection.
+- Live static prompts are mode-aware for Spanish quality mode. Direct mode prompts for natural English translation; cascade mode prompts for Spanish ASR and explicitly says not to translate because WLK handles English output through `--target-language en`.
 - Live audio diagnostics are observational only. They report sample rate, channels, output chunk bytes, RMS, peak, queue depth, dropped chunks, estimated queue delay, and WhisperLiveKit lag without changing transcript semantics.
 - The live translation-mode helper/parser cleanup is an internal refactor only. It does not change CLI options, defaults, direct/cascade transcript semantics, WLK command flags, CI gates, or migration posture.
 - Live-mode error status: missing optional live dependencies now report a clear install message instead of a traceback, and WLK subprocess startup failures terminate the child process before returning an error.
-- Live-mode rollout status: additive local beta. Startup smoke has passed with the `live` extra installed, but full Windows loopback audio validation is still pending. No existing file transcription/watch behavior is migrated or deprecated.
+- Live-mode rollout status: additive local beta. Startup smoke has passed with the `live` extra installed, but full Windows loopback audio validation is still pending. No existing file transcription/watch behavior is migrated or deprecated, and `live_translate.bat` remains the fast path.
 - Rollback is git-based: revert the release commit and rerun the full validation gate.
 
 ## Change Guide
 
 - CLI argument or config behavior: update `parse_args`, `build_config`, README CLI options, and tests.
 - Live-mode behavior: update `transcriber/live.py`, `transcriber/live_audio.py`, `transcriber/live_wlk.py`, `transcriber/live_window.py`, README live commands, and live tests.
+- Live transcript evaluation: update `tools/evaluate_live_transcript.py` and `tests/test_live_eval.py`.
 - Transcription execution: update `transcribe_file`, WhisperX helpers, and tests that mock execution.
 - Translation behavior: update translation helpers and tests around prompts/context/beam settings.
 - Watch folder policy: update `build_watch_targets`, `run_watch_loop`, watcher docs, and tests.

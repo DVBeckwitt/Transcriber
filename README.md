@@ -85,7 +85,7 @@ Project workflow and governance:
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
-- Live caption mode: startup smoke passed with the `live` extra installed. The launcher now resolves the active Python environment's WhisperLiveKit executable before PATH, starts WLK with the LocalAgreement backend policy, avoids the observed SimulStreaming `StorageView` encoder crash, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default. The previous direct-mode bilingual log bug is fixed by rejecting bilingual transcript output unless cascade mode is selected. Full live audio validation with Windows loopback input is still pending.
+- Live caption mode: startup smoke passed with the `live` extra installed. The latency launcher remains direct English and writes `logs\live_english_transcript.txt` by default. The quality launcher uses cascade mode, writes English and bilingual logs, applies mode-aware Spanish prompts, and prints audio diagnostics. The previous direct-mode bilingual log bug is fixed by rejecting bilingual transcript output unless cascade mode is selected. Full live audio validation with Windows loopback input is still pending.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, transcript merge collection, speaker-label prompt/config control flow, and live translation-mode helper/parser cleanup were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
 - Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. No migration or deprecation is required. Rollback is `git revert` of the release commit.
@@ -142,13 +142,41 @@ The live launcher changes to the repository root before starting, uses `VIRTUAL_
 python -m transcriber --live --lang es --model small --live-source system --no-speaker-labels --live-preset latency --live-translation-mode direct --live-save-transcript logs\live_english_transcript.txt
 ```
 
-Slower live mode with real Spanish/English transcript pairs:
+Accuracy-first live Spanish-to-English system-audio captions:
 
 ```powershell
-python -m transcriber --live --lang es --model medium --live-source system --no-speaker-labels --live-preset quality --live-translation-mode cascade --live-save-bilingual-transcript logs\live_bilingual_transcript.txt --live-audio-diagnostics
+.\live_translate_quality.bat
 ```
 
-Live mode status: implemented and covered by unit tests for CLI dispatch, PCM conversion, WhisperLiveKit message parsing, direct/cascade transcript semantics, bilingual transcript formatting, quality preset flags, window text formatting, dependency diagnostics, executable resolution, and WLK startup cleanup. Startup smoke has passed with the `live` extra installed; full live audio validation still requires Windows audio hardware.
+The quality launcher uses cascade mode so WhisperLiveKit keeps Spanish source text and English translation separately. It writes `logs\live_english_transcript.txt`, writes bilingual Spanish/English pairs to `logs\live_bilingual_transcript.txt`, and prints live audio diagnostics.
+
+Quality launcher overrides:
+
+```powershell
+set LIVE_MODEL=large-v3
+set LIVE_NLLB_SIZE=1.3B
+set LIVE_BEAMS=3
+```
+
+Use `LIVE_BEAMS=3` first if lag grows during quality mode. If lag still grows, keep `LIVE_NLLB_SIZE=600M` and try `LIVE_MODEL=small`.
+
+Live audio sanity check:
+
+```powershell
+python -m transcriber --live-loopback-test --seconds 20 --output loopback_test.wav --live-audio-diagnostics
+```
+
+The live stream sent to WhisperLiveKit is 16 kHz signed 16-bit mono PCM, which is 32,000 bytes per second. A 500 ms chunk is about 16,000 bytes, a 750 ms chunk is about 24,000 bytes, and a 1,000 ms chunk is about 32,000 bytes.
+
+Evaluate a committed bilingual live transcript against reference text from the source checkout:
+
+```powershell
+python tools/evaluate_live_transcript.py --reference-es reference_es.txt --candidate-bilingual logs\live_bilingual_transcript.txt --reference-en reference_en.txt
+```
+
+The evaluator is a dependency-free developer tool that prints Spanish CER/WER and, when `--reference-en` is provided, English CER/WER. It does not require WhisperLiveKit, network, GPU, model downloads, audio hardware, or a Hugging Face token.
+
+Live mode status: implemented and covered by unit tests for CLI dispatch, launcher contracts, PCM conversion, WhisperLiveKit message parsing, direct/cascade transcript semantics, bilingual transcript formatting, quality preset flags, mode-aware prompts, evaluator metrics, window text formatting, dependency diagnostics, executable resolution, and WLK startup cleanup. Startup smoke has passed with the `live` extra installed; full live audio validation still requires Windows audio hardware.
 
 ### Watch `C:\Users\Kenpo\OneDrive\recordings`
 

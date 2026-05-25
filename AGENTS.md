@@ -12,13 +12,15 @@ This repository is a local WhisperX launcher for audio/video transcription, subt
 - `transcriber/live_wlk.py`: WhisperLiveKit subprocess/WebSocket integration and caption message parsing.
 - `transcriber/live_window.py`: Tkinter always-on-top caption popup.
 - `merge_transcripts.py`: Utility for recursively merging transcript text files.
+- `tools/evaluate_live_transcript.py`: Pure-Python CER/WER evaluator for committed live bilingual transcript files.
 - `tests/test_helpers.py`: Unit tests for CLI config, watcher policy, translation helpers, confidence cleanup, and transcript merging.
+- `tests/test_live_cli.py`, `tests/test_live_audio.py`, `tests/test_live_wlk_messages.py`, `tests/test_live_eval.py`: Live-mode unit coverage for CLI config, launchers, PCM/audio helpers, WLK protocol parsing, transcript semantics, and evaluator metrics.
 - `README.md`: User setup, runtime behavior, CLI examples, and troubleshooting.
 - `CONTRIBUTING.md`: Branch, review, validation, and rollback workflow.
 - `SECURITY.md`: Vulnerability reporting, secret handling, and dependency audit policy.
 - `docs/architecture.md`: Runtime flow, module boundaries, stable interfaces, and change guide.
 - `docs/decisions/`: Accepted architecture and process decisions.
-- `*.bat`: Windows launchers for one-off transcription and watcher processes.
+- `*.bat`: Windows launchers for one-off transcription, watcher processes, and live low-latency or quality caption modes.
 - `logs/`, `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`, `.uv-venv/`: Generated local artifacts; do not edit or commit them.
 
 ## Setup
@@ -68,17 +70,20 @@ If using `$env:UV_PROJECT_ENVIRONMENT = ".uv-venv"`, keep that variable set for 
 
 ## Current Ship Status
 
-- Status date: 2026-05-16.
-- Optional live caption mode is implemented for Windows PC speaker output through WhisperLiveKit and ready for local manual validation. Live dependencies stay behind the `live` extra and require Python 3.11+; the base package remains Python 3.10-compatible. Unit tests cover CLI dispatch, PCM conversion, audio diagnostics, queue drop policy, WLK message parsing, direct/cascade transcript semantics, bilingual transcript formatting, quality preset flags, window formatting, missing dependency diagnostics, executable resolution, and WLK startup cleanup.
-- Live launcher status: `live_translate.bat` runs from the repository root and prefers `VIRTUAL_ENV`, repo-local `.uv-venv`, repo-local `.venv`, then `%USERPROFILE%\.venv`. The Python integration resolves that active environment's WhisperLiveKit executable before PATH, starts WLK with configured live quality flags, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default. The direct-mode bilingual log defect is fixed by rejecting `--live-save-bilingual-transcript` unless cascade mode is selected. `--live-preset quality` now selects cascade mode, model `medium` unless overridden, Faster-Whisper backend, beam decoding, CTranslate2 NLLB translation, static Spanish-to-English prompt guidance, valid audio buffer lengths, and an unbounded no-intentional-drop queue policy for slower but more accurate live transcripts. The previous missing-live-extra traceback path now exits with a clear message. Startup smoke has passed with the `live` extra installed; full Windows loopback audio validation is still pending.
+- Status date: 2026-05-25.
+- Optional live caption mode is implemented for Windows PC speaker output through WhisperLiveKit and ready for local manual validation. Live dependencies stay behind the `live` extra and require Python 3.11+; the base package remains Python 3.10-compatible. Unit tests cover CLI dispatch, launcher contracts, PCM conversion, audio diagnostics, queue drop policy, WLK message parsing, direct/cascade transcript semantics, bilingual transcript formatting, quality preset flags, window formatting, missing dependency diagnostics, executable resolution, WLK startup cleanup, and live transcript evaluator metrics.
+- Live launcher status: `live_translate.bat` remains the low-latency path. It runs from the repository root, prefers `VIRTUAL_ENV`, repo-local `.uv-venv`, repo-local `.venv`, then `%USERPROFILE%\.venv`, and writes committed direct-mode English captions to `logs\live_english_transcript.txt` by default. `live_translate_quality.bat` is the accuracy-first path. It uses quality/cascade mode, medium model by default, 750 ms chunks, frame threshold 45, 5 beams, Faster-Whisper, beam decoding, CTranslate2 NLLB, valid 1.0-45 second audio buffer bounds, optional local glossary injection when `transcriber_glossary.txt` exists, English and bilingual transcript logs, and live audio diagnostics. The direct-mode bilingual log defect is fixed by rejecting `--live-save-bilingual-transcript` unless cascade mode is selected.
+- Live prompt status: automatic Spanish static prompts are mode-aware. Direct mode asks WhisperLiveKit for natural English translation; cascade mode asks for accurate Spanish ASR and explicitly says not to translate. Explicit `--live-static-prompt` still overrides the automatic prompts.
+- Live evaluator status: `tools/evaluate_live_transcript.py` is a source-repo developer tool for deterministic CER/WER checks against committed bilingual transcript text. It has no external dependencies, is covered by unit tests, and is included in mypy validation. It is not a packaged console script.
+- Dependency status: `uv.lock` is updated to WhisperLiveKit `0.2.21`; `pyproject.toml` still allows `whisperlivekit[translation]>=0.2.20.post1` behind the optional `live` extra.
 - Agentic legibility hardening is ready for release: reproducible uv environment, `Makefile` validation, coverage gate, CI quality gates, agent guide, governance docs, security policy, architecture docs, and generated-artifact cleanup are in place.
 - Watcher move failure handling is fixed and covered by regression tests. Missing or locked `.srt` files no longer strand moved media without a retryable source.
 - Transcript merge secret filtering is fixed and covered by regression tests. Token files are skipped case-insensitively, and generated/cache directories are excluded from recursive scans.
 - Speaker label option is ready for release and covered by regression tests. Interactive one-off runs prompt for speaker labels after language and quality/fast mode. `--speaker-labels` / `--no-speaker-labels` control SRT `SPEAKER_00:` labels; disabling labels skips diarization and Hugging Face token loading. Existing `--diarize` / `--no-diarize` remain backward-compatible aliases.
-- Code simplification is complete for the current refactor slice. The speaker-label prompt/config flow and live translation-mode helper/parser cleanup were simplified without changing public CLI behavior, watcher policy, live direct/cascade semantics, or merge output contracts.
+- Code simplification is complete for the current refactor slice. The speaker-label prompt/config flow, live static-prompt selection, live translation-mode helper/parser cleanup, and evaluator parser cleanup were simplified without changing public CLI behavior, watcher policy, live direct/cascade semantics, merge output contracts, or evaluator output format.
 - Dependency audit is strict in CI through `pip-audit`; secret scanning is enforced with Gitleaks; Dependabot is configured for GitHub Actions and uv.
 - Coverage is enforced through pytest-cov. Start at the current baseline and ratchet up only when tests improve.
-- No deprecation or migration is required for this release; old diarization flags remain supported and live mode is an additive optional path.
+- No deprecation or migration is required for this release; old diarization flags remain supported, the latency live launcher remains unchanged, and the quality launcher/evaluator are additive optional paths.
 - Rollback path is git-based: revert the release commit to restore the previous behavior and docs.
 
 ## Conventions
