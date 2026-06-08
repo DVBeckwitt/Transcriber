@@ -54,6 +54,37 @@ class FakeTranslationBackend:
         )
 
 
+class ScriptedTranslationBackend:
+    name = "scripted"
+    model_name = "scripted-model"
+
+    def __init__(self, outputs_by_call: list[list[str]]) -> None:
+        self.outputs_by_call = list(outputs_by_call)
+        self.calls: list[dict[str, Any]] = []
+
+    def translate_texts(
+        self,
+        request: TranslationRequest,
+        *,
+        device: str,
+        batch_size: int,
+        max_new_tokens: int,
+    ) -> TranslationResult:
+        self.calls.append(
+            {
+                "texts": list(request.texts),
+                "batch_size": batch_size,
+                "max_new_tokens": max_new_tokens,
+            }
+        )
+        return TranslationResult(
+            texts=self.outputs_by_call.pop(0),
+            backend=self.name,
+            model=self.model_name,
+            warnings=[],
+        )
+
+
 class FakeResponse:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.body = json_module.dumps(payload).encode("utf-8")
@@ -199,7 +230,7 @@ class TranslationTests(unittest.TestCase):
                 source_srt_path=source_srt,
                 english_srt_path=english_srt,
                 source_lang="es",
-                backend=FakeTranslationBackend(warnings=["low confidence"]),
+                backend=FakeTranslationBackend(outputs=["Hello OpenAI", "Thanks"], warnings=["low confidence"]),
                 glossary={"OpenAI": "OpenAI"},
                 device="cpu",
                 batch_size=2,
@@ -213,13 +244,167 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(result.backend, "fake")
             self.assertIn("00:00:00,000 --> 00:00:01,000", english_text)
             self.assertIn("00:00:01,000 --> 00:00:02,000", english_text)
-            self.assertIn("SPEAKER_00: EN: Hola OpenAI", english_text)
+            self.assertIn("SPEAKER_00: Hello OpenAI", english_text)
             self.assertEqual(report["source_lang"], "es")
             self.assertEqual(report["target_lang"], "en")
             self.assertEqual(report["cue_count"], 2)
+            self.assertEqual(report["batch_size"], 2)
+            self.assertEqual(report["max_new_tokens"], 256)
+            self.assertTrue(report["quality_check"]["passed"])
             self.assertEqual(report["warnings"], ["low confidence"])
             self.assertEqual(report["english_output_mode"], "post")
             self.assertNotIn("Hola", json_module.dumps(report))
+
+    def test_translate_srt_to_english_retries_residual_german_cue(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source_srt = Path(tmpdir) / "meeting.de.srt"
+            english_srt = Path(tmpdir) / "meeting.en.srt"
+            report_path = Path(tmpdir) / "meeting.translation.json"
+            source_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHallo, mein Name ist Armin.\n",
+                encoding="utf-8",
+            )
+            backend = ScriptedTranslationBackend(
+                [
+                    ["Hallo, mein Name ist Armin."],
+                    ["Hello, my name is Armin."],
+                ]
+            )
+
+            result = translate_srt_to_english(
+                source_srt_path=source_srt,
+                english_srt_path=english_srt,
+                source_lang="de",
+                backend=backend,
+                glossary={},
+                device="cpu",
+                batch_size=1,
+                max_new_tokens=1024,
+                report_path=report_path,
+                english_output_mode="post",
+            )
+
+            report = json_module.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.texts, ["Hello, my name is Armin."])
+            self.assertIn("Hello, my name is Armin.", english_srt.read_text(encoding="utf-8"))
+            self.assertEqual([call["batch_size"] for call in backend.calls], [1, 1])
+            self.assertEqual(report["quality_check"]["retried_cue_count"], 1)
+            self.assertEqual(report["quality_check"]["failed_cue_indexes"], [])
+
+    def test_translate_srt_to_english_allows_unchanged_names(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source_srt = Path(tmpdir) / "meeting.de.srt"
+            english_srt = Path(tmpdir) / "meeting.en.srt"
+            report_path = Path(tmpdir) / "meeting.translation.json"
+            source_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nArmin Meiwes\n", encoding="utf-8")
+
+            translate_srt_to_english(
+                source_srt_path=source_srt,
+                english_srt_path=english_srt,
+                source_lang="de",
+                backend=FakeTranslationBackend(outputs=["Armin Meiwes"]),
+                glossary={},
+                device="cpu",
+                batch_size=1,
+                max_new_tokens=1024,
+                report_path=report_path,
+                english_output_mode="post",
+            )
+
+            report = json_module.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["quality_check"]["passed"])
+            self.assertEqual(report["quality_check"]["retried_cue_count"], 0)
+
+    def test_translate_srt_to_english_allows_shared_spanish_english_words(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source_srt = Path(tmpdir) / "meeting.es.srt"
+            english_srt = Path(tmpdir) / "meeting.en.srt"
+            report_path = Path(tmpdir) / "meeting.translation.json"
+            source_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nNo\n", encoding="utf-8")
+
+            translate_srt_to_english(
+                source_srt_path=source_srt,
+                english_srt_path=english_srt,
+                source_lang="es",
+                backend=FakeTranslationBackend(outputs=["No"]),
+                glossary={},
+                device="cpu",
+                batch_size=1,
+                max_new_tokens=1024,
+                report_path=report_path,
+                english_output_mode="post",
+            )
+
+            report = json_module.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["quality_check"]["passed"])
+            self.assertEqual(report["quality_check"]["retried_cue_count"], 0)
+
+    def test_translate_srt_to_english_rejects_unfixed_residual_german_cue(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source_srt = Path(tmpdir) / "meeting.de.srt"
+            english_srt = Path(tmpdir) / "meeting.en.srt"
+            report_path = Path(tmpdir) / "meeting.translation.json"
+            source_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHallo, mein Name ist Armin.\n",
+                encoding="utf-8",
+            )
+            backend = ScriptedTranslationBackend(
+                [
+                    ["Hallo, mein Name ist Armin."],
+                    ["Hallo, mein Name ist Armin."],
+                ]
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "quality check"):
+                translate_srt_to_english(
+                    source_srt_path=source_srt,
+                    english_srt_path=english_srt,
+                    source_lang="de",
+                    backend=backend,
+                    glossary={},
+                    device="cpu",
+                    batch_size=1,
+                    max_new_tokens=1024,
+                    report_path=report_path,
+                    english_output_mode="post",
+                )
+
+            report = json_module.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(english_srt.exists())
+            self.assertFalse(report["quality_check"]["passed"])
+            self.assertEqual(report["quality_check"]["residual_source_cue_count"], 1)
+            self.assertEqual(report["quality_check"]["failed_cue_indexes"], [1])
+            self.assertNotIn("Hallo", json_module.dumps(report))
+
+    def test_translate_srt_to_english_rejects_dropped_content_after_retry(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source_srt = Path(tmpdir) / "meeting.es.srt"
+            english_srt = Path(tmpdir) / "meeting.en.srt"
+            report_path = Path(tmpdir) / "meeting.translation.json"
+            source_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nEsta entrevista contiene muchos detalles importantes del caso.\n",
+                encoding="utf-8",
+            )
+            backend = ScriptedTranslationBackend([["OK"], ["OK"]])
+
+            with self.assertRaisesRegex(RuntimeError, "quality check"):
+                translate_srt_to_english(
+                    source_srt_path=source_srt,
+                    english_srt_path=english_srt,
+                    source_lang="es",
+                    backend=backend,
+                    glossary={},
+                    device="cpu",
+                    batch_size=1,
+                    max_new_tokens=1024,
+                    report_path=report_path,
+                    english_output_mode="post",
+                )
+
+            report = json_module.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(report["quality_check"]["passed"])
+            self.assertEqual(report["quality_check"]["dropped_content_cue_count"], 1)
+            self.assertEqual(report["quality_check"]["failed_cue_indexes"], [1])
 
     def test_translate_srt_to_english_rejects_changed_cue_count(self) -> None:
         with TemporaryDirectory() as tmpdir:

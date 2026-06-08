@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json as json_module
 import shutil
 import sys
 import unittest
@@ -86,8 +87,8 @@ def make_cfg(**overrides: object) -> RunConfig:
         low_confidence_word_prob=0.5,
         device="cpu",
         compute_type="float32",
-        translation_batch_size=4,
-        translation_max_new_tokens=256,
+        translation_batch_size=1,
+        translation_max_new_tokens=1024,
         glossary={},
         glossary_path=None,
         asr_prompt=None,
@@ -127,8 +128,13 @@ class FakePostTranslationBackend:
         batch_size: int,
         max_new_tokens: int,
     ) -> TranslationResult:
+        translations = {
+            "Gracias": "Thanks",
+            "Hallo": "Hello",
+            "Hola": "Hello",
+        }
         return TranslationResult(
-            texts=[f"EN: {text}" for text in request.texts],
+            texts=[translations.get(text, f"English: {text}") for text in request.texts],
             backend=self.name,
             model=self.model_name,
             warnings=[],
@@ -150,6 +156,26 @@ class FailingPostTranslationBackend:
         raise RuntimeError("server unavailable")
 
 
+class ResidualPostTranslationBackend:
+    name = "residual"
+    model_name = "residual-model"
+
+    def translate_texts(
+        self,
+        request: TranslationRequest,
+        *,
+        device: str,
+        batch_size: int,
+        max_new_tokens: int,
+    ) -> TranslationResult:
+        return TranslationResult(
+            texts=list(request.texts),
+            backend=self.name,
+            model=self.model_name,
+            warnings=[],
+        )
+
+
 class HelperTests(unittest.TestCase):
     def test_build_config_defaults_to_auto(self) -> None:
         cfg = build_config(parse_args([]), interactive=False)
@@ -160,6 +186,17 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(cfg.post_translate_to_english)
         self.assertTrue(cfg.speaker_labels)
         self.assertTrue(cfg.diarize)
+        self.assertEqual(cfg.translation_batch_size, 1)
+        self.assertEqual(cfg.translation_max_new_tokens, 1024)
+
+    def test_translation_reliability_flags_override_defaults(self) -> None:
+        cfg = build_config(
+            parse_args(["--translation-batch-size", "2", "--translation-max-new-tokens", "1536"]),
+            interactive=False,
+        )
+
+        self.assertEqual(cfg.translation_batch_size, 2)
+        self.assertEqual(cfg.translation_max_new_tokens, 1536)
 
     def test_fast_mode_defaults_to_no_speaker_labels(self) -> None:
         cfg = build_config(parse_args(["--mode", "fast"]), interactive=False)
@@ -530,11 +567,11 @@ class HelperTests(unittest.TestCase):
                 (source.parent / "meeting.es.srt").read_text(encoding="utf-8").strip().splitlines()[-1],
                 "SPEAKER_00: Hola",
             )
-            self.assertIn("SPEAKER_00: EN: Hola", outputs.english_srt_path.read_text(encoding="utf-8"))
+            self.assertIn("SPEAKER_00: Hello", outputs.english_srt_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 outputs.srt_path.read_text(encoding="utf-8"), outputs.english_srt_path.read_text(encoding="utf-8")
             )
-            self.assertIn("SPEAKER_00: EN: Hola", outputs.llm_path.read_text(encoding="utf-8"))
+            self.assertIn("SPEAKER_00: Hello", outputs.llm_path.read_text(encoding="utf-8"))
             self.assertEqual(record.get("english_output_mode"), "post")
 
     @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
@@ -623,7 +660,55 @@ class HelperTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertTrue((source.parent / "meeting.de.srt").exists())
-            self.assertIn("EN: Hallo", outputs.english_srt_path.read_text(encoding="utf-8"))
+            self.assertIn("Hello", outputs.english_srt_path.read_text(encoding="utf-8"))
+
+    @patch("transcriber.__main__.build_post_translation_backend", return_value=ResidualPostTranslationBackend())
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_auto_preserves_source_when_translation_quality_fails(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+        _backend: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="auto",
+            english_output_mode="auto",
+            post_translate_to_english=True,
+            translation_server_url="http://localhost:8000/v1",
+            speaker_labels=False,
+            diarize=False,
+            write_llm_txt=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text(
+                    "1\n00:00:00,000 --> 00:00:01,000\nHallo, mein Name ist Armin.\n",
+                    encoding="utf-8",
+                )
+                return 0, "de"
+
+            run_logged.side_effect = fake_run
+
+            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
+            outputs = output_paths_for_input(source, cfg)
+            report = json_module.loads(outputs.translation_report_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((source.parent / "meeting.de.srt").exists())
+            self.assertFalse(outputs.english_srt_path.exists())
+            self.assertIn("Hallo, mein Name ist Armin.", outputs.srt_path.read_text(encoding="utf-8"))
+            self.assertFalse(report["quality_check"]["passed"])
+            self.assertEqual(report["quality_check"]["failed_cue_indexes"], [1])
 
     @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
     @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())

@@ -85,6 +85,8 @@ LANGUAGE_CHOICES = ("auto", "en", "es", "de")
 ENGLISH_OUTPUT_MODE_CHOICES = ("off", "direct", "post", "auto")
 TRANSLATION_BACKEND_CHOICES = ("server",)
 DEFAULT_TRANSLATION_BACKEND = "server"
+DEFAULT_TRANSLATION_BATCH_SIZE = 1
+DEFAULT_TRANSLATION_MAX_NEW_TOKENS = 1024
 TRANSLATION_NUM_BEAMS = 4
 TRANSLATION_LENGTH_PENALTY = 1.0
 TRANSLATION_NO_REPEAT_NGRAM_SIZE = 3
@@ -1489,6 +1491,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--translation-batch-size",
+        type=int,
+        default=DEFAULT_TRANSLATION_BATCH_SIZE,
+        help=f"Number of subtitle cues per post-translation request (default: {DEFAULT_TRANSLATION_BATCH_SIZE}).",
+    )
+    parser.add_argument(
+        "--translation-max-new-tokens",
+        type=int,
+        default=DEFAULT_TRANSLATION_MAX_NEW_TOKENS,
+        help=(
+            f"Maximum generated tokens per post-translation request (default: {DEFAULT_TRANSLATION_MAX_NEW_TOKENS})."
+        ),
+    )
+    parser.add_argument(
         "--save-source-srt",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1826,8 +1842,8 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
     compression_ratio_threshold = 2.4
     logprob_threshold = -1.0
     no_speech_threshold = 0.6
-    translation_batch_size = 4
-    translation_max_new_tokens = 256
+    translation_batch_size = int(args.translation_batch_size)
+    translation_max_new_tokens = int(args.translation_max_new_tokens)
     temperature_schedule: tuple[float, ...]
 
     if is_fast_mode:

@@ -27,6 +27,97 @@ GLOSSARY_PLACEHOLDER_TEMPLATE = "ZXGLOSSARY{index:03d}ZX"
 DEFAULT_TRANSLATION_SERVER_HOST = "127.0.0.1"
 DEFAULT_TRANSLATION_SERVER_PORT = 8000
 DEFAULT_TRANSLATION_SERVER_START_TIMEOUT_SECONDS = 30 * 60.0
+_WORD_RE = re.compile(r"[A-Za-z\u00c0-\u024f]+")
+_GERMAN_MARKER_RE = re.compile(r"[\u00c4\u00d6\u00dc\u00e4\u00f6\u00fc\u00df]")
+_SPANISH_MARKER_RE = re.compile(
+    r"[\u00c1\u00c9\u00cd\u00d3\u00da\u00dc\u00d1\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00f1\u00bf\u00a1]"
+)
+_SOURCE_LANGUAGE_WORDS = {
+    "de": {
+        "aber",
+        "als",
+        "auch",
+        "auf",
+        "aus",
+        "bei",
+        "bin",
+        "danke",
+        "das",
+        "dass",
+        "dem",
+        "den",
+        "der",
+        "des",
+        "die",
+        "ein",
+        "eine",
+        "einem",
+        "einen",
+        "er",
+        "es",
+        "fur",
+        "habe",
+        "haben",
+        "hallo",
+        "hat",
+        "ich",
+        "im",
+        "in",
+        "ist",
+        "ja",
+        "mein",
+        "meine",
+        "mit",
+        "nein",
+        "nicht",
+        "noch",
+        "oder",
+        "schon",
+        "sie",
+        "und",
+        "war",
+        "waren",
+        "werden",
+        "wir",
+        "wird",
+        "zu",
+    },
+    "es": {
+        "al",
+        "como",
+        "con",
+        "de",
+        "del",
+        "el",
+        "en",
+        "es",
+        "esta",
+        "estoy",
+        "gracias",
+        "hola",
+        "la",
+        "las",
+        "lo",
+        "los",
+        "mas",
+        "me",
+        "muy",
+        "no",
+        "para",
+        "pero",
+        "por",
+        "que",
+        "se",
+        "si",
+        "te",
+        "un",
+        "una",
+        "y",
+    },
+}
+_UNCHANGED_TRANSLATION_OK = {
+    "es": {"no", "ok"},
+}
 
 
 @dataclass(frozen=True)
@@ -368,6 +459,85 @@ def render_srt_cues(cues: Sequence[SubtitleCue]) -> str:
     return "\n".join(rendered).rstrip() + "\n"
 
 
+def _normalized_words(text: str) -> list[str]:
+    return [match.group(0).lower() for match in _WORD_RE.finditer(text)]
+
+
+def _source_language_score(text: str, source_lang: str) -> int:
+    words = _normalized_words(text)
+    score = sum(1 for word in words if word in _SOURCE_LANGUAGE_WORDS.get(source_lang, set()))
+    if source_lang == "de" and _GERMAN_MARKER_RE.search(text):
+        score += 2
+    if source_lang == "es" and _SPANISH_MARKER_RE.search(text):
+        score += 2
+    return score
+
+
+def _looks_like_residual_source_language(source: str, translated: str, source_lang: str) -> bool:
+    if source_lang not in SUPPORTED_POST_TRANSLATION_LANGS:
+        return False
+    source_words = _normalized_words(source)
+    translated_words = _normalized_words(translated)
+    if not source_words or not translated_words:
+        return False
+    if source_words == translated_words:
+        normalized_source = " ".join(source_words)
+        if normalized_source in _UNCHANGED_TRANSLATION_OK.get(source_lang, set()):
+            return False
+        return _source_language_score(source, source_lang) > 0
+
+    score = _source_language_score(translated, source_lang)
+    if score >= 3:
+        return True
+    return score >= 2 and score / len(translated_words) >= 0.25
+
+
+def _looks_like_dropped_translation(source: str, translated: str) -> bool:
+    source_words = _normalized_words(source)
+    if not source_words:
+        return False
+    translated_words = _normalized_words(translated)
+    if not translated_words:
+        return True
+    if len(source_words) >= 6 and len(translated_words) <= 1:
+        return True
+    return len(source) >= 40 and len(translated) < max(8, int(len(source) * 0.15))
+
+
+def _find_translation_quality_failures(
+    *,
+    source_lang: str,
+    source_texts: Sequence[str],
+    translated_texts: Sequence[str],
+) -> tuple[set[int], set[int]]:
+    residual_positions: set[int] = set()
+    dropped_positions: set[int] = set()
+    for position, (source, translated) in enumerate(zip(source_texts, translated_texts, strict=True)):
+        if _looks_like_residual_source_language(source, translated, source_lang):
+            residual_positions.add(position)
+        if _looks_like_dropped_translation(source, translated):
+            dropped_positions.add(position)
+    return residual_positions, dropped_positions
+
+
+def _translation_quality_payload(
+    *,
+    cue_indexes: Sequence[int],
+    residual_positions: set[int],
+    dropped_positions: set[int],
+    retried_cue_count: int,
+) -> dict[str, Any]:
+    failed_positions = sorted(residual_positions | dropped_positions)
+    failed_cue_indexes = [cue_indexes[position] for position in failed_positions]
+    return {
+        "passed": not failed_cue_indexes,
+        "retried_cue_count": retried_cue_count,
+        "residual_source_cue_count": len(residual_positions),
+        "dropped_content_cue_count": len(dropped_positions),
+        "failed_cue_indexes": failed_cue_indexes,
+    }
+
+
 def write_translation_report(
     report_path: Path,
     *,
@@ -375,8 +545,11 @@ def write_translation_report(
     target_lang: str,
     result: TranslationResult,
     cue_count: int,
+    batch_size: int,
+    max_new_tokens: int,
     fallback_count: int,
     english_output_mode: str,
+    quality_check: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "source_lang": source_lang,
@@ -384,9 +557,19 @@ def write_translation_report(
         "backend": result.backend,
         "model": result.model,
         "cue_count": cue_count,
+        "batch_size": batch_size,
+        "max_new_tokens": max_new_tokens,
         "warnings": result.warnings,
         "fallback_count": fallback_count,
         "english_output_mode": english_output_mode,
+        "quality_check": quality_check
+        or {
+            "passed": True,
+            "retried_cue_count": 0,
+            "residual_source_cue_count": 0,
+            "dropped_content_cue_count": 0,
+            "failed_cue_indexes": [],
+        },
     }
     atomic_write_text(report_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
@@ -409,11 +592,13 @@ def translate_srt_to_english(
         raise RuntimeError("Source SRT has no translatable cues.")
 
     source_texts: list[str] = []
+    source_bodies: list[str] = []
     cue_meta: list[tuple[SubtitleCue, str, dict[str, str]]] = []
     for cue in cues:
         prefix, text = split_speaker_prefix(cue.text)
         protected_text, placeholders = apply_glossary_placeholders(text, glossary)
         source_texts.append(protected_text)
+        source_bodies.append(text)
         cue_meta.append((cue, prefix, placeholders))
 
     result = backend.translate_texts(
@@ -431,23 +616,72 @@ def translate_srt_to_english(
     if len(result.texts) != len(cues):
         raise RuntimeError("Translation produced an unexpected cue count.")
 
+    warnings = list(result.warnings)
+    cue_indexes = [cue.index for cue in cues]
+    translated_bodies: list[str] = []
+    for translated_text, (_cue, _prefix, placeholders) in zip(result.texts, cue_meta, strict=True):
+        translated_bodies.append(
+            normalize_subtitle_whitespace(replace_glossary_placeholders(translated_text, placeholders))
+        )
+
+    residual_positions, dropped_positions = _find_translation_quality_failures(
+        source_lang=source_lang,
+        source_texts=source_bodies,
+        translated_texts=translated_bodies,
+    )
+    retry_positions = sorted(residual_positions | dropped_positions)
+    if retry_positions:
+        warnings.append(f"Retried {len(retry_positions)} cue(s) after translation quality check.")
+    for position in retry_positions:
+        retry_result = backend.translate_texts(
+            TranslationRequest(
+                source_lang=source_lang,
+                target_lang="en",
+                texts=[source_texts[position]],
+                glossary=glossary,
+                preserve_markers=tuple(sorted(glossary.values())),
+            ),
+            device=device,
+            batch_size=1,
+            max_new_tokens=max_new_tokens,
+        )
+        if len(retry_result.texts) != 1:
+            raise RuntimeError(f"Translation retry produced an unexpected cue count for cue {cue_indexes[position]}.")
+        _cue, _prefix, placeholders = cue_meta[position]
+        translated_bodies[position] = normalize_subtitle_whitespace(
+            replace_glossary_placeholders(retry_result.texts[0], placeholders)
+        )
+        warnings.extend(retry_result.warnings)
+
+    residual_positions, dropped_positions = _find_translation_quality_failures(
+        source_lang=source_lang,
+        source_texts=source_bodies,
+        translated_texts=translated_bodies,
+    )
+    quality_check = _translation_quality_payload(
+        cue_indexes=cue_indexes,
+        residual_positions=residual_positions,
+        dropped_positions=dropped_positions,
+        retried_cue_count=len(retry_positions),
+    )
+
     translated_cues: list[SubtitleCue] = []
     restored_texts: list[str] = []
-    for translated_text, (cue, prefix, placeholders) in zip(result.texts, cue_meta, strict=True):
-        restored = normalize_subtitle_whitespace(replace_glossary_placeholders(translated_text, placeholders))
-        if cue.text.strip() and not restored:
-            raise RuntimeError(f"Translation produced empty output for cue {cue.index}.")
-        final_text = f"{prefix}{restored}".strip() if prefix else restored
+    for translated_body, (cue, prefix, _placeholders) in zip(translated_bodies, cue_meta, strict=True):
+        final_text = f"{prefix}{translated_body}".strip() if prefix else translated_body
         translated_cues.append(SubtitleCue(index=cue.index, start=cue.start, end=cue.end, text=final_text))
         restored_texts.append(final_text)
 
-    atomic_write_text(english_srt_path, render_srt_cues(translated_cues))
     final_result = TranslationResult(
         texts=restored_texts,
         backend=result.backend,
         model=result.model,
-        warnings=list(result.warnings),
+        warnings=warnings,
     )
+    if not quality_check["passed"]:
+        failed_indexes = ", ".join(str(index) for index in quality_check["failed_cue_indexes"])
+        final_result.warnings.append(f"Translation quality check failed after retry for cue(s): {failed_indexes}")
+
     if report_path is not None:
         write_translation_report(
             report_path,
@@ -455,9 +689,16 @@ def translate_srt_to_english(
             target_lang="en",
             result=final_result,
             cue_count=len(cues),
+            batch_size=batch_size,
+            max_new_tokens=max_new_tokens,
             fallback_count=0,
             english_output_mode=english_output_mode,
+            quality_check=quality_check,
         )
+    if not quality_check["passed"]:
+        raise RuntimeError(f"Translation quality check failed for cue(s): {failed_indexes}")
+
+    atomic_write_text(english_srt_path, render_srt_cues(translated_cues))
     return final_result
 
 
