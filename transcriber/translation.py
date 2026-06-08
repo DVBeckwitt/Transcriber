@@ -1,0 +1,368 @@
+from __future__ import annotations
+
+import importlib
+import ipaddress
+import json
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+from urllib.parse import urlparse
+
+from transcriber.io import atomic_write_text
+
+SUPPORTED_POST_TRANSLATION_LANGS = {"es", "de"}
+DEFAULT_TRANSLATION_MODEL = "Unbabel/Tower-Plus-72B"
+GLOSSARY_PLACEHOLDER_TEMPLATE = "ZXGLOSSARY{index:03d}ZX"
+
+
+@dataclass(frozen=True)
+class TranslationRequest:
+    source_lang: str
+    target_lang: str
+    texts: Sequence[str]
+    glossary: dict[str, str]
+    preserve_markers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TranslationResult:
+    texts: list[str]
+    backend: str
+    model: str
+    warnings: list[str]
+
+
+@dataclass(frozen=True)
+class SubtitleCue:
+    index: int
+    start: str
+    end: str
+    text: str
+
+
+class TranslationBackend(Protocol):
+    name: str
+    model_name: str
+
+    def translate_texts(
+        self,
+        request: TranslationRequest,
+        *,
+        device: str,
+        batch_size: int,
+        max_new_tokens: int,
+    ) -> TranslationResult: ...
+
+
+def normalize_subtitle_whitespace(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.;:?!])", r"\1", text)
+    text = re.sub(r'([("])\s+', r"\1", text)
+    text = re.sub(r'\s+([)")])', r"\1", text)
+    return text
+
+
+def split_speaker_prefix(text: str) -> tuple[str, str]:
+    match = re.match(r"^([A-Z][A-Z0-9_ ]{1,31}:\s+)(.+)$", text.strip())
+    if not match:
+        return "", normalize_subtitle_whitespace(text)
+    return match.group(1), normalize_subtitle_whitespace(match.group(2))
+
+
+def apply_glossary_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[str, str]]:
+    if not glossary or not text:
+        return text, {}
+
+    placeholder_map: dict[str, str] = {}
+    updated = text
+    placeholder_index = 0
+    for source, target in sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True):
+        if not source:
+            continue
+        escaped = re.escape(source)
+        pattern = rf"\b{escaped}\b" if re.fullmatch(r"[A-Za-z0-9_]+", source) else escaped
+        if not re.search(pattern, updated):
+            continue
+        placeholder = GLOSSARY_PLACEHOLDER_TEMPLATE.format(index=placeholder_index)
+        placeholder_index += 1
+        updated = re.sub(pattern, placeholder, updated)
+        placeholder_map[placeholder] = target
+    return updated, placeholder_map
+
+
+def replace_glossary_placeholders(text: str, placeholder_map: dict[str, str]) -> str:
+    updated = text
+    for placeholder, target in placeholder_map.items():
+        updated = updated.replace(placeholder, target)
+    return updated
+
+
+def parse_srt_cues(srt_text: str) -> list[SubtitleCue]:
+    cues: list[SubtitleCue] = []
+    for block in re.split(r"\n\s*\n", srt_text.strip()):
+        lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        line_index = 1 if lines[0].strip().isdigit() else 0
+        if line_index >= len(lines) or "-->" not in lines[line_index]:
+            continue
+        start_raw, end_raw = [part.strip() for part in lines[line_index].split("-->", 1)]
+        text = " ".join(line.strip() for line in lines[line_index + 1 :] if line.strip())
+        if not text:
+            continue
+        cues.append(SubtitleCue(index=len(cues) + 1, start=start_raw, end=end_raw, text=text))
+    return cues
+
+
+def render_srt_cues(cues: Sequence[SubtitleCue]) -> str:
+    rendered: list[str] = []
+    for idx, cue in enumerate(cues, start=1):
+        rendered.append(str(idx))
+        rendered.append(f"{cue.start} --> {cue.end}")
+        rendered.append(cue.text)
+        rendered.append("")
+    return "\n".join(rendered).rstrip() + "\n"
+
+
+def write_translation_report(
+    report_path: Path,
+    *,
+    source_lang: str,
+    target_lang: str,
+    result: TranslationResult,
+    cue_count: int,
+    fallback_count: int,
+    english_output_mode: str,
+) -> None:
+    payload = {
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "backend": result.backend,
+        "model": result.model,
+        "cue_count": cue_count,
+        "warnings": result.warnings,
+        "fallback_count": fallback_count,
+        "english_output_mode": english_output_mode,
+    }
+    atomic_write_text(report_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def translate_srt_to_english(
+    *,
+    source_srt_path: Path,
+    english_srt_path: Path,
+    source_lang: str,
+    backend: TranslationBackend,
+    glossary: dict[str, str],
+    device: str,
+    batch_size: int,
+    max_new_tokens: int,
+    report_path: Path | None = None,
+    english_output_mode: str = "post",
+) -> TranslationResult:
+    cues = parse_srt_cues(source_srt_path.read_text(encoding="utf-8", errors="ignore"))
+    if not cues:
+        raise RuntimeError("Source SRT has no translatable cues.")
+
+    source_texts: list[str] = []
+    cue_meta: list[tuple[SubtitleCue, str, dict[str, str]]] = []
+    for cue in cues:
+        prefix, text = split_speaker_prefix(cue.text)
+        protected_text, placeholders = apply_glossary_placeholders(text, glossary)
+        source_texts.append(protected_text)
+        cue_meta.append((cue, prefix, placeholders))
+
+    result = backend.translate_texts(
+        TranslationRequest(
+            source_lang=source_lang,
+            target_lang="en",
+            texts=source_texts,
+            glossary=glossary,
+            preserve_markers=tuple(sorted(glossary.values())),
+        ),
+        device=device,
+        batch_size=batch_size,
+        max_new_tokens=max_new_tokens,
+    )
+    if len(result.texts) != len(cues):
+        raise RuntimeError("Translation produced an unexpected cue count.")
+
+    translated_cues: list[SubtitleCue] = []
+    restored_texts: list[str] = []
+    for translated_text, (cue, prefix, placeholders) in zip(result.texts, cue_meta, strict=True):
+        restored = normalize_subtitle_whitespace(replace_glossary_placeholders(translated_text, placeholders))
+        if cue.text.strip() and not restored:
+            raise RuntimeError(f"Translation produced empty output for cue {cue.index}.")
+        final_text = f"{prefix}{restored}".strip() if prefix else restored
+        translated_cues.append(SubtitleCue(index=cue.index, start=cue.start, end=cue.end, text=final_text))
+        restored_texts.append(final_text)
+
+    atomic_write_text(english_srt_path, render_srt_cues(translated_cues))
+    final_result = TranslationResult(
+        texts=restored_texts,
+        backend=result.backend,
+        model=result.model,
+        warnings=list(result.warnings),
+    )
+    if report_path is not None:
+        write_translation_report(
+            report_path,
+            source_lang=source_lang,
+            target_lang="en",
+            result=final_result,
+            cue_count=len(cues),
+            fallback_count=0,
+            english_output_mode=english_output_mode,
+        )
+    return final_result
+
+
+class ServerTranslationBackend:
+    name = "server"
+
+    def __init__(
+        self,
+        *,
+        server_url: str,
+        model_name: str = DEFAULT_TRANSLATION_MODEL,
+        client: Any | None = None,
+    ) -> None:
+        if not server_url:
+            raise ValueError("translation server URL is required for the server backend.")
+        _validate_local_server_url(server_url)
+        self.server_url = server_url.rstrip("/")
+        self.model_name = model_name
+        self._client = client
+
+    def _http_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        httpx = importlib.import_module("httpx")
+        return httpx
+
+    def translate_texts(
+        self,
+        request: TranslationRequest,
+        *,
+        device: str,
+        batch_size: int,
+        max_new_tokens: int,
+    ) -> TranslationResult:
+        if not request.texts:
+            return TranslationResult(texts=[], backend=self.name, model=self.model_name, warnings=[])
+
+        translated: list[str] = []
+        for batch in _chunked_texts(request.texts, batch_size):
+            translated.extend(
+                self._translate_batch(
+                    source_lang=request.source_lang,
+                    target_lang=request.target_lang,
+                    texts=batch,
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+        return TranslationResult(texts=translated, backend=self.name, model=self.model_name, warnings=[])
+
+    def _translate_batch(
+        self,
+        *,
+        source_lang: str,
+        target_lang: str,
+        texts: Sequence[str],
+        max_new_tokens: int,
+    ) -> list[str]:
+        items = [{"index": idx, "text": text} for idx, text in enumerate(texts)]
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate subtitle text to English. Return exactly one JSON object with an items array. "
+                        "Preserve item indexes, speaker labels, placeholders, names, numbers, and tags."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "source_lang": source_lang,
+                            "target_lang": target_lang,
+                            "items": items,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "top_p": 1,
+            "max_tokens": max_new_tokens,
+        }
+        response = self._http_client().post(f"{self.server_url}/chat/completions", json=payload, timeout=120.0)
+        response.raise_for_status()
+        data = response.json()
+        content = _chat_completion_content(data)
+        return _parse_indexed_translation_content(content, expected_count=len(texts))
+
+
+def _chunked_texts(texts: Sequence[str], batch_size: int) -> list[Sequence[str]]:
+    size = max(1, int(batch_size))
+    return [texts[index : index + size] for index in range(0, len(texts), size)]
+
+
+def _validate_local_server_url(server_url: str) -> None:
+    parsed = urlparse(server_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("translation server URL must be an http(s) localhost or loopback URL.")
+    if parsed.username or parsed.password:
+        raise ValueError("translation server URL must not include credentials.")
+
+    hostname = parsed.hostname.strip("[]").lower()
+    if hostname == "localhost":
+        return
+    try:
+        if ipaddress.ip_address(hostname).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise ValueError("translation server URL must point to localhost or a loopback address.")
+
+
+def _chat_completion_content(data: Any) -> str:
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Translation server response did not include chat message content.") from exc
+    if not isinstance(content, str):
+        raise RuntimeError("Translation server response content was not text.")
+    return content
+
+
+def _parse_indexed_translation_content(content: str, *, expected_count: int) -> list[str]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Translation server response was not valid JSON.") from exc
+
+    raw_items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(raw_items, list):
+        raise RuntimeError("Translation server JSON did not contain an items array.")
+
+    translated: dict[int, str] = {}
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise RuntimeError("Translation server item was not an object.")
+        index = raw_item.get("index")
+        text = raw_item.get("text")
+        if not isinstance(index, int) or not isinstance(text, str):
+            raise RuntimeError("Translation server item must include integer index and text.")
+        if index in translated:
+            raise RuntimeError("Translation server returned a duplicate item index.")
+        translated[index] = text
+
+    expected_indexes = set(range(expected_count))
+    if set(translated) != expected_indexes:
+        raise RuntimeError("Translation server returned missing or unexpected item indexes.")
+    return [translated[index] for index in range(expected_count)]

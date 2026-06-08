@@ -69,6 +69,7 @@ def build_status_record(
         "error": error,
         "fallback_no_diarize": fallback_no_diarize,
         "detected_language": detected_language,
+        "english_output_mode": getattr(config, "english_output_mode", None),
     }
 
 

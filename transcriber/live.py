@@ -153,6 +153,10 @@ def _live_audio_queue_maxsize(config: LiveConfig) -> int:
     return 0 if config.preset == "quality" else 8
 
 
+def _source_language_label(language: str) -> str:
+    return {"es": "ES", "de": "DE", "en": "EN"}.get(language.lower(), "SRC")
+
+
 def build_live_config(args: argparse.Namespace) -> LiveConfig:
     translation_mode = _effective_live_translation_mode(args)
     if translation_mode == LiveTranslationMode.DIRECT and args.live_save_bilingual_transcript:
@@ -291,10 +295,10 @@ def _write_committed_transcript(path: Path, state: CaptionState) -> None:
     atomic_write_text(path, text)
 
 
-def _write_bilingual_transcript(path: Path, state: CaptionState) -> None:
+def _write_bilingual_transcript(path: Path, state: CaptionState, *, source_language_label: str = "ES") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     blocks = [
-        f"{index}.\nES: {pair.source_text}\nEN: {pair.translated_text}"
+        f"{index}.\n{source_language_label}: {pair.source_text}\nEN: {pair.translated_text}"
         for index, pair in enumerate(state.committed_pairs, start=1)
     ]
     text = "\n\n".join(blocks)
@@ -318,6 +322,7 @@ def _state_handler(
     state_queue: queue.Queue[CaptionState] | None,
     save_transcript_path: str | None,
     save_bilingual_transcript_path: str | None,
+    source_language_label: str = "ES",
     audio_diagnostics: bool = False,
 ) -> Callable[[CaptionState], None]:
     transcript_path = Path(save_transcript_path).expanduser() if save_transcript_path else None
@@ -337,7 +342,7 @@ def _state_handler(
             _write_committed_transcript(transcript_path, state)
             last_written_lines = state.committed_lines
         if bilingual_transcript_path is not None and state.committed_pairs != last_written_pairs:
-            _write_bilingual_transcript(bilingual_transcript_path, state)
+            _write_bilingual_transcript(bilingual_transcript_path, state, source_language_label=source_language_label)
             last_written_pairs = state.committed_pairs
 
     return handle_state
@@ -366,6 +371,7 @@ def _stream_loop(
                     state_queue=state_queue,
                     save_transcript_path=config.save_transcript_path,
                     save_bilingual_transcript_path=config.save_bilingual_transcript_path,
+                    source_language_label=_source_language_label(config.language),
                     audio_diagnostics=config.audio_diagnostics,
                 ),
             )

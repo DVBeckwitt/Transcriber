@@ -68,13 +68,25 @@ def check_transcription_preflight(*, cfg: Any, hf_token_present: bool, require_f
     if bool(getattr(cfg, "diarize", False)) and not hf_token_present:
         errors.append("Speaker diarization requires HF_TOKEN or hf_token.txt/HF_TOKEN.txt.")
 
-    needs_post_translation = (not bool(getattr(cfg, "translate_to_english", False))) and str(
-        getattr(cfg, "language", "")
-    ) == "auto"
-    if needs_post_translation:
-        for module_name in ("transformers", "sentencepiece", "sacremoses"):
-            if not module_available(module_name):
-                warnings.append(f"Spanish auto-translation may be unavailable because {module_name} is not importable.")
+    needs_post_translation = bool(getattr(cfg, "post_translate_to_english", False)) and not bool(
+        getattr(cfg, "direct_whisper_translate", False)
+    )
+    if needs_post_translation and str(getattr(cfg, "translation_backend", "")) == "server":
+        if not str(getattr(cfg, "translation_server_url", "") or "").strip():
+            message = (
+                "Post-translation server backend needs an OpenAI-compatible local server URL "
+                "(set --translation-server-url)."
+            )
+            if str(getattr(cfg, "english_output_mode", "")) == "post":
+                errors.append(message)
+            else:
+                warnings.append(message)
+        elif not module_available("httpx"):
+            message = "Post-translation server backend may be unavailable because httpx is not importable."
+            if str(getattr(cfg, "english_output_mode", "")) == "post":
+                errors.append(message)
+            else:
+                warnings.append(message)
 
     return PreflightReport(errors=tuple(errors), warnings=tuple(warnings))
 
@@ -83,15 +95,18 @@ def validate_run_config(cfg: Any | None = None, **values: float | None) -> Prefl
     errors: list[str] = []
 
     if cfg is not None:
-        if str(getattr(cfg, "language", "")) not in {"auto", "en", "es"}:
-            errors.append("language must be one of: auto, en, es.")
+        if str(getattr(cfg, "language", "")) not in {"auto", "en", "es", "de"}:
+            errors.append("language must be one of: auto, en, es, de.")
         if str(getattr(cfg, "mode", "")) not in {"quality", "fast"}:
             errors.append("mode must be one of: quality, fast.")
+        if str(getattr(cfg, "english_output_mode", "")) not in {"off", "direct", "post", "auto"}:
+            errors.append("english_output_mode must be one of: off, direct, post, auto.")
+        if str(getattr(cfg, "translation_backend", "")) not in {"server"}:
+            errors.append("translation_backend must be one of: server.")
         for field in (
             "batch_size",
             "beam_size",
             "translation_batch_size",
-            "translation_num_beams",
             "translation_max_new_tokens",
         ):
             try:
@@ -99,7 +114,7 @@ def validate_run_config(cfg: Any | None = None, **values: float | None) -> Prefl
                     errors.append(f"{field} must be greater than 0.")
             except Exception:
                 errors.append(f"{field} must be an integer.")
-        for field in ("min_speaker_turn_ms", "min_speaker_turn_tokens", "translation_no_repeat_ngram_size"):
+        for field in ("min_speaker_turn_ms", "min_speaker_turn_tokens"):
             try:
                 if int(getattr(cfg, field)) < 0:
                     errors.append(f"{field} must be 0 or greater.")

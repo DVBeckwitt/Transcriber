@@ -58,6 +58,12 @@ class LiveCliTests(unittest.TestCase):
         self.assertIsNone(cfg.static_prompt)
         self.assertFalse(cfg.audio_diagnostics)
 
+    def test_live_accepts_german_language_override(self) -> None:
+        cfg = build_live_config(parse_args(["--live", "--lang", "de"]))
+
+        self.assertEqual(cfg.language, "de")
+        self.assertTrue(cfg.translate_to_english)
+
     def test_live_cascade_bilingual_transcript_path_reaches_config(self) -> None:
         cfg = build_live_config(
             parse_args(
@@ -287,6 +293,25 @@ class LiveCliTests(unittest.TestCase):
 
             self.assertEqual(english_path.read_text(encoding="utf-8"), "hello\n")
             self.assertEqual(bilingual_path.read_text(encoding="utf-8"), "1.\nES: hola\nEN: hello\n")
+
+    def test_state_handler_uses_source_language_label_for_bilingual_transcript(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            bilingual_path = Path(tmpdir) / "bilingual.txt"
+            state = CaptionState(
+                committed_lines=("hello",),
+                partial_line="",
+                committed_pairs=(CaptionPair(source_text="hallo", translated_text="hello"),),
+            )
+            handle_state = _state_handler(
+                state_queue=None,
+                save_transcript_path=None,
+                save_bilingual_transcript_path=str(bilingual_path),
+                source_language_label="DE",
+            )
+
+            handle_state(state)
+
+            self.assertEqual(bilingual_path.read_text(encoding="utf-8"), "1.\nDE: hallo\nEN: hello\n")
 
     def test_live_audio_latency_queue_drops_oldest_chunk_when_full(self) -> None:
         audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=1)

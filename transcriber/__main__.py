@@ -26,6 +26,16 @@ from transcriber import status as status_utils
 from transcriber.errors import OutputWriteError
 from transcriber.io import atomic_replace_path, atomic_write_text, temporary_sibling_path
 from transcriber.preflight import check_transcription_preflight, validate_run_config
+from transcriber.translation import (
+    DEFAULT_TRANSLATION_MODEL,
+    SUPPORTED_POST_TRANSLATION_LANGS,
+    ServerTranslationBackend,
+    normalize_subtitle_whitespace,
+    split_speaker_prefix,
+)
+from transcriber.translation import (
+    translate_srt_to_english as translate_generated_srt_to_english,
+)
 
 MEDIA_FILTER = (
     "Audio/Video",
@@ -70,12 +80,13 @@ SUBTITLE_TARGET_CPS = 17.0
 SUBTITLE_PREFERRED_BREAK_CHARS = ".?!,:;"
 
 SPANISH_TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-es-en"
-TRANSLATION_CONTEXT_WINDOW = 2
+LANGUAGE_CHOICES = ("auto", "en", "es", "de")
+ENGLISH_OUTPUT_MODE_CHOICES = ("off", "direct", "post", "auto")
+TRANSLATION_BACKEND_CHOICES = ("server",)
+DEFAULT_TRANSLATION_BACKEND = "server"
 TRANSLATION_NUM_BEAMS = 4
 TRANSLATION_LENGTH_PENALTY = 1.0
 TRANSLATION_NO_REPEAT_NGRAM_SIZE = 3
-TRANSLATION_MARKER_START = "__CUR_START__"
-TRANSLATION_MARKER_END = "__CUR_END__"
 UNCERTAIN_MARKER_RE = re.compile(
     r"__UNCERTAIN(?:_(\d+))?__(.*?)__UNCERTAIN_END__",
     re.DOTALL,
@@ -123,6 +134,13 @@ class LegacyOptions:
 class RunConfig:
     language: str
     translate_to_english: bool
+    english_output_mode: str
+    direct_whisper_translate: bool
+    post_translate_to_english: bool
+    translation_backend: str
+    translation_model: str | None
+    translation_server_url: str | None
+    save_source_srt: bool
     write_llm_txt: bool
     mode: str
     model: str
@@ -148,11 +166,8 @@ class RunConfig:
     low_confidence_word_prob: float
     device: str
     compute_type: str
-    translation_context_window: int
     translation_batch_size: int
-    translation_num_beams: int
     translation_max_new_tokens: int
-    translation_no_repeat_ngram_size: int
     glossary: dict[str, str]
     glossary_path: str | None
     asr_prompt: str | None
@@ -163,6 +178,9 @@ class RunConfig:
 class OutputPaths:
     output_dir: Path
     srt_path: Path
+    source_srt_path: Path
+    english_srt_path: Path
+    translation_report_path: Path
     llm_path: Path
     log_path: Path
     lock_path: Path
@@ -265,21 +283,6 @@ def ms_to_timestamp(total_ms: int) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     seconds, millis = divmod(remainder, 1_000)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
-
-
-def normalize_subtitle_whitespace(text: str) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"\s+([,.;:?!])", r"\1", text)
-    text = re.sub(r'([("])\s+', r"\1", text)
-    text = re.sub(r'\s+([)")])', r"\1", text)
-    return text
-
-
-def split_speaker_prefix(text: str) -> tuple[str, str]:
-    match = re.match(r"^([A-Z][A-Z0-9_ ]{1,31}:\s+)(.+)$", text.strip())
-    if not match:
-        return "", normalize_subtitle_whitespace(text)
-    return match.group(1), normalize_subtitle_whitespace(match.group(2))
 
 
 def normalize_speaker_label(label: str | None) -> str:
@@ -1082,97 +1085,6 @@ def looks_like_glossary_file(value: str) -> bool:
     return candidate.exists()
 
 
-def apply_glossary_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[str, str]]:
-    if not glossary or not text:
-        return text, {}
-
-    placeholder_map: dict[str, str] = {}
-    terms = sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True)
-    updated = text
-    placeholder_index = 0
-    for source, target in terms:
-        if not source:
-            continue
-        escaped = re.escape(source)
-        if re.fullmatch(r"[A-Za-z0-9_]+", source):
-            pattern = rf"\b{escaped}\b"
-        else:
-            pattern = escaped
-        if not re.search(pattern, updated):
-            continue
-        placeholder = f"__GLOSSARY_{placeholder_index}__"
-        placeholder_index += 1
-        updated = re.sub(pattern, placeholder, updated)
-        placeholder_map[placeholder] = target
-    return updated, placeholder_map
-
-
-def replace_glossary_placeholders(text: str, placeholder_map: dict[str, str]) -> str:
-    updated = text
-    for placeholder, target in placeholder_map.items():
-        updated = updated.replace(placeholder, target)
-    return updated
-
-
-def extract_between_markers(text: str, start: str, end: str) -> str | None:
-    if start not in text or end not in text:
-        return None
-    _, after_start = text.split(start, 1)
-    middle, _ = after_start.split(end, 1)
-    return middle.strip()
-
-
-def translation_context_for_cue(cues: Sequence[SRTCue], index: int, window: int) -> list[tuple[int, str]]:
-    context: list[tuple[int, str]] = []
-    for offset in range(window, 0, -1):
-        prev_index = index - offset
-        if prev_index < 0:
-            continue
-        _, prev_text = split_speaker_prefix(cues[prev_index].text)
-        prev_text = normalize_subtitle_whitespace(prev_text)
-        if prev_text:
-            context.append((-offset, prev_text))
-    for offset in range(1, window + 1):
-        next_index = index + offset
-        if next_index >= len(cues):
-            break
-        _, next_text = split_speaker_prefix(cues[next_index].text)
-        next_text = normalize_subtitle_whitespace(next_text)
-        if next_text:
-            context.append((offset, next_text))
-    return context
-
-
-def build_translation_prompt(*, model_name: str, context_window: int, glossary: dict[str, str]) -> str:
-    lines = [
-        "Translate Spanish subtitle text to natural, accurate English.",
-        f"Model: {model_name}",
-        f"Context window: {context_window}",
-        f"Preserve markers: {TRANSLATION_MARKER_START} ... {TRANSLATION_MARKER_END}",
-        "Preserve speaker labels, names, numbers, and uncertain markers exactly.",
-        "Use surrounding context only to disambiguate the current cue.",
-        "Prefer faithful meaning over literal phrasing.",
-    ]
-    if glossary:
-        lines.append("Glossary:")
-        for source, target in glossary.items():
-            if source == target:
-                lines.append(f"- preserve: {source}")
-            else:
-                lines.append(f"- {source} => {target}")
-    else:
-        lines.append("Glossary: (none)")
-    return "\n".join(lines)
-
-
-def log_translation_prompt(log_path: Path, prompt: str) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8", errors="ignore") as log:
-        log.write("\n[transcriber] Translation prompt:\n")
-        for line in prompt.splitlines():
-            log.write(f"[transcriber] {line}\n")
-
-
 def build_asr_prompt(
     *,
     glossary: dict[str, str],
@@ -1286,93 +1198,6 @@ def translate_spanish_texts(
         translated.extend(text.strip() for text in decoded)
 
     return translated
-
-
-def translate_srt_to_english(
-    srt_path: Path,
-    device: str,
-    glossary: dict[str, str] | None = None,
-    glossary_spec: str | None = None,
-    context_window: int = TRANSLATION_CONTEXT_WINDOW,
-    batch_size: int = 4,
-    num_beams: int = TRANSLATION_NUM_BEAMS,
-    max_new_tokens: int = 256,
-    no_repeat_ngram_size: int = TRANSLATION_NO_REPEAT_NGRAM_SIZE,
-    log_path: Path | None = None,
-) -> None:
-    if not srt_path.exists():
-        return
-
-    srt_text = srt_path.read_text(encoding="utf-8", errors="ignore")
-    cues = parse_srt_cues(srt_text)
-    if not cues:
-        return
-
-    glossary = dict(glossary or {})
-    file_glossary = load_translation_glossary(glossary_spec)
-    if file_glossary:
-        merged = dict(file_glossary)
-        merged.update(glossary)
-        glossary = merged
-
-    if log_path is not None:
-        prompt = build_translation_prompt(
-            model_name=SPANISH_TRANSLATION_MODEL,
-            context_window=context_window,
-            glossary=glossary,
-        )
-        log_translation_prompt(log_path, prompt)
-
-    source_blocks: list[str] = []
-    block_meta: list[tuple[str, dict[str, str], str]] = []
-
-    for idx, cue in enumerate(cues):
-        prefix, current_text = split_speaker_prefix(cue.text)
-        current_text = normalize_subtitle_whitespace(current_text)
-        context_entries = translation_context_for_cue(cues, idx, context_window)
-        block_lines = [f"[context {offset:+d}] {line}" for offset, line in context_entries]
-        block_lines.append(f"{TRANSLATION_MARKER_START} {current_text} {TRANSLATION_MARKER_END}")
-        block_text = "\n".join(block_lines)
-        protected_text, placeholders = apply_glossary_placeholders(block_text, glossary)
-        source_blocks.append(protected_text)
-        block_meta.append((prefix, placeholders, current_text))
-
-    translated_blocks = translate_spanish_texts(
-        source_blocks,
-        device=device,
-        batch_size=batch_size,
-        num_beams=num_beams,
-        max_new_tokens=max_new_tokens,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-    )
-    if len(translated_blocks) != len(cues):
-        raise RuntimeError("Translation produced an unexpected cue count.")
-
-    translated_cues: list[SRTCue] = []
-    for cue, translated_block, meta in zip(cues, translated_blocks, block_meta, strict=True):
-        prefix, placeholders, original = meta
-        translated_text = replace_glossary_placeholders(translated_block, placeholders)
-        extracted = extract_between_markers(translated_text, TRANSLATION_MARKER_START, TRANSLATION_MARKER_END)
-        if not extracted:
-            fallback = translate_spanish_texts(
-                [original],
-                device=device,
-                batch_size=1,
-                num_beams=num_beams,
-                max_new_tokens=max_new_tokens,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-            )[0]
-            extracted = replace_glossary_placeholders(fallback, placeholders)
-        translated_text = normalize_subtitle_whitespace(extracted)
-        if prefix:
-            translated_text = f"{prefix}{translated_text}".strip()
-        translated_cues.append(SRTCue(index=cue.index, start_ms=cue.start_ms, end_ms=cue.end_ms, text=translated_text))
-
-    rewrapped: list[SRTCue] = []
-    for cue in translated_cues:
-        rewrapped.extend(split_cue_for_subtitles(cue))
-
-    atomic_write_text(srt_path, render_srt_cues(rewrapped or translated_cues))
 
 
 def build_llm_file(srt_path: Path, llm_path: Path) -> None:
@@ -1535,7 +1360,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="WhisperX one-click transcriber (quality + fast modes).")
     parser.add_argument("legacy", nargs="*", help="Legacy tokens: [language] [model] [mode]")
     parser.add_argument("--input", "-i", help="Audio/video file path.")
-    parser.add_argument("--lang", choices=("auto", "en", "es"), help="Language: auto, en, or es.")
+    parser.add_argument("--lang", choices=LANGUAGE_CHOICES, help="Language: auto, en, es, or de.")
     parser.add_argument("--live", action="store_true", help="Stream Windows system audio to live English captions.")
     parser.add_argument(
         "--live-source", choices=("system",), default="system", help="Live audio source (default: system)."
@@ -1550,7 +1375,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--live-translation-mode",
         choices=("direct", "cascade"),
-        help="Live translation mode: direct English captions or cascade Spanish source plus English translation.",
+        help="Live translation mode: direct English captions or cascade source text plus English translation.",
     )
     parser.add_argument(
         "--live-preset",
@@ -1597,7 +1422,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--live-save-transcript", help="Write committed live English captions to this text file.")
     parser.add_argument(
         "--live-save-bilingual-transcript",
-        help="Write committed live Spanish source and English translation pairs to this text file.",
+        help="Write committed live source-language and English translation pairs to this text file.",
     )
     parser.add_argument(
         "--live-engine",
@@ -1631,6 +1456,39 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--translate-to-english",
         action="store_true",
         help="Use WhisperX translate mode so English SRT output is written directly.",
+    )
+    parser.add_argument(
+        "--english-output-mode",
+        choices=ENGLISH_OUTPUT_MODE_CHOICES,
+        help=(
+            "English output mode: off keeps source text, direct uses WhisperX translation, "
+            "post translates generated source files, auto post-translates Spanish/German."
+        ),
+    )
+    parser.add_argument(
+        "--post-translate-to-english",
+        action="store_true",
+        help="Shortcut for --english-output-mode post.",
+    )
+    parser.add_argument(
+        "--translation-backend",
+        choices=TRANSLATION_BACKEND_CHOICES,
+        default=DEFAULT_TRANSLATION_BACKEND,
+        help="Post-translation backend (default: server).",
+    )
+    parser.add_argument(
+        "--translation-model",
+        help=f"Model name for post-translation server requests (default: {DEFAULT_TRANSLATION_MODEL}).",
+    )
+    parser.add_argument(
+        "--translation-server-url",
+        help="OpenAI-compatible local server base URL for post-translation, e.g. http://localhost:8000/v1.",
+    )
+    parser.add_argument(
+        "--save-source-srt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep the source-language SRT beside English output (default: on).",
     )
     parser.add_argument(
         "--temperature",
@@ -1801,6 +1659,10 @@ def parse_legacy(tokens: Iterable[str]) -> LegacyOptions:
             opt.language = "es"
             opt.language_locked = True
             continue
+        if low in {"g", "de", "ger", "german", "deutsch"}:
+            opt.language = "de"
+            opt.language_locked = True
+            continue
         if low in {"t", "tr", "translate"}:
             opt.language = "es"
             opt.language_locked = True
@@ -1829,13 +1691,15 @@ def prompt_input_path() -> str | None:
 def prompt_language(current: str) -> str:
     if not sys.stdin.isatty():
         return current
-    choice = input("Language [Enter=Auto, e=English, s=Spanish]: ").strip().lower()
+    choice = input("Language [Enter=Auto, e=English, s=Spanish, g=German]: ").strip().lower()
     if choice in {"", "a", "auto"}:
         return "auto"
     if choice in {"s", "es"}:
         return "es"
     if choice in {"e", "en"}:
         return "en"
+    if choice in {"g", "de", "ger", "german", "deutsch"}:
+        return "de"
     return current
 
 
@@ -1847,6 +1711,25 @@ def prompt_mode(current: str) -> str:
         return "fast"
     if choice in {"q", "quality", ""}:
         return "quality"
+    return current
+
+
+def default_english_output_mode(mode: str) -> str:
+    return "off" if mode == "fast" else "auto"
+
+
+def prompt_english_output_mode(current: str) -> str:
+    if not sys.stdin.isatty():
+        return current
+    choice = (
+        input(f"Convert generated output to English [Enter={current}, off/post/direct/auto; recommended=post]: ")
+        .strip()
+        .lower()
+    )
+    if not choice:
+        return current
+    if choice in ENGLISH_OUTPUT_MODE_CHOICES:
+        return choice
     return current
 
 
@@ -1922,15 +1805,25 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
     if not model_locked:
         model = "medium" if is_fast_mode else "large-v3"
 
+    english_output_mode = args.english_output_mode or default_english_output_mode(mode)
+    english_output_mode_locked = bool(
+        args.english_output_mode or args.post_translate_to_english or args.translate_to_english
+    )
+    if args.post_translate_to_english:
+        english_output_mode = "post"
+    if args.translate_to_english:
+        english_output_mode = "direct"
+    if interactive and not english_output_mode_locked:
+        english_output_mode = prompt_english_output_mode(english_output_mode)
+    direct_whisper_translate = english_output_mode == "direct"
+    post_translate_to_english = english_output_mode in {"post", "auto"}
+
     temperature = 0.0
     compression_ratio_threshold = 2.4
     logprob_threshold = -1.0
     no_speech_threshold = 0.6
-    translation_context_window = TRANSLATION_CONTEXT_WINDOW
     translation_batch_size = 4
-    translation_num_beams = TRANSLATION_NUM_BEAMS
     translation_max_new_tokens = 256
-    translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
     temperature_schedule: tuple[float, ...]
 
     if is_fast_mode:
@@ -2005,11 +1898,18 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         prompt_file=args.asr_prompt_file,
     )
 
-    translate_to_english = bool(args.translate_to_english) or language == "es"
+    translate_to_english = direct_whisper_translate
 
     cfg = RunConfig(
         language=language,
         translate_to_english=translate_to_english,
+        english_output_mode=english_output_mode,
+        direct_whisper_translate=direct_whisper_translate,
+        post_translate_to_english=post_translate_to_english,
+        translation_backend=args.translation_backend,
+        translation_model=args.translation_model,
+        translation_server_url=args.translation_server_url,
+        save_source_srt=bool(args.save_source_srt),
         write_llm_txt=True,
         mode=mode,
         model=model or "large-v3",
@@ -2035,11 +1935,8 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         low_confidence_word_prob=float(args.low_confidence_word_prob),
         device=args.device,
         compute_type=args.compute_type,
-        translation_context_window=translation_context_window,
         translation_batch_size=translation_batch_size,
-        translation_num_beams=translation_num_beams,
         translation_max_new_tokens=translation_max_new_tokens,
-        translation_no_repeat_ngram_size=translation_no_repeat_ngram_size,
         glossary=glossary,
         glossary_path=glossary_path,
         asr_prompt=asr_prompt,
@@ -2060,10 +1957,44 @@ def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool =
     return OutputPaths(
         output_dir=output_dir,
         srt_path=srt_path,
+        source_srt_path=output_dir / f"{base}.source.srt",
+        english_srt_path=output_dir / f"{base}.en.srt",
+        translation_report_path=output_dir / f"{base}.translation.json",
         llm_path=output_dir / f"{base}_llm.txt",
         log_path=log_dir / f"{base}_whisperx.log",
         lock_path=output_dir / f"{base}{LOCK_SUFFIX}",
         status_path=status_utils.status_path_for_srt(srt_path),
+    )
+
+
+def normalize_language_code(language: str | None) -> str:
+    return (language or "").strip().lower().split("-", 1)[0]
+
+
+def source_srt_path_for_language(outputs: OutputPaths, source_lang: str | None) -> Path:
+    language = normalize_language_code(source_lang)
+    if language and language != "auto":
+        return outputs.srt_path.with_name(f"{outputs.srt_path.stem}.{language}.srt")
+    return outputs.source_srt_path
+
+
+def resolved_source_language(cfg: RunConfig, detected_language: str | None) -> str:
+    if cfg.language != "auto":
+        return normalize_language_code(cfg.language)
+    return normalize_language_code(detected_language)
+
+
+def should_post_translate_to_english(cfg: RunConfig, source_lang: str | None) -> bool:
+    language = normalize_language_code(source_lang)
+    if cfg.direct_whisper_translate or not cfg.post_translate_to_english:
+        return False
+    return language in SUPPORTED_POST_TRANSLATION_LANGS
+
+
+def build_post_translation_backend(cfg: RunConfig) -> ServerTranslationBackend:
+    return ServerTranslationBackend(
+        server_url=cfg.translation_server_url or "",
+        model_name=cfg.translation_model or DEFAULT_TRANSLATION_MODEL,
     )
 
 
@@ -2089,6 +2020,9 @@ def make_watch_target(cfg: RunConfig, watch_dir: Path) -> WatchTarget:
                 cfg,
                 language="es",
                 translate_to_english=True,
+                english_output_mode="direct",
+                direct_whisper_translate=True,
+                post_translate_to_english=False,
                 write_llm_txt=False,
                 speaker_labels=False,
                 diarize=False,
@@ -2303,7 +2237,7 @@ def run_whisperx_direct(
     torch_module = import_optional_module("torch")
 
     whisper_language = None if cfg.language == "auto" else cfg.language
-    whisper_task = "translate" if cfg.translate_to_english else "transcribe"
+    whisper_task = "translate" if cfg.direct_whisper_translate else "transcribe"
 
     print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...", flush=True)
     asr_options = {"beam_size": cfg.beam_size, "patience": cfg.patience}
@@ -2347,7 +2281,7 @@ def run_whisperx_direct(
 
     detected_language = str(result.get("language") or "").strip().lower() or None
 
-    align_language = "en" if cfg.translate_to_english else (detected_language or whisper_language or "en")
+    align_language = "en" if cfg.direct_whisper_translate else (detected_language or whisper_language or "en")
     print(f"[transcriber] Aligning words for language={align_language}...", flush=True)
     try:
         language_code = align_language
@@ -2434,13 +2368,15 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
     report(f'Status:    "{outputs.status_path}"')
     report(f'OutDir:    "{outputs.output_dir}"')
     report(f"Lang:      {cfg.language}")
-    if cfg.language == "auto":
-        if cfg.translate_to_english:
-            report("Translate: whisperx (direct English output)")
-        else:
-            report("Translate: auto (Spanish -> English when detected)")
+    report(f"English:   {cfg.english_output_mode}")
+    if cfg.english_output_mode == "direct":
+        report("Translate: whisperx (direct English output)")
+    elif cfg.english_output_mode == "post":
+        report("Translate: post (source transcript -> English)")
+    elif cfg.english_output_mode == "auto":
+        report("Translate: auto (Spanish/German -> English post-translation)")
     else:
-        report(f"Translate: {'whisperx direct' if cfg.translate_to_english else 'off'}")
+        report("Translate: off")
     report(f"Mode:      {cfg.mode}")
     report(f"Model:     {cfg.model}")
     report(f"Speakers:  {'on' if cfg.speaker_labels else 'off'}")
@@ -2616,37 +2552,60 @@ def transcribe_file(
 
         try:
             require_valid_srt_file(working_srt_path)
-            should_translate = (not cfg.translate_to_english) and cfg.language == "auto" and detected_language == "es"
+            finalize_srt_file(working_srt_path)
+            require_valid_srt_file(working_srt_path)
+            source_lang = resolved_source_language(cfg, detected_language)
+            should_translate = should_post_translate_to_english(cfg, source_lang)
             if cfg.language == "auto":
                 report(f"Detected language: {detected_language or 'unknown'}.")
+            final_srt_for_outputs = working_srt_path
             if should_translate:
                 if cfg.glossary_path and not Path(cfg.glossary_path).expanduser().exists():
                     report(f'Glossary file not found: "{cfg.glossary_path}"')
-                report("Translating Spanish transcript to English text...")
+                source_srt_path = working_srt_path
+                if cfg.save_source_srt:
+                    source_srt_path = source_srt_path_for_language(outputs, source_lang)
+                    atomic_write_text(source_srt_path, working_srt_path.read_text(encoding="utf-8", errors="ignore"))
+                working_english_srt_path = temporary_sibling_path(outputs.english_srt_path, suffix=".srt.tmp")
+                report(f"Translating {source_lang} transcript to English text...")
                 try:
-                    translate_srt_to_english(
-                        working_srt_path,
-                        cfg.device,
+                    translate_generated_srt_to_english(
+                        source_srt_path=source_srt_path,
+                        english_srt_path=working_english_srt_path,
+                        source_lang=source_lang,
+                        backend=build_post_translation_backend(cfg),
                         glossary=cfg.glossary,
-                        glossary_spec=cfg.glossary_path,
-                        context_window=cfg.translation_context_window,
+                        device=cfg.device,
                         batch_size=cfg.translation_batch_size,
-                        num_beams=cfg.translation_num_beams,
                         max_new_tokens=cfg.translation_max_new_tokens,
-                        no_repeat_ngram_size=cfg.translation_no_repeat_ngram_size,
-                        log_path=outputs.log_path,
+                        report_path=outputs.translation_report_path,
+                        english_output_mode=cfg.english_output_mode,
                     )
+                    require_valid_srt_file(working_english_srt_path)
+                    atomic_replace_path(working_english_srt_path, outputs.english_srt_path)
+                    final_srt_for_outputs = outputs.english_srt_path
                 except Exception as exc:
                     append_log_message(outputs.log_path, f"[transcriber] Translation failed: {exc}")
                     report("")
                     report(f"Translation failed: {exc}")
                     report("Keeping the original transcript text.")
                     report("")
+                    with contextlib.suppress(OSError):
+                        working_english_srt_path.unlink()
+                    if cfg.english_output_mode == "post":
+                        raise RuntimeError(f"Explicit post-translation failed: {exc}") from exc
+            elif cfg.post_translate_to_english and not cfg.direct_whisper_translate and source_lang not in {"", "en"}:
+                message = f"Post-translation skipped: source language {source_lang!r} is not supported."
+                append_log_message(outputs.log_path, f"[transcriber] {message}")
+                report(message)
             if cfg.write_llm_txt:
-                build_llm_file(working_srt_path, outputs.llm_path)
-            finalize_srt_file(working_srt_path)
-            require_valid_srt_file(working_srt_path)
-            atomic_replace_path(working_srt_path, outputs.srt_path)
+                build_llm_file(final_srt_for_outputs, outputs.llm_path)
+            if same_path(final_srt_for_outputs, working_srt_path):
+                atomic_replace_path(working_srt_path, outputs.srt_path)
+            else:
+                atomic_write_text(outputs.srt_path, final_srt_for_outputs.read_text(encoding="utf-8", errors="ignore"))
+                with contextlib.suppress(OSError):
+                    working_srt_path.unlink()
             write_status("succeeded")
         except Exception as exc:
             append_log_message(outputs.log_path, f"[transcriber] Output finalization failed: {exc}")

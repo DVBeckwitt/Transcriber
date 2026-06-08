@@ -1,11 +1,13 @@
 # Transcriber
 
 Local WhisperX launcher for fast transcription from audio/video files.
-It can transcribe first, or ask WhisperX to translate directly into English output when you want an English SRT from Spanish audio.
+It can transcribe first, convert generated Spanish/German files to English through a local OpenAI-compatible translation server, or use WhisperX direct English translation for legacy Spanish workflows.
 
 It generates:
 - `your_file.srt` subtitle transcript
 - `your_file_llm.txt` clean text block for LLM workflows
+- optional `your_file.es.srt` / `your_file.de.srt` source subtitles plus `your_file.en.srt` English subtitles when post-translation is enabled
+- optional `your_file.translation.json` audit metadata for post-translation runs
 - `logs/your_file_whisperx.log` full run log in the project folder
 - `logs/transcriber-watcher.log` watch-mode activity log in the project folder
 
@@ -34,11 +36,18 @@ Live caption mode has heavier optional dependencies and requires Python 3.11+:
 pip install -e ".[live]"
 ```
 
-With `uv`, use a Python 3.11+ environment and install the optional live extra:
+Local post-translation through an OpenAI-compatible server uses the lightweight `translation-server` extra:
+
+```powershell
+pip install -e ".[translation-server]"
+```
+
+With `uv`, use a Python 3.11+ environment and install optional extras as needed:
 
 ```powershell
 $env:UV_PROJECT_ENVIRONMENT = ".uv-venv"
 uv sync --extra live
+uv sync --extra translation-server
 ```
 
 ## Development
@@ -85,6 +94,7 @@ Project workflow and governance:
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
+- File English conversion: ready for release. `--english-output-mode` is visible in the normal settings flow and supports `off`, `direct`, `post`, and `auto`. Server post-translation is local-only by default, batches subtitle cues, preserves source `.es.srt` / `.de.srt`, and writes English `.en.srt` plus compatibility `.srt` when translation succeeds. Explicit `post` fails if the local server is missing or translation fails; `auto` warns and keeps source output when post-translation is unavailable.
 - Live caption mode: startup smoke passed with the `live` extra installed. The latency launcher remains direct English and writes `logs\live_english_transcript.txt` by default. The quality launcher uses cascade mode, writes English and bilingual logs, applies mode-aware Spanish prompts, and prints audio diagnostics. The previous direct-mode bilingual log bug is fixed by rejecting bilingual transcript output unless cascade mode is selected. Full live audio validation with Windows loopback input is still pending.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, transcript merge collection, speaker-label prompt/config control flow, and live translation-mode helper/parser cleanup were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
@@ -107,9 +117,11 @@ Important:
   - https://hf.co/pyannote/segmentation-3.0
 
 Optional:
-- Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology during Spanish-to-English translation.
+- Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology during post-translation.
 - Add `--asr-prompt` or `--asr-prompt-file` to bias WhisperX toward names and jargon during transcription.
-- Add `--translate-to-english` to use WhisperX translation mode so the `.srt` is written in English directly instead of generating a Spanish SRT first.
+- Add `--english-output-mode post` to transcribe the source language first, then convert generated Spanish/German output to English.
+- Add `--english-output-mode auto` to post-translate Spanish/German, skip English, and keep unsupported languages in the source language.
+- Add `--translate-to-english` or `--english-output-mode direct` to use legacy WhisperX translation mode so the `.srt` is written in English directly.
 - Add `--no-speaker-labels` when you do not want `SPEAKER_00:` style labels in the SRT; this also skips diarization and the Hugging Face token requirement.
 - Use `--temperature-schedule`, `--best-of`, `--logprob-threshold`, and related options to control decode fallbacks.
 
@@ -253,10 +265,31 @@ Spanish source audio with direct English SRT output:
 transcriber --input "C:\media\call.wav" --lang es --translate-to-english
 ```
 
-Spanish audio translated to English:
+Auto-detect source language without forced English conversion:
 
 ```powershell
 transcriber --input "C:\media\call.wav" --lang auto
+```
+
+Maximum-accuracy English output from Spanish or German source subtitles:
+
+```powershell
+transcriber --input "C:\media\call.wav" --lang auto --mode quality --english-output-mode post --translation-backend server --translation-server-url http://localhost:8000/v1
+```
+
+Local Tower+ server example:
+
+```powershell
+vllm serve Unbabel/Tower-Plus-72B
+transcriber --input "C:\media\call.wav" --english-output-mode post --translation-backend server --translation-server-url http://localhost:8000/v1
+```
+
+`--translation-server-url` accepts localhost or loopback HTTP(S) URLs such as `http://localhost:8000/v1` or `http://127.0.0.1:8000/v1`. Remote URLs are rejected by default so transcript text is not accidentally sent off-machine.
+
+German source audio:
+
+```powershell
+transcriber --input "C:\media\meeting.mp4" --lang de
 ```
 
 Write subtitles without speaker labels:
@@ -298,6 +331,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - WhisperX receives an initial prompt built from `--asr-prompt`, `--asr-prompt-file`, and glossary terms when present.
 - Quality mode uses a fallback temperature schedule by default; fast mode uses a single-pass decode.
 - Interactive one-off runs prompt for language, quality/fast mode, and speaker labels unless those choices are already provided with CLI arguments.
+- Interactive one-off runs also expose `Convert generated output to English` with `off`, `post`, `direct`, and `auto` choices. Quality mode defaults to `auto`; fast mode defaults to `off`.
 - Watch mode monitors the top level of the watched folder for supported media files.
 - The default recordings watcher also monitors `%USERPROFILE%\Videos\escuela` for supported video files.
 - Watch mode waits for a file to stop changing before transcription starts.
@@ -307,16 +341,20 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - Default mode presets:
   - `quality`: model `large-v3`, speaker labels and diarization on by default
   - `fast`: model `medium`, speaker labels and diarization off by default
-- Language is auto-detected unless you force `--lang en` or `--lang es`.
-- If you pass `--translate-to-english`, WhisperX writes English subtitle text directly.
-- If the detected language is Spanish and `--translate-to-english` is not set, the launcher falls back to the existing post-translation step.
+- Language is auto-detected unless you force `--lang en`, `--lang es`, or `--lang de`.
+- `--english-output-mode off` keeps generated subtitles/transcripts in the detected or forced source language.
+- `--english-output-mode direct` or `--translate-to-english` asks WhisperX to write English subtitle text directly.
+- `--english-output-mode post` transcribes Spanish/German source first, writes `your_file.es.srt` or `your_file.de.srt`, then writes English `your_file.en.srt` and compatibility `your_file.srt`.
+- In explicit `post` mode, missing local server configuration or translation failure marks the run failed instead of silently producing source-only output.
+- `--english-output-mode auto` post-translates Spanish/German when the local server is available, skips translation for English, and keeps unsupported or failed post-translation output in the source language with a warning.
+- Post-translation writes `your_file.translation.json` with backend/model, cue count, warnings, and selected English mode. It does not include the transcript text.
 - If speaker labels are disabled, the launcher skips diarization and writes SRT text without `SPEAKER_00:` prefixes.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
 - Live mode is separate from file/watch transcription. It captures Windows PC speaker output through WASAPI loopback, converts it to 16 kHz mono signed 16-bit PCM, streams it to a local WhisperLiveKit server at `/asr` with the LocalAgreement backend policy, and displays committed captions plus one replaceable partial line in a small always-on-top Tkinter window.
 - `--live-translation-mode direct` uses WhisperLiveKit direct English translation for fastest captions. In this mode WLK committed `text` is already English, so bilingual transcript output is rejected to avoid labeling English as Spanish.
-- `--live-translation-mode cascade` uses WhisperLiveKit `--target-language en` so committed `text` is Spanish source text and `translation` is English. Use this mode when a real Spanish/English transcript is required.
+- `--live-translation-mode cascade` uses WhisperLiveKit `--target-language en` so committed `text` is source-language text and `translation` is English. Use this mode when a real source/English transcript is required.
 - `--live-preset quality` defaults to cascade mode, model `medium`, the Faster-Whisper backend, beam decoding, CTranslate2 NLLB translation, and a Spanish-to-English static prompt for the known `casarse` / `hunt` failure mode. Explicit live flags still override preset defaults.
 - `--live-static-prompt` is passed to WhisperLiveKit as a static prompt that does not scroll out of context. Existing `--asr-prompt`, `--asr-prompt-file`, and glossary flags still feed the regular initial prompt.
 - `--live-audio-diagnostics` prints input sample rate, channel count, output chunk bytes, RMS level, peak level, queue depth, dropped chunk count, queue-delay estimate, and WhisperLiveKit lag when available.
@@ -325,18 +363,24 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - The latency preset keeps a bounded queue and may drop the oldest chunk when behind. The quality preset uses an unbounded queue, does not intentionally drop audio, and may show growing lag when the machine cannot keep up.
 - Live mode never enables diarization, never renders speaker labels, never loads Hugging Face tokens, and does not write SRT or `*_llm.txt` files.
 - `--live-save-transcript` can write the current committed English caption lines to a text file while live mode runs.
-- `--live-save-bilingual-transcript` writes committed Spanish source and English translation pairs to a text file, and requires `--live-translation-mode cascade`.
+- `--live-save-bilingual-transcript` writes committed source-language and English translation pairs to a text file, and requires `--live-translation-mode cascade`. The evaluator remains Spanish-specific and expects `ES:` / `EN:` pairs.
 - Closing the caption window or pressing `Ctrl+C` stops capture and terminates the local WhisperLiveKit subprocess.
 
 ## CLI options
 
 ```text
 --input, -i        Path to audio/video file
---lang             auto | en | es
+--lang             auto | en | es | de
 --glossary         Glossary entry: 'source=target' or 'source' to preserve (repeatable)
 --glossary-file    Glossary text file (one entry per line)
 --asr-prompt       Optional text prompt to bias WhisperX toward names and jargon
 --asr-prompt-file  Text file with extra ASR prompt lines
+--english-output-mode  off | direct | post | auto
+--post-translate-to-english  Shortcut for --english-output-mode post
+--translation-backend  server
+--translation-model    Model name for the local translation server
+--translation-server-url  OpenAI-compatible localhost/loopback server base URL
+--save-source-srt / --no-save-source-srt
 --translate-to-english  Use WhisperX translation mode to write English subtitles directly
 --temperature      Single decoding temperature
 --temperature-schedule  Comma-separated fallback temperatures
@@ -388,7 +432,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 --live-audio-diagnostics   Print live audio levels, queue state, and lag
 --live-no-window           Run live mode without the caption popup
 --live-save-transcript     Write committed live captions to a text file
---live-save-bilingual-transcript  Write committed Spanish/English live caption pairs to a text file
+--live-save-bilingual-transcript  Write committed source/English live caption pairs to a text file
 --live-engine              whisperlivekit
 --seconds                  Seconds to record for --live-loopback-test
 --output                   WAV path for --live-loopback-test

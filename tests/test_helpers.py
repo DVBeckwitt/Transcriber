@@ -21,7 +21,6 @@ from transcriber.__main__ import (
     ESCUELA_RENAME_STRATEGY,
     VIDEO_EXTENSIONS,
     RunConfig,
-    SRTCue,
     TimedToken,
     apply_confidence_cleanup,
     build_asr_prompt,
@@ -29,7 +28,6 @@ from transcriber.__main__ import (
     build_config,
     build_segment_fallback_cues,
     build_srt_cues_from_result,
-    build_translation_prompt,
     build_watch_targets,
     is_watchable_media,
     load_translation_glossary,
@@ -47,15 +45,22 @@ from transcriber.__main__ import (
     smooth_timed_tokens,
     transcribe_file,
     translate_spanish_texts,
-    translation_context_for_cue,
 )
-from transcriber.preflight import PreflightReport
+from transcriber.preflight import PreflightReport, check_transcription_preflight
+from transcriber.translation import TranslationRequest, TranslationResult
 
 
 def make_cfg(**overrides: object) -> RunConfig:
     cfg = RunConfig(
         language="auto",
         translate_to_english=False,
+        english_output_mode="off",
+        direct_whisper_translate=False,
+        post_translate_to_english=False,
+        translation_backend="server",
+        translation_model=None,
+        translation_server_url=None,
+        save_source_srt=True,
         write_llm_txt=True,
         mode="quality",
         model="large-v3",
@@ -81,11 +86,8 @@ def make_cfg(**overrides: object) -> RunConfig:
         low_confidence_word_prob=0.5,
         device="cpu",
         compute_type="float32",
-        translation_context_window=2,
         translation_batch_size=4,
-        translation_num_beams=4,
         translation_max_new_tokens=256,
-        translation_no_repeat_ngram_size=3,
         glossary={},
         glossary_path=None,
         asr_prompt=None,
@@ -113,11 +115,49 @@ def speaker_labeled_result() -> dict[str, Any]:
     }
 
 
+class FakePostTranslationBackend:
+    name = "fake"
+    model_name = "fake-model"
+
+    def translate_texts(
+        self,
+        request: TranslationRequest,
+        *,
+        device: str,
+        batch_size: int,
+        max_new_tokens: int,
+    ) -> TranslationResult:
+        return TranslationResult(
+            texts=[f"EN: {text}" for text in request.texts],
+            backend=self.name,
+            model=self.model_name,
+            warnings=[],
+        )
+
+
+class FailingPostTranslationBackend:
+    name = "failing"
+    model_name = "failing-model"
+
+    def translate_texts(
+        self,
+        request: TranslationRequest,
+        *,
+        device: str,
+        batch_size: int,
+        max_new_tokens: int,
+    ) -> TranslationResult:
+        raise RuntimeError("server unavailable")
+
+
 class HelperTests(unittest.TestCase):
     def test_build_config_defaults_to_auto(self) -> None:
         cfg = build_config(parse_args([]), interactive=False)
         self.assertEqual(cfg.language, "auto")
         self.assertFalse(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "auto")
+        self.assertFalse(cfg.direct_whisper_translate)
+        self.assertTrue(cfg.post_translate_to_english)
         self.assertTrue(cfg.speaker_labels)
         self.assertTrue(cfg.diarize)
 
@@ -125,6 +165,7 @@ class HelperTests(unittest.TestCase):
         cfg = build_config(parse_args(["--mode", "fast"]), interactive=False)
         self.assertFalse(cfg.speaker_labels)
         self.assertFalse(cfg.diarize)
+        self.assertEqual(cfg.english_output_mode, "off")
 
     def test_speaker_label_flags_control_diarization(self) -> None:
         labels_cfg = build_config(parse_args(["--speaker-labels"]), interactive=False)
@@ -145,7 +186,7 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(no_diarize_cfg.diarize)
 
     @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
-    @patch("builtins.input", return_value="n")
+    @patch("builtins.input", side_effect=["off", "n"])
     def test_interactive_prompt_can_disable_quality_speaker_labels(
         self,
         _input: MagicMock,
@@ -157,7 +198,7 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(cfg.diarize)
 
     @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
-    @patch("builtins.input", return_value="y")
+    @patch("builtins.input", side_effect=["off", "y"])
     def test_interactive_prompt_can_enable_fast_speaker_labels(
         self,
         _input: MagicMock,
@@ -168,8 +209,9 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(cfg.speaker_labels)
         self.assertTrue(cfg.diarize)
 
-    @patch("builtins.input")
-    def test_speaker_label_flags_skip_interactive_prompt(self, prompt: MagicMock) -> None:
+    @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", return_value="off")
+    def test_speaker_label_flags_skip_speaker_prompt(self, prompt: MagicMock, _isatty: MagicMock) -> None:
         cfg = build_config(
             parse_args(["--lang", "en", "--mode", "quality", "--no-speaker-labels"]),
             interactive=True,
@@ -177,15 +219,74 @@ class HelperTests(unittest.TestCase):
 
         self.assertFalse(cfg.speaker_labels)
         self.assertFalse(cfg.diarize)
-        prompt.assert_not_called()
+        prompt.assert_called_once()
 
     def test_translate_flag_enables_direct_whisperx_output(self) -> None:
         cfg = build_config(parse_args(["--translate-to-english"]), interactive=False)
         self.assertTrue(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "direct")
+        self.assertTrue(cfg.direct_whisper_translate)
+        self.assertFalse(cfg.post_translate_to_english)
+
+    def test_english_output_mode_post_sets_post_translation(self) -> None:
+        cfg = build_config(parse_args(["--english-output-mode", "post"]), interactive=False)
+
+        self.assertFalse(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "post")
+        self.assertFalse(cfg.direct_whisper_translate)
+        self.assertTrue(cfg.post_translate_to_english)
+
+    def test_post_translate_shortcut_sets_post_translation(self) -> None:
+        cfg = build_config(parse_args(["--post-translate-to-english"]), interactive=False)
+
+        self.assertEqual(cfg.english_output_mode, "post")
+        self.assertTrue(cfg.post_translate_to_english)
+
+    @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", side_effect=["post", "n"])
+    def test_interactive_prompt_can_select_post_english_conversion(
+        self,
+        _input: MagicMock,
+        _isatty: MagicMock,
+    ) -> None:
+        cfg = build_config(parse_args(["--lang", "es", "--mode", "quality"]), interactive=True)
+
+        self.assertEqual(cfg.english_output_mode, "post")
+        self.assertTrue(cfg.post_translate_to_english)
 
     def test_spanish_language_defaults_to_translation(self) -> None:
         cfg = build_config(parse_args(["--lang", "es"]), interactive=False)
-        self.assertTrue(cfg.translate_to_english)
+        self.assertFalse(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "auto")
+        self.assertTrue(cfg.post_translate_to_english)
+
+    def test_german_language_defaults_to_auto_post_translation(self) -> None:
+        cfg = build_config(parse_args(["--lang", "de"]), interactive=False)
+
+        self.assertEqual(cfg.language, "de")
+        self.assertFalse(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "auto")
+        self.assertTrue(cfg.post_translate_to_english)
+
+    def test_german_legacy_language_token_is_supported(self) -> None:
+        cfg = build_config(parse_args(["g"]), interactive=False)
+
+        self.assertEqual(cfg.language, "de")
+        self.assertFalse(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "auto")
+
+    @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", side_effect=["g", "auto"])
+    def test_interactive_prompt_accepts_german(
+        self,
+        _input: MagicMock,
+        _isatty: MagicMock,
+    ) -> None:
+        cfg = build_config(parse_args(["--mode", "quality", "--no-speaker-labels"]), interactive=True)
+
+        self.assertEqual(cfg.language, "de")
+        self.assertFalse(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "auto")
 
     def test_temperature_schedule_parser(self) -> None:
         self.assertEqual(parse_temperature_schedule("0.0, 0.2,0.4"), (0.0, 0.2, 0.4))
@@ -257,6 +358,8 @@ class HelperTests(unittest.TestCase):
         self.assertEqual([target.watch_dir for target in targets], [DEFAULT_WATCH_DIR, DEFAULT_ESCUELA_WATCH_DIR])
         self.assertEqual(targets[0].cfg.language, "auto")
         self.assertTrue(targets[1].cfg.translate_to_english)
+        self.assertEqual(targets[1].cfg.english_output_mode, "direct")
+        self.assertTrue(targets[1].cfg.direct_whisper_translate)
         self.assertEqual(targets[1].cfg.language, "es")
         self.assertFalse(targets[1].cfg.speaker_labels)
         self.assertFalse(targets[1].cfg.diarize)
@@ -272,6 +375,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(targets[0].watch_dir, DEFAULT_ESCUELA_WATCH_DIR)
         self.assertEqual(targets[0].cfg.language, "es")
         self.assertTrue(targets[0].cfg.translate_to_english)
+        self.assertEqual(targets[0].cfg.english_output_mode, "direct")
         self.assertFalse(targets[0].cfg.speaker_labels)
         self.assertFalse(targets[0].cfg.diarize)
         self.assertFalse(targets[0].cfg.write_llm_txt)
@@ -290,6 +394,17 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(outputs.llm_path.parent, source.parent)
             self.assertEqual(outputs.lock_path.parent, source.parent)
             self.assertEqual(outputs.log_path.parent, project_dir() / "logs")
+
+    def test_output_paths_include_post_translation_files(self) -> None:
+        cfg = make_cfg()
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.mp4"
+            source.write_bytes(b"data")
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+
+            self.assertEqual(outputs.source_srt_path, source.parent / "meeting.source.srt")
+            self.assertEqual(outputs.english_srt_path, source.parent / "meeting.en.srt")
+            self.assertEqual(outputs.translation_report_path, source.parent / "meeting.translation.json")
 
     def test_output_paths_include_status_file(self) -> None:
         cfg = make_cfg()
@@ -372,6 +487,218 @@ class HelperTests(unittest.TestCase):
             self.assertFalse(list(source.parent.glob(".*.srt.tmp")))
             self.assertIsNotNone(record)
             self.assertEqual((record or {}).get("status"), "succeeded")
+
+    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_post_translates_spanish_and_preserves_source_srt(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+        _backend: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="es",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            speaker_labels=False,
+            diarize=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nSPEAKER_00: Hola\n", encoding="utf-8")
+                return 0, "es"
+
+            run_logged.side_effect = fake_run
+
+            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
+            outputs = output_paths_for_input(source, cfg)
+            record = status_utils.read_status_file(outputs.status_path) or {}
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                (source.parent / "meeting.es.srt").read_text(encoding="utf-8").strip().splitlines()[-1],
+                "SPEAKER_00: Hola",
+            )
+            self.assertIn("SPEAKER_00: EN: Hola", outputs.english_srt_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                outputs.srt_path.read_text(encoding="utf-8"), outputs.english_srt_path.read_text(encoding="utf-8")
+            )
+            self.assertIn("SPEAKER_00: EN: Hola", outputs.llm_path.read_text(encoding="utf-8"))
+            self.assertEqual(record.get("english_output_mode"), "post")
+
+    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_auto_post_translates_german_when_detected(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+        _backend: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="auto",
+            english_output_mode="auto",
+            post_translate_to_english=True,
+            speaker_labels=False,
+            diarize=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHallo\n", encoding="utf-8")
+                return 0, "de"
+
+            run_logged.side_effect = fake_run
+
+            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
+            outputs = output_paths_for_input(source, cfg)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((source.parent / "meeting.de.srt").exists())
+            self.assertIn("EN: Hallo", outputs.english_srt_path.read_text(encoding="utf-8"))
+
+    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_honors_no_save_source_srt(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+        _backend: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="es",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            save_source_srt=False,
+            speaker_labels=False,
+            diarize=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHola\n", encoding="utf-8")
+                return 0, "es"
+
+            run_logged.side_effect = fake_run
+
+            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
+            outputs = output_paths_for_input(source, cfg)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse((source.parent / "meeting.es.srt").exists())
+            self.assertTrue(outputs.english_srt_path.exists())
+
+    @patch("transcriber.__main__.build_post_translation_backend")
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_post_mode_skips_english_source(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+        backend: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="en",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            speaker_labels=False,
+            diarize=False,
+            write_llm_txt=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+                return 0, "en"
+
+            run_logged.side_effect = fake_run
+
+            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
+            outputs = output_paths_for_input(source, cfg)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(outputs.srt_path.read_text(encoding="utf-8").strip().splitlines()[-1], "Hello")
+            self.assertFalse(outputs.english_srt_path.exists())
+            backend.assert_not_called()
+
+    @patch("transcriber.__main__.build_post_translation_backend", return_value=FailingPostTranslationBackend())
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_explicit_post_fails_when_translation_fails(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+        _backend: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="es",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            speaker_labels=False,
+            diarize=False,
+            write_llm_txt=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHola\n", encoding="utf-8")
+                return 0, "es"
+
+            run_logged.side_effect = fake_run
+
+            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
+            outputs = output_paths_for_input(source, cfg)
+            record = status_utils.read_status_file(outputs.status_path) or {}
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(record.get("status"), "failed")
+            self.assertIn("Explicit post-translation failed", str(record.get("error")))
+            self.assertTrue((source.parent / "meeting.es.srt").exists())
+            self.assertFalse(outputs.srt_path.exists())
+            self.assertFalse(outputs.english_srt_path.exists())
 
     @patch("transcriber.__main__.resolve_input_path")
     @patch("transcriber.__main__.transcribe_file")
@@ -567,15 +894,12 @@ class HelperTests(unittest.TestCase):
             self.assertTrue((dest_dir / f"{expected_base}.mp4").exists())
             self.assertTrue((dest_dir / f"{expected_base}.srt").exists())
 
-    def test_glossary_parsing_and_prompt(self) -> None:
+    def test_glossary_parsing(self) -> None:
         glossary = parse_glossary_entries(["OpenAI => OpenAI", "esfuerzo|effort", "termino"])
-        prompt = build_translation_prompt(model_name="model", context_window=1, glossary=glossary)
 
         self.assertEqual(glossary["OpenAI"], "OpenAI")
         self.assertEqual(glossary["esfuerzo"], "effort")
         self.assertEqual(glossary["termino"], "termino")
-        self.assertIn("__CUR_START__", prompt)
-        self.assertIn("Glossary:", prompt)
 
     def test_asr_prompt_includes_glossary_and_file_terms(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -610,15 +934,6 @@ class HelperTests(unittest.TestCase):
 
             self.assertEqual(glossary["OpenAI"], "OpenAI")
 
-    def test_translation_context_includes_neighbors(self) -> None:
-        cues = [
-            SRTCue(index=1, start_ms=0, end_ms=1000, text="SPEAKER_1: Hola"),
-            SRTCue(index=2, start_ms=1000, end_ms=2000, text="SPEAKER_2: Que tal"),
-            SRTCue(index=3, start_ms=2000, end_ms=3000, text="SPEAKER_1: Bien"),
-        ]
-        context = translation_context_for_cue(cues, index=1, window=1)
-        self.assertEqual(context, [(-1, "Hola"), (1, "Bien")])
-
     @patch("transcriber.__main__.load_spanish_to_english_translator")
     def test_translation_uses_beam_search(self, load_translator: MagicMock) -> None:
         class FakeTensor:
@@ -645,6 +960,55 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(kwargs["length_penalty"], 1.0)
         self.assertEqual(kwargs["no_repeat_ngram_size"], 3)
         self.assertTrue(kwargs["early_stopping"])
+
+    @patch("transcriber.preflight.module_available", return_value=True)
+    def test_preflight_fails_when_explicit_post_translation_has_no_url(self, _module_available: MagicMock) -> None:
+        cfg = make_cfg(
+            language="de",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            translation_backend="server",
+            translation_server_url=None,
+            diarize=False,
+            device="cpu",
+        )
+
+        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
+
+        self.assertTrue(any("OpenAI-compatible" in error for error in report.errors))
+        self.assertFalse(any("Spanish auto-translation" in warning for warning in report.warnings))
+
+    @patch("transcriber.preflight.module_available", return_value=True)
+    def test_preflight_warns_when_auto_post_translation_has_no_url(self, _module_available: MagicMock) -> None:
+        cfg = make_cfg(
+            language="auto",
+            english_output_mode="auto",
+            post_translate_to_english=True,
+            translation_backend="server",
+            translation_server_url=None,
+            diarize=False,
+            device="cpu",
+        )
+
+        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
+
+        self.assertTrue(any("OpenAI-compatible" in warning for warning in report.warnings))
+        self.assertFalse(report.errors)
+
+    @patch("transcriber.preflight.module_available", return_value=True)
+    def test_preflight_does_not_warn_about_server_for_direct_translation(self, _module_available: MagicMock) -> None:
+        cfg = make_cfg(
+            english_output_mode="direct",
+            direct_whisper_translate=True,
+            post_translate_to_english=False,
+            translation_server_url=None,
+            diarize=False,
+            device="cpu",
+        )
+
+        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
+
+        self.assertFalse(any("OpenAI-compatible" in warning for warning in report.warnings))
 
     def test_confidence_cleanup_marks_low_confidence(self) -> None:
         cfg = make_cfg()
