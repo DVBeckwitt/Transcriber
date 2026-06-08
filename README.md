@@ -91,8 +91,8 @@ Project workflow and governance:
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
-- File English conversion: ready for release. `--english-output-mode` is visible in the normal settings flow and supports `off`, `direct`, `post`, and `auto`. Server post-translation is local-only by default, auto-starts a local vLLM server when no URL is supplied, falls back to default-distro WSL2 vLLM on Windows when native vLLM is unavailable, batches subtitle cues, preserves source `.es.srt` / `.de.srt`, and writes English `.en.srt` plus compatibility `.srt` when translation succeeds. Explicit `post` fails if the local server cannot start or translation fails; `auto` warns and keeps source output when post-translation is unavailable. The false preflight failure for missing `httpx` is fixed because post-translation now uses stdlib HTTP. Manual WSL2 smoke testing is pending on this workstation until WSL can start without `HCS_E_SERVICE_NOT_AVAILABLE`.
-- WSL2 post-translation server fallback: implemented and unit-tested on 2026-06-08. Windows native vLLM remains preferred; default-distro WSL2 vLLM is used only when native vLLM is unavailable. No CLI migration is required, and rollback is a normal git revert. Local manual verification is blocked on this workstation until Windows WSL/Virtual Machine Platform support can start Ubuntu successfully.
+- File English conversion: ready for release. `--english-output-mode` is visible in the normal settings flow and supports `off`, `direct`, `post`, and `auto`. Server post-translation is local-only by default, auto-starts a local vLLM server when no URL is supplied, falls back to default-distro WSL2 vLLM on Windows when native vLLM is unavailable, batches subtitle cues, preserves source `.es.srt` / `.de.srt`, and writes English `.en.srt` plus compatibility `.srt` when translation succeeds. Explicit `post` fails if the local server cannot start or translation fails; `auto` warns and keeps source output when post-translation is unavailable. The false preflight failure for missing `httpx` is fixed because post-translation now uses stdlib HTTP. The default local model is `utter-project/EuroLLM-1.7B-Instruct` for local 12 GB GPU compatibility.
+- WSL2 post-translation server fallback: ready for release and smoke-tested on 2026-06-08 with WSL vLLM serving `utter-project/EuroLLM-1.7B-Instruct` through the OpenAI-compatible localhost API. Windows native vLLM remains preferred; default-distro WSL2 vLLM is used only when native vLLM is unavailable. No CLI migration is required, and rollback is a normal git revert.
 - Live caption mode: startup smoke passed with the `live` extra installed. The latency launcher remains direct English and writes `logs\live_english_transcript.txt` by default. The quality launcher uses cascade mode, writes English and bilingual logs, applies mode-aware Spanish prompts, and prints audio diagnostics. The previous direct-mode bilingual log bug is fixed by rejecting bilingual transcript output unless cascade mode is selected. Full live audio validation with Windows loopback input is still pending.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, transcript merge collection, speaker-label prompt/config control flow, and live translation-mode helper/parser cleanup were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
@@ -275,14 +275,16 @@ Maximum-accuracy English output from Spanish or German source subtitles:
 transcriber --input "C:\media\call.wav" --lang auto --mode quality --english-output-mode post --translation-backend server
 ```
 
-Reuse an already-running local Tower+ server:
+Reuse an already-running local EuroLLM server:
 
 ```powershell
-vllm serve Unbabel/Tower-Plus-72B
+vllm serve utter-project/EuroLLM-1.7B-Instruct
 transcriber --input "C:\media\call.wav" --english-output-mode post --translation-backend server --translation-server-url http://localhost:8000/v1
 ```
 
 If `--translation-server-url` is omitted, post-translation auto-starts `vllm serve <translation model>` on `127.0.0.1`, waits for the OpenAI-compatible `/v1/models` endpoint, and stops that child process when translation finishes. Native Windows `vllm` is tried first. If it is missing on Windows, the launcher checks the default WSL2 distribution for `vllm` and starts it with `wsl -e sh -lc ...`. If `--translation-server-url` is supplied, the launcher reuses that existing server and does not stop it.
+
+The default post-translation model is `utter-project/EuroLLM-1.7B-Instruct`, a small European-language translation model chosen for local 12 GB GPU systems. Override it with `--translation-model` when you want to use another local server model.
 
 For the WSL2 fallback, WSL must be able to start, the default distribution must have `vllm` on its Linux `PATH`, and Windows localhost forwarding must be working. Install vLLM inside WSL with a Linux Python environment; do not install a Linux NVIDIA display driver inside WSL.
 
@@ -350,6 +352,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - In explicit `post` mode, the launcher auto-starts a local vLLM server when no server URL is supplied. On Windows it can start default-distro WSL2 vLLM when native vLLM is unavailable. Startup or translation failure marks the run failed instead of silently producing source-only output.
 - `--english-output-mode auto` post-translates Spanish/German when a local server can be reused or auto-started, skips translation for English, and keeps unsupported or failed post-translation output in the source language with a warning.
 - Post-translation writes `your_file.translation.json` with backend/model, cue count, warnings, and selected English mode. It does not include the transcript text.
+- Local model JSON/index mistakes are recovered when the server still returns exactly one translated text item per input cue; recovery warnings are written to the translation report. Changed cue/item counts fail for single-cue requests and trigger per-cue retry for larger batches, so subtitle timing is kept one-to-one or the run fails.
 - If speaker labels are disabled, the launcher skips diarization and writes SRT text without `SPEAKER_00:` prefixes.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
@@ -380,7 +383,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 --english-output-mode  off | direct | post | auto
 --post-translate-to-english  Shortcut for --english-output-mode post
 --translation-backend  server
---translation-model    Model name for the local translation server
+--translation-model    Model name for the local translation server (default: utter-project/EuroLLM-1.7B-Instruct)
 --translation-server-url  Optional OpenAI-compatible localhost/loopback server base URL; omitted means auto-start vLLM
 --save-source-srt / --no-save-source-srt
 --translate-to-english  Use WhisperX translation mode to write English subtitles directly

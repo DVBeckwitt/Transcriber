@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 from transcriber.io import atomic_write_text
 
 SUPPORTED_POST_TRANSLATION_LANGS = {"es", "de"}
-DEFAULT_TRANSLATION_MODEL = "Unbabel/Tower-Plus-72B"
+DEFAULT_TRANSLATION_MODEL = "utter-project/EuroLLM-1.7B-Instruct"
 GLOSSARY_PLACEHOLDER_TEMPLATE = "ZXGLOSSARY{index:03d}ZX"
 DEFAULT_TRANSLATION_SERVER_HOST = "127.0.0.1"
 DEFAULT_TRANSLATION_SERVER_PORT = 8000
@@ -52,6 +52,16 @@ class SubtitleCue:
     start: str
     end: str
     text: str
+
+
+@dataclass(frozen=True)
+class _ParsedTranslationBatch:
+    texts: list[str]
+    warnings: list[str]
+
+
+class _TranslationResponseFormatError(RuntimeError):
+    pass
 
 
 class TranslationBackend(Protocol):
@@ -480,16 +490,28 @@ class ServerTranslationBackend:
             return TranslationResult(texts=[], backend=self.name, model=self.model_name, warnings=[])
 
         translated: list[str] = []
+        warnings: list[str] = []
         for batch in _chunked_texts(request.texts, batch_size):
-            translated.extend(
-                self._translate_batch(
+            try:
+                batch_result = self._translate_batch(
                     source_lang=request.source_lang,
                     target_lang=request.target_lang,
                     texts=batch,
                     max_new_tokens=max_new_tokens,
                 )
-            )
-        return TranslationResult(texts=translated, backend=self.name, model=self.model_name, warnings=[])
+            except _TranslationResponseFormatError as exc:
+                if len(batch) <= 1:
+                    raise
+                batch_result = self._retry_batch_as_single_items(
+                    source_lang=request.source_lang,
+                    target_lang=request.target_lang,
+                    texts=batch,
+                    max_new_tokens=max_new_tokens,
+                    original_error=exc,
+                )
+            translated.extend(batch_result.texts)
+            warnings.extend(batch_result.warnings)
+        return TranslationResult(texts=translated, backend=self.name, model=self.model_name, warnings=warnings)
 
     def _translate_batch(
         self,
@@ -498,7 +520,7 @@ class ServerTranslationBackend:
         target_lang: str,
         texts: Sequence[str],
         max_new_tokens: int,
-    ) -> list[str]:
+    ) -> _ParsedTranslationBatch:
         items = [{"index": idx, "text": text} for idx, text in enumerate(texts)]
         payload = {
             "model": self.model_name,
@@ -534,6 +556,31 @@ class ServerTranslationBackend:
         )
         content = _chat_completion_content(data)
         return _parse_indexed_translation_content(content, expected_count=len(texts))
+
+    def _retry_batch_as_single_items(
+        self,
+        *,
+        source_lang: str,
+        target_lang: str,
+        texts: Sequence[str],
+        max_new_tokens: int,
+        original_error: _TranslationResponseFormatError,
+    ) -> _ParsedTranslationBatch:
+        translated: list[str] = []
+        warnings = [f"Retried translation batch as single-item requests after response format error: {original_error}"]
+        for text in texts:
+            try:
+                result = self._translate_batch(
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    texts=[text],
+                    max_new_tokens=max_new_tokens,
+                )
+            except _TranslationResponseFormatError as exc:
+                raise original_error from exc
+            translated.extend(result.texts)
+            warnings.extend(result.warnings)
+        return _ParsedTranslationBatch(texts=translated, warnings=warnings)
 
 
 def _chunked_texts(texts: Sequence[str], batch_size: int) -> list[Sequence[str]]:
@@ -600,29 +647,35 @@ def _chat_completion_content(data: Any) -> str:
     return content
 
 
-def _parse_indexed_translation_content(content: str, *, expected_count: int) -> list[str]:
+def _parse_indexed_translation_content(content: str, *, expected_count: int) -> _ParsedTranslationBatch:
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Translation server response was not valid JSON.") from exc
+        raise _TranslationResponseFormatError("Translation server response was not valid JSON.") from exc
 
     raw_items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(raw_items, list):
-        raise RuntimeError("Translation server JSON did not contain an items array.")
+        raise _TranslationResponseFormatError("Translation server JSON did not contain an items array.")
+    if len(raw_items) != expected_count:
+        raise _TranslationResponseFormatError("Translation server returned an unexpected item count.")
 
     translated: dict[int, str] = {}
+    positional_texts: list[str] = []
     for raw_item in raw_items:
         if not isinstance(raw_item, dict):
-            raise RuntimeError("Translation server item was not an object.")
+            raise _TranslationResponseFormatError("Translation server item was not an object.")
         index = raw_item.get("index")
         text = raw_item.get("text")
-        if not isinstance(index, int) or not isinstance(text, str):
-            raise RuntimeError("Translation server item must include integer index and text.")
-        if index in translated:
-            raise RuntimeError("Translation server returned a duplicate item index.")
-        translated[index] = text
+        if not isinstance(text, str):
+            raise _TranslationResponseFormatError("Translation server item must include text.")
+        positional_texts.append(text)
+        if type(index) is int and index not in translated:
+            translated[index] = text
 
     expected_indexes = set(range(expected_count))
-    if set(translated) != expected_indexes:
-        raise RuntimeError("Translation server returned missing or unexpected item indexes.")
-    return [translated[index] for index in range(expected_count)]
+    if set(translated) == expected_indexes:
+        return _ParsedTranslationBatch(texts=[translated[index] for index in range(expected_count)], warnings=[])
+    return _ParsedTranslationBatch(
+        texts=positional_texts,
+        warnings=["Recovered translation batch by item order after invalid item indexes."],
+    )

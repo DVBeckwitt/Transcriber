@@ -98,6 +98,30 @@ class FakeUrlOpen:
         return FakeResponse({"choices": [{"message": {"content": json_module.dumps({"items": items})}}]})
 
 
+class ScriptedUrlOpen:
+    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, request: Any, *, timeout: float) -> FakeResponse:
+        body = request.data.decode("utf-8") if request.data else ""
+        payload = json_module.loads(body) if body else {}
+        self.calls.append(
+            {
+                "url": request.full_url,
+                "method": request.get_method(),
+                "json": payload,
+                "timeout": timeout,
+            }
+        )
+        if request.get_method() == "GET":
+            return FakeResponse({"data": []})
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return FakeResponse({"choices": [{"message": {"content": json_module.dumps(response)}}]})
+
+
 class FakeServerProcess:
     def __init__(self) -> None:
         self.returncode: int | None = None
@@ -136,6 +160,9 @@ class TranslationTests(unittest.TestCase):
 
     def test_supported_post_translation_languages_include_spanish_and_german(self) -> None:
         self.assertEqual(SUPPORTED_POST_TRANSLATION_LANGS, {"es", "de"})
+
+    def test_default_translation_model_targets_local_gpu(self) -> None:
+        self.assertEqual(DEFAULT_TRANSLATION_MODEL, "utter-project/EuroLLM-1.7B-Instruct")
 
     def test_glossary_placeholders_are_exact_and_restored(self) -> None:
         protected, placeholders = apply_glossary_placeholders(
@@ -215,6 +242,50 @@ class TranslationTests(unittest.TestCase):
                     max_new_tokens=256,
                 )
 
+    def test_translate_srt_to_english_reports_server_recovery_warnings(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            source_srt = Path(tmpdir) / "meeting.de.srt"
+            english_srt = Path(tmpdir) / "meeting.en.srt"
+            report_path = Path(tmpdir) / "meeting.translation.json"
+            source_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHallo\n\n2\n00:00:01,000 --> 00:00:02,000\nDanke\n",
+                encoding="utf-8",
+            )
+            client = ScriptedUrlOpen(
+                [
+                    {
+                        "items": [
+                            {"text": "Hello"},
+                            {"text": "Thanks"},
+                        ]
+                    }
+                ]
+            )
+            backend = ServerTranslationBackend(
+                server_url="http://localhost:8000/v1",
+                model_name="custom-translation-model",
+                client=client,
+            )
+
+            result = translate_srt_to_english(
+                source_srt_path=source_srt,
+                english_srt_path=english_srt,
+                source_lang="de",
+                backend=backend,
+                glossary={},
+                device="cpu",
+                batch_size=2,
+                max_new_tokens=128,
+                report_path=report_path,
+                english_output_mode="post",
+            )
+
+            report = json_module.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.texts, ["Hello", "Thanks"])
+            self.assertIn("Hello", english_srt.read_text(encoding="utf-8"))
+            self.assertTrue(any("item order" in warning for warning in report["warnings"]))
+            self.assertNotIn("Hallo", json_module.dumps(report))
+
     def test_openai_server_ready_uses_stdlib_opener(self) -> None:
         opener = FakeUrlOpen()
 
@@ -231,7 +302,7 @@ class TranslationTests(unittest.TestCase):
         client = FakeUrlOpen()
         backend = ServerTranslationBackend(
             server_url="http://localhost:8000/v1",
-            model_name="Unbabel/Tower-Plus-72B",
+            model_name="custom-translation-model",
             client=client,
         )
 
@@ -251,7 +322,7 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(result.texts, ["Hello", "Thanks"])
         self.assertEqual(client.calls[0]["url"], "http://localhost:8000/v1/chat/completions")
         self.assertEqual(client.calls[0]["method"], "POST")
-        self.assertEqual(client.calls[0]["json"]["model"], "Unbabel/Tower-Plus-72B")
+        self.assertEqual(client.calls[0]["json"]["model"], "custom-translation-model")
         self.assertEqual(client.calls[0]["json"]["temperature"], 0)
         self.assertEqual(client.calls[0]["json"]["max_tokens"], 128)
         content_type = {key.lower(): value for key, value in client.calls[0]["headers"].items()}["content-type"]
@@ -261,7 +332,7 @@ class TranslationTests(unittest.TestCase):
         client = FakeUrlOpen()
         backend = ServerTranslationBackend(
             server_url="http://127.0.0.1:8000/v1",
-            model_name="Unbabel/Tower-Plus-72B",
+            model_name="custom-translation-model",
             client=client,
         )
 
@@ -281,6 +352,140 @@ class TranslationTests(unittest.TestCase):
         batch_sizes = [len(json_module.loads(call["json"]["messages"][1]["content"])["items"]) for call in client.calls]
         self.assertEqual(batch_sizes, [2, 2, 1])
         self.assertEqual(result.texts, ["EN: eins", "EN: zwei", "EN: drei", "EN: vier", "EN: funf"])
+
+    def test_server_backend_recovers_bad_indexes_by_position(self) -> None:
+        responses: dict[str, dict[str, Any]] = {
+            "shifted": {
+                "items": [
+                    {"index": 1, "text": "Hello"},
+                    {"index": 2, "text": "Thanks"},
+                ]
+            },
+            "string": {
+                "items": [
+                    {"index": "0", "text": "Hello"},
+                    {"index": "1", "text": "Thanks"},
+                ]
+            },
+            "missing": {
+                "items": [
+                    {"text": "Hello"},
+                    {"text": "Thanks"},
+                ]
+            },
+            "boolean": {
+                "items": [
+                    {"index": True, "text": "Hello"},
+                    {"index": False, "text": "Thanks"},
+                ]
+            },
+        }
+        for name, response in responses.items():
+            with self.subTest(name=name):
+                client = ScriptedUrlOpen([response])
+                backend = ServerTranslationBackend(server_url="http://localhost:8000/v1", client=client)
+
+                result = backend.translate_texts(
+                    TranslationRequest(
+                        source_lang="de",
+                        target_lang="en",
+                        texts=["Hallo", "Danke"],
+                        glossary={},
+                        preserve_markers=(),
+                    ),
+                    device="cpu",
+                    batch_size=2,
+                    max_new_tokens=128,
+                )
+
+                self.assertEqual(result.texts, ["Hello", "Thanks"])
+                self.assertTrue(any("item order" in warning for warning in result.warnings))
+
+    def test_server_backend_rejects_changed_item_count(self) -> None:
+        client = ScriptedUrlOpen([{"items": [{"index": 0, "text": "Hello"}, {"index": 1, "text": "Extra"}]}])
+        backend = ServerTranslationBackend(server_url="http://localhost:8000/v1", client=client)
+
+        with self.assertRaisesRegex(RuntimeError, "item count|item indexes"):
+            backend.translate_texts(
+                TranslationRequest(
+                    source_lang="de",
+                    target_lang="en",
+                    texts=["Hallo"],
+                    glossary={},
+                    preserve_markers=(),
+                ),
+                device="cpu",
+                batch_size=1,
+                max_new_tokens=128,
+            )
+
+    def test_server_backend_retries_failed_multi_item_batch_as_single_items(self) -> None:
+        client = ScriptedUrlOpen(
+            [
+                {"items": [{"index": 0, "text": "Only one item"}]},
+                {"items": [{"index": 0, "text": "Hello"}]},
+                {"items": [{"index": 0, "text": "Thanks"}]},
+            ]
+        )
+        backend = ServerTranslationBackend(server_url="http://localhost:8000/v1", client=client)
+
+        result = backend.translate_texts(
+            TranslationRequest(
+                source_lang="de",
+                target_lang="en",
+                texts=["Hallo", "Danke"],
+                glossary={},
+                preserve_markers=(),
+            ),
+            device="cpu",
+            batch_size=2,
+            max_new_tokens=128,
+        )
+
+        requested_batch_sizes = [
+            len(json_module.loads(call["json"]["messages"][1]["content"])["items"]) for call in client.calls
+        ]
+        self.assertEqual(requested_batch_sizes, [2, 1, 1])
+        self.assertEqual(result.texts, ["Hello", "Thanks"])
+        self.assertTrue(any("single-item" in warning for warning in result.warnings))
+
+    def test_server_backend_does_not_retry_network_failure_as_single_items(self) -> None:
+        client = ScriptedUrlOpen([URLError("connection refused")])
+        backend = ServerTranslationBackend(server_url="http://localhost:8000/v1", client=client)
+
+        with self.assertRaisesRegex(RuntimeError, "Translation server request failed.*connection refused"):
+            backend.translate_texts(
+                TranslationRequest(
+                    source_lang="de",
+                    target_lang="en",
+                    texts=["Hallo", "Danke"],
+                    glossary={},
+                    preserve_markers=(),
+                ),
+                device="cpu",
+                batch_size=2,
+                max_new_tokens=128,
+            )
+        self.assertEqual(len(client.calls), 1)
+
+    def test_server_backend_does_not_retry_failed_single_item_batch(self) -> None:
+        client = ScriptedUrlOpen([{"items": []}])
+        backend = ServerTranslationBackend(server_url="http://localhost:8000/v1", client=client)
+
+        with self.assertRaisesRegex(RuntimeError, "item count"):
+            backend.translate_texts(
+                TranslationRequest(
+                    source_lang="de",
+                    target_lang="en",
+                    texts=["Hallo"],
+                    glossary={},
+                    preserve_markers=(),
+                ),
+                device="cpu",
+                batch_size=1,
+                max_new_tokens=128,
+            )
+        self.assertEqual(len(client.calls), 1)
 
     def test_server_backend_raises_clear_error_on_network_failure(self) -> None:
         backend = ServerTranslationBackend(
