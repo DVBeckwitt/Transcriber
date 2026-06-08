@@ -24,7 +24,7 @@ Add explicit file English output modes:
 - `post`: transcribe Spanish/German source first, then translate generated SRT output to English.
 - `auto`: post-translate Spanish/German when available, skip English, and keep unsupported or failed post-translation output in the source language with a warning.
 
-Post-translation uses an OpenAI-compatible local server backend over Python standard-library HTTP. The server URL must be localhost or loopback by default. When no server URL is provided, the launcher starts `vllm serve <translation model>` on `127.0.0.1`, waits for the OpenAI-compatible `/v1/models` endpoint, uses that server for subtitle translation, and terminates only that owned child process when translation finishes. Subtitle cue requests are batched according to the translation batch size, and translation reports include backend/model, cue count, warnings, fallback count, and selected English output mode without transcript text.
+Post-translation uses an OpenAI-compatible local server backend over Python standard-library HTTP. The server URL must be localhost or loopback by default. When no server URL is provided, the launcher starts `vllm serve <translation model>` on `127.0.0.1`, waits for the OpenAI-compatible `/v1/models` endpoint, uses that server for subtitle translation, and terminates only that owned child process when translation finishes. Native Windows `vllm` is tried first; on Windows, default-distro WSL2 `vllm` is the fallback when native vLLM is unavailable. Subtitle cue requests are batched according to the translation batch size, and translation reports include backend/model, cue count, warnings, fallback count, and selected English output mode without transcript text.
 
 Explicit `post` mode is strict: server startup failure or translation failure marks the run failed because the user requested English output. `auto` mode is fallback-friendly: unavailable post-translation keeps source output and warns.
 
@@ -49,7 +49,8 @@ Explicit `post` mode is strict: server startup failure or translation failure ma
 - Users get a normal settings-flow English conversion choice instead of relying on hidden CLI-only flags.
 - Spanish/German source SRTs are preserved beside English outputs in post mode.
 - `--translate-to-english` remains backward compatible as direct WhisperX translation; no migration is required.
-- Post-translation no longer requires an HTTP client extra. Automatic server startup requires a compatible `vllm` executable in the active Python environment or `PATH`, unless the user supplies `--translation-server-url`.
+- Post-translation no longer requires an HTTP client extra. Automatic server startup requires a compatible `vllm` executable in the active Python environment, on `PATH`, or in the default WSL2 distribution on Windows, unless the user supplies `--translation-server-url`.
+- The WSL2 fallback is additive and advisory: native vLLM remains preferred, existing `--translation-server-url` usage is unchanged, and no CLI migration or deprecation is required.
 - Removing the `translation-server` extra is not a user migration because no replacement package install is required for stdlib HTTP; users only need vLLM or an existing local server for server-backed translation.
 - CI remains model-free: tests use fake backends and fake HTTP clients.
 - Rollback is a normal git revert; no data migration is required.

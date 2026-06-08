@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json as json_module
+import shlex
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import URLError
 
@@ -20,6 +22,8 @@ from transcriber.translation import (
     openai_server_ready,
     replace_glossary_placeholders,
     translate_srt_to_english,
+    wsl_vllm_available,
+    wsl_vllm_command,
 )
 
 
@@ -337,6 +341,56 @@ class TranslationTests(unittest.TestCase):
 
         self.assertTrue(process.terminated)
         self.assertFalse(process.killed)
+
+    def test_managed_translation_server_can_start_wsl_vllm_command(self) -> None:
+        process = FakeServerProcess()
+        popen_calls: list[list[str]] = []
+
+        def fake_popen(command: list[str], **_kwargs: Any) -> FakeServerProcess:
+            popen_calls.append(command)
+            return process
+
+        with ManagedTranslationServer.start(
+            server_url=None,
+            model_name=DEFAULT_TRANSLATION_MODEL,
+            log_path=None,
+            port_picker=lambda: 8124,
+            readiness_check=lambda url: url == "http://127.0.0.1:8124/v1" and bool(popen_calls),
+            command_resolver=lambda model_name, port: wsl_vllm_command(
+                model_name,
+                port,
+                wsl_executable="wsl.exe",
+            ),
+            popen=fake_popen,
+            sleep=lambda _seconds: None,
+            timeout_seconds=1.0,
+        ) as server:
+            self.assertEqual(server.server_url, "http://127.0.0.1:8124/v1")
+            self.assertEqual(popen_calls[0][:4], ["wsl.exe", "-e", "sh", "-lc"])
+            self.assertIn("vllm serve", popen_calls[0][4])
+            self.assertIn("--port 8124", popen_calls[0][4])
+
+        self.assertTrue(process.terminated)
+
+    def test_wsl_vllm_available_checks_default_distro_for_vllm(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_runner(command: list[str], **_kwargs: Any) -> Any:
+            calls.append(command)
+            return SimpleNamespace(returncode=0)
+
+        self.assertTrue(wsl_vllm_available(wsl_executable="wsl.exe", runner=fake_runner))
+        self.assertEqual(calls[0], ["wsl.exe", "-e", "sh", "-lc", "command -v vllm >/dev/null 2>&1"])
+
+    def test_wsl_vllm_command_quotes_model_name_for_shell(self) -> None:
+        model_name = "model; touch /tmp/pwn && echo 'x'"
+
+        command = wsl_vllm_command(model_name, 8124, wsl_executable="wsl.exe")
+
+        self.assertEqual(
+            shlex.split(command[4]),
+            ["exec", "vllm", "serve", model_name, "--host", "127.0.0.1", "--port", "8124"],
+        )
 
     def test_managed_translation_server_reuses_supplied_url_without_starting_process(self) -> None:
         with ManagedTranslationServer.start(

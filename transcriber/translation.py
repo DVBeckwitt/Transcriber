@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -81,9 +82,13 @@ class ManagedTranslationServer:
         server_url: str | None,
         model_name: str,
         log_path: Path | None,
-        executable_resolver: Callable[[], str | None] = lambda: local_vllm_executable(),
+        executable_resolver: Callable[[], str | None] | None = None,
         port_picker: Callable[[], int] = lambda: pick_translation_server_port(),
         readiness_check: Callable[[str], bool] = lambda url: openai_server_ready(url),
+        command_resolver: Callable[[str, int], Sequence[str] | None] = lambda model_name, port: local_vllm_command(
+            model_name,
+            port,
+        ),
         popen: Callable[..., Any] = subprocess.Popen,
         sleep: Callable[[float], None] = time.sleep,
         timeout_seconds: float = DEFAULT_TRANSLATION_SERVER_START_TIMEOUT_SECONDS,
@@ -97,16 +102,20 @@ class ManagedTranslationServer:
         if readiness_check(default_url):
             return cls(server_url=default_url)
 
-        executable = executable_resolver()
-        if not executable:
-            raise RuntimeError(
-                "Could not auto-start post-translation because the vllm command was not found. "
-                "Install vLLM, put vllm on PATH, or pass --translation-server-url for an existing local server."
-            )
-
         port = int(port_picker())
         auto_url = _translation_server_url(port)
-        command = [executable, "serve", model_name, "--host", DEFAULT_TRANSLATION_SERVER_HOST, "--port", str(port)]
+        if executable_resolver is not None:
+            executable = executable_resolver()
+            command = _native_vllm_command(executable, model_name, port) if executable else None
+        else:
+            resolved_command = command_resolver(model_name, port)
+            command = list(resolved_command) if resolved_command else None
+        if not command:
+            raise RuntimeError(
+                "Could not auto-start post-translation because the vllm command was not found. "
+                "Install vLLM in Windows or WSL, put vllm on PATH, or pass --translation-server-url for an "
+                "existing local server."
+            )
         log_handle: Any | None = None
         stdout: Any = subprocess.DEVNULL
         if log_path is not None:
@@ -188,6 +197,55 @@ def local_vllm_executable() -> str | None:
         if candidate.exists():
             return str(candidate)
     return shutil.which("vllm")
+
+
+def local_vllm_command(model_name: str, port: int) -> list[str] | None:
+    executable = local_vllm_executable()
+    if executable:
+        return _native_vllm_command(executable, model_name, port)
+    if os.name == "nt" and wsl_vllm_available():
+        return wsl_vllm_command(model_name, port)
+    return None
+
+
+def wsl_vllm_available(
+    *,
+    wsl_executable: str | None = None,
+    runner: Callable[..., Any] = subprocess.run,
+    timeout_seconds: float = 5.0,
+) -> bool:
+    wsl = wsl_executable or shutil.which("wsl.exe") or shutil.which("wsl")
+    if not wsl:
+        return False
+    try:
+        result = runner(
+            [wsl, "-e", "sh", "-lc", "command -v vllm >/dev/null 2>&1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except Exception:
+        return False
+    return int(getattr(result, "returncode", 1)) == 0
+
+
+def wsl_vllm_command(model_name: str, port: int, *, wsl_executable: str | None = None) -> list[str]:
+    wsl = wsl_executable or shutil.which("wsl.exe") or shutil.which("wsl") or "wsl"
+    shell_command = "exec " + " ".join(shlex.quote(part) for part in _native_vllm_command("vllm", model_name, port))
+    return [wsl, "-e", "sh", "-lc", shell_command]
+
+
+def _native_vllm_command(executable: str, model_name: str, port: int) -> list[str]:
+    return [
+        executable,
+        "serve",
+        model_name,
+        "--host",
+        DEFAULT_TRANSLATION_SERVER_HOST,
+        "--port",
+        str(int(port)),
+    ]
 
 
 def pick_translation_server_port(preferred_port: int = DEFAULT_TRANSLATION_SERVER_PORT) -> int:

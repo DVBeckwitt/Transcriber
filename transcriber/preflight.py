@@ -7,9 +7,10 @@ from typing import Any
 
 from transcriber.errors import PreflightError
 from transcriber.translation import (
+    DEFAULT_TRANSLATION_MODEL,
     DEFAULT_TRANSLATION_SERVER_HOST,
     DEFAULT_TRANSLATION_SERVER_PORT,
-    local_vllm_executable,
+    local_vllm_command,
     openai_server_ready,
 )
 
@@ -79,16 +80,22 @@ def check_transcription_preflight(*, cfg: Any, hf_token_present: bool, require_f
     )
     if needs_post_translation and str(getattr(cfg, "translation_backend", "")) == "server":
         if not str(getattr(cfg, "translation_server_url", "") or "").strip():
-            vllm_path = local_vllm_executable()
             default_server_url = f"http://{DEFAULT_TRANSLATION_SERVER_HOST}:{DEFAULT_TRANSLATION_SERVER_PORT}/v1"
-            if vllm_path or openai_server_ready(default_server_url):
+            server_ready = openai_server_ready(default_server_url)
+            can_start_server = server_ready or bool(
+                local_vllm_command(
+                    DEFAULT_TRANSLATION_MODEL,
+                    DEFAULT_TRANSLATION_SERVER_PORT,
+                )
+            )
+            if can_start_server:
                 warnings.append(
                     "No post-translation server URL was supplied; transcriber will reuse or auto-start a local server."
                 )
             else:
                 message = (
-                    "Post-translation auto-start needs the vllm command. Install vLLM, put vllm on PATH, "
-                    "or set --translation-server-url for an existing local server."
+                    "Post-translation auto-start needs the vllm command. Install vLLM in Windows or WSL, "
+                    "put vllm on PATH, or set --translation-server-url for an existing local server."
                 )
                 if str(getattr(cfg, "english_output_mode", "")) == "post":
                     errors.append(message)
