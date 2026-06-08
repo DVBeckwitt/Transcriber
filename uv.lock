@@ -2893,9 +2893,6 @@ live = [
     { name = "websockets" },
     { name = "whisperlivekit", extra = ["translation"], marker = "python_full_version >= '3.11'" },
 ]
-translation-server = [
-    { name = "httpx" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -2908,7 +2905,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", marker = "extra == 'translation-server'", specifier = ">=0.28" },
     { name = "numpy", marker = "extra == 'live'", specifier = ">=1.26" },
     { name = "pyaudiowpatch", marker = "python_full_version >= '3.11' and sys_platform == 'win32' and extra == 'live'", specifier = ">=0.2.12.8" },
     { name = "python-multipart", marker = "extra == 'live'", specifier = ">=0.0.20" },
@@ -2919,7 +2915,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'live'", specifier = ">=15" },
     { name = "whisperlivekit", extras = ["translation"], marker = "python_full_version >= '3.11' and extra == 'live'", specifier = ">=0.2.20.post1" },
 ]
-provides-extras = ["translation-server", "live"]
+provides-extras = ["live"]
 
 [package.metadata.requires-dev]
 dev = [

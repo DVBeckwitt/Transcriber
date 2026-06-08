@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-import importlib
+import contextlib
 import ipaddress
 import json
+import os
 import re
-from collections.abc import Sequence
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,6 +23,9 @@ from transcriber.io import atomic_write_text
 SUPPORTED_POST_TRANSLATION_LANGS = {"es", "de"}
 DEFAULT_TRANSLATION_MODEL = "Unbabel/Tower-Plus-72B"
 GLOSSARY_PLACEHOLDER_TEMPLATE = "ZXGLOSSARY{index:03d}ZX"
+DEFAULT_TRANSLATION_SERVER_HOST = "127.0.0.1"
+DEFAULT_TRANSLATION_SERVER_PORT = 8000
+DEFAULT_TRANSLATION_SERVER_START_TIMEOUT_SECONDS = 30 * 60.0
 
 
 @dataclass(frozen=True)
@@ -54,6 +65,169 @@ class TranslationBackend(Protocol):
         batch_size: int,
         max_new_tokens: int,
     ) -> TranslationResult: ...
+
+
+@dataclass
+class ManagedTranslationServer:
+    server_url: str
+    process: Any | None = None
+    started: bool = False
+    _log_handle: Any | None = None
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        server_url: str | None,
+        model_name: str,
+        log_path: Path | None,
+        executable_resolver: Callable[[], str | None] = lambda: local_vllm_executable(),
+        port_picker: Callable[[], int] = lambda: pick_translation_server_port(),
+        readiness_check: Callable[[str], bool] = lambda url: openai_server_ready(url),
+        popen: Callable[..., Any] = subprocess.Popen,
+        sleep: Callable[[float], None] = time.sleep,
+        timeout_seconds: float = DEFAULT_TRANSLATION_SERVER_START_TIMEOUT_SECONDS,
+    ) -> ManagedTranslationServer:
+        normalized_url = (server_url or "").strip().rstrip("/")
+        if normalized_url:
+            _validate_local_server_url(normalized_url)
+            return cls(server_url=normalized_url)
+
+        default_url = _translation_server_url(DEFAULT_TRANSLATION_SERVER_PORT)
+        if readiness_check(default_url):
+            return cls(server_url=default_url)
+
+        executable = executable_resolver()
+        if not executable:
+            raise RuntimeError(
+                "Could not auto-start post-translation because the vllm command was not found. "
+                "Install vLLM, put vllm on PATH, or pass --translation-server-url for an existing local server."
+            )
+
+        port = int(port_picker())
+        auto_url = _translation_server_url(port)
+        command = [executable, "serve", model_name, "--host", DEFAULT_TRANSLATION_SERVER_HOST, "--port", str(port)]
+        log_handle: Any | None = None
+        stdout: Any = subprocess.DEVNULL
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = log_path.open("ab")
+            stdout = log_handle
+
+        try:
+            process = popen(command, stdout=stdout, stderr=subprocess.STDOUT)
+        except Exception:
+            if log_handle is not None:
+                log_handle.close()
+            raise
+
+        server = cls(server_url=auto_url, process=process, started=True, _log_handle=log_handle)
+        try:
+            server._wait_until_ready(
+                readiness_check=readiness_check,
+                sleep=sleep,
+                timeout_seconds=timeout_seconds,
+                log_path=log_path,
+            )
+        except Exception:
+            server.close()
+            raise
+        return server
+
+    def _wait_until_ready(
+        self,
+        *,
+        readiness_check: Callable[[str], bool],
+        sleep: Callable[[float], None],
+        timeout_seconds: float,
+        log_path: Path | None,
+    ) -> None:
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        while True:
+            if self.process is not None and self.process.poll() is not None:
+                message = f"Post-translation server exited before it became ready (code {self.process.returncode})."
+                if log_path is not None:
+                    message += f' See "{log_path}".'
+                raise RuntimeError(message)
+            if readiness_check(self.server_url):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                message = "Timed out waiting for the post-translation server to become ready."
+                if log_path is not None:
+                    message += f' See "{log_path}".'
+                raise RuntimeError(message)
+            sleep(min(2.0, max(0.1, remaining)))
+
+    def close(self) -> None:
+        try:
+            if self.started and self.process is not None and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=15.0)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=15.0)
+        finally:
+            if self._log_handle is not None:
+                self._log_handle.close()
+                self._log_handle = None
+
+    def __enter__(self) -> ManagedTranslationServer:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
+def local_vllm_executable() -> str | None:
+    script_dir = Path(sys.executable).parent
+    candidate_names = ("vllm.exe", "vllm") if os.name == "nt" else ("vllm",)
+    for name in candidate_names:
+        candidate = script_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("vllm")
+
+
+def pick_translation_server_port(preferred_port: int = DEFAULT_TRANSLATION_SERVER_PORT) -> int:
+    if _loopback_port_available(preferred_port):
+        return preferred_port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((DEFAULT_TRANSLATION_SERVER_HOST, 0))
+        return int(sock.getsockname()[1])
+
+
+def _urlopen_no_proxy(request: urllib.request.Request, *, timeout: float) -> Any:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=timeout)
+
+
+def openai_server_ready(
+    server_url: str,
+    timeout_seconds: float = 1.0,
+    opener: Callable[..., Any] = _urlopen_no_proxy,
+) -> bool:
+    try:
+        _validate_local_server_url(server_url)
+        _http_json_request(f"{server_url.rstrip('/')}/models", opener=opener, timeout=timeout_seconds)
+    except Exception:
+        return False
+    return True
+
+
+def _translation_server_url(port: int) -> str:
+    return f"http://{DEFAULT_TRANSLATION_SERVER_HOST}:{int(port)}/v1"
+
+
+def _loopback_port_available(port: int) -> bool:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((DEFAULT_TRANSLATION_SERVER_HOST, int(port)))
+        except OSError:
+            return False
+    return True
 
 
 def normalize_subtitle_whitespace(text: str) -> str:
@@ -236,12 +410,6 @@ class ServerTranslationBackend:
         self.model_name = model_name
         self._client = client
 
-    def _http_client(self) -> Any:
-        if self._client is not None:
-            return self._client
-        httpx = importlib.import_module("httpx")
-        return httpx
-
     def translate_texts(
         self,
         request: TranslationRequest,
@@ -300,9 +468,12 @@ class ServerTranslationBackend:
             "top_p": 1,
             "max_tokens": max_new_tokens,
         }
-        response = self._http_client().post(f"{self.server_url}/chat/completions", json=payload, timeout=120.0)
-        response.raise_for_status()
-        data = response.json()
+        data = _http_json_request(
+            f"{self.server_url}/chat/completions",
+            payload=payload,
+            opener=self._client if self._client is not None else _urlopen_no_proxy,
+            timeout=120.0,
+        )
         content = _chat_completion_content(data)
         return _parse_indexed_translation_content(content, expected_count=len(texts))
 
@@ -328,6 +499,37 @@ def _validate_local_server_url(server_url: str) -> None:
     except ValueError:
         pass
     raise ValueError("translation server URL must point to localhost or a loopback address.")
+
+
+def _http_json_request(
+    url: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    opener: Callable[..., Any],
+    timeout: float,
+) -> Any:
+    data = None
+    method = "GET"
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        method = "POST"
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with opener(request, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Translation server request failed with HTTP {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Translation server request failed: {exc.reason}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Translation server request failed: {exc}") from exc
+
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Translation server response was not valid JSON.") from exc
 
 
 def _chat_completion_content(data: Any) -> str:

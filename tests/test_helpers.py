@@ -503,6 +503,7 @@ class HelperTests(unittest.TestCase):
             language="es",
             english_output_mode="post",
             post_translate_to_english=True,
+            translation_server_url="http://localhost:8000/v1",
             speaker_labels=False,
             diarize=False,
             compute_type="float32",
@@ -537,6 +538,54 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(record.get("english_output_mode"), "post")
 
     @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
+    @patch("transcriber.__main__.ManagedTranslationServer.start")
+    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_auto_starts_and_closes_translation_server_when_url_missing(
+        self,
+        run_logged: MagicMock,
+        preprocess: MagicMock,
+        _preflight: MagicMock,
+        start_server: MagicMock,
+        backend: MagicMock,
+    ) -> None:
+        server = MagicMock()
+        server.server_url = "http://127.0.0.1:8123/v1"
+        server.started = True
+        start_server.return_value = server
+        cfg = make_cfg(
+            language="de",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            translation_server_url=None,
+            speaker_labels=False,
+            diarize=False,
+            compute_type="float32",
+        )
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            preprocess.return_value = source
+
+            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                srt_path = args[2]
+                assert isinstance(srt_path, Path)
+                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHallo\n", encoding="utf-8")
+                return 0, "de"
+
+            run_logged.side_effect = fake_run
+
+            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
+
+            self.assertEqual(rc, 0)
+            start_server.assert_called_once()
+            self.assertIsNone(start_server.call_args.kwargs["server_url"])
+            backend.assert_called_once()
+            self.assertEqual(backend.call_args.kwargs["server_url"], "http://127.0.0.1:8123/v1")
+            server.close.assert_called_once()
+
+    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
     @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
     @patch("transcriber.__main__.preprocess_audio_for_whisperx")
     @patch("transcriber.__main__.run_whisperx_direct_logged")
@@ -551,6 +600,7 @@ class HelperTests(unittest.TestCase):
             language="auto",
             english_output_mode="auto",
             post_translate_to_english=True,
+            translation_server_url="http://localhost:8000/v1",
             speaker_labels=False,
             diarize=False,
             compute_type="float32",
@@ -590,6 +640,7 @@ class HelperTests(unittest.TestCase):
             language="es",
             english_output_mode="post",
             post_translate_to_english=True,
+            translation_server_url="http://localhost:8000/v1",
             save_source_srt=False,
             speaker_labels=False,
             diarize=False,
@@ -671,6 +722,7 @@ class HelperTests(unittest.TestCase):
             language="es",
             english_output_mode="post",
             post_translate_to_english=True,
+            translation_server_url="http://localhost:8000/v1",
             speaker_labels=False,
             diarize=False,
             write_llm_txt=False,
@@ -961,8 +1013,14 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(kwargs["no_repeat_ngram_size"], 3)
         self.assertTrue(kwargs["early_stopping"])
 
-    @patch("transcriber.preflight.module_available", return_value=True)
-    def test_preflight_fails_when_explicit_post_translation_has_no_url(self, _module_available: MagicMock) -> None:
+    @patch("transcriber.preflight.local_vllm_executable", return_value="vllm")
+    @patch("transcriber.preflight.module_available")
+    def test_preflight_allows_explicit_post_translation_without_url_when_vllm_can_start(
+        self,
+        module_available: MagicMock,
+        _local_vllm_executable: MagicMock,
+    ) -> None:
+        module_available.side_effect = lambda module_name: module_name != "httpx"
         cfg = make_cfg(
             language="de",
             english_output_mode="post",
@@ -975,11 +1033,63 @@ class HelperTests(unittest.TestCase):
 
         report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
 
-        self.assertTrue(any("OpenAI-compatible" in error for error in report.errors))
-        self.assertFalse(any("Spanish auto-translation" in warning for warning in report.warnings))
+        self.assertFalse(report.errors)
+        self.assertTrue(any("auto-start" in warning for warning in report.warnings))
 
+    @patch("transcriber.preflight.openai_server_ready", return_value=False)
+    @patch("transcriber.preflight.local_vllm_executable", return_value=None)
     @patch("transcriber.preflight.module_available", return_value=True)
-    def test_preflight_warns_when_auto_post_translation_has_no_url(self, _module_available: MagicMock) -> None:
+    def test_preflight_fails_when_explicit_post_translation_cannot_start_server(
+        self,
+        _module_available: MagicMock,
+        _local_vllm_executable: MagicMock,
+        _openai_server_ready: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="de",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            translation_backend="server",
+            translation_server_url=None,
+            diarize=False,
+            device="cpu",
+        )
+
+        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
+
+        self.assertTrue(any("vllm" in error for error in report.errors))
+
+    @patch("transcriber.preflight.openai_server_ready", return_value=True)
+    @patch("transcriber.preflight.local_vllm_executable", return_value=None)
+    @patch("transcriber.preflight.module_available", return_value=True)
+    def test_preflight_allows_explicit_post_translation_without_vllm_when_default_server_is_ready(
+        self,
+        _module_available: MagicMock,
+        _local_vllm_executable: MagicMock,
+        _openai_server_ready: MagicMock,
+    ) -> None:
+        cfg = make_cfg(
+            language="de",
+            english_output_mode="post",
+            post_translate_to_english=True,
+            translation_backend="server",
+            translation_server_url=None,
+            diarize=False,
+            device="cpu",
+        )
+
+        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
+
+        self.assertFalse(report.errors)
+        self.assertTrue(any("reuse or auto-start" in warning for warning in report.warnings))
+
+    @patch("transcriber.preflight.local_vllm_executable", return_value="vllm")
+    @patch("transcriber.preflight.module_available", return_value=True)
+    def test_preflight_warns_when_auto_post_translation_has_no_url(
+        self,
+        _module_available: MagicMock,
+        _local_vllm_executable: MagicMock,
+    ) -> None:
         cfg = make_cfg(
             language="auto",
             english_output_mode="auto",
@@ -992,7 +1102,7 @@ class HelperTests(unittest.TestCase):
 
         report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
 
-        self.assertTrue(any("OpenAI-compatible" in warning for warning in report.warnings))
+        self.assertTrue(any("auto-start" in warning for warning in report.warnings))
         self.assertFalse(report.errors)
 
     @patch("transcriber.preflight.module_available", return_value=True)

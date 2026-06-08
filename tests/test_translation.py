@@ -7,13 +7,17 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from urllib.error import URLError
 
 from transcriber.translation import (
+    DEFAULT_TRANSLATION_MODEL,
     SUPPORTED_POST_TRANSLATION_LANGS,
+    ManagedTranslationServer,
     ServerTranslationBackend,
     TranslationRequest,
     TranslationResult,
     apply_glossary_placeholders,
+    openai_server_ready,
     replace_glossary_placeholders,
     translate_srt_to_english,
 )
@@ -48,28 +52,67 @@ class FakeTranslationBackend:
 
 class FakeResponse:
     def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
+        self.body = json_module.dumps(payload).encode("utf-8")
 
-    def raise_for_status(self) -> None:
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         return None
 
-    def json(self) -> dict[str, Any]:
-        return self.payload
+    def read(self) -> bytes:
+        return self.body
 
 
-class FakeHttpClient:
-    def __init__(self) -> None:
+class FakeUrlOpen:
+    def __init__(self, fail_with: Exception | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.fail_with = fail_with
 
-    def post(self, url: str, *, json: dict[str, Any], timeout: float) -> FakeResponse:
-        self.calls.append({"url": url, "json": json, "timeout": timeout})
-        request = json_module.loads(json["messages"][1]["content"])
+    def __call__(self, request: Any, *, timeout: float) -> FakeResponse:
+        if self.fail_with is not None:
+            raise self.fail_with
+        body = request.data.decode("utf-8") if request.data else ""
+        payload = json_module.loads(body) if body else {}
+        self.calls.append(
+            {
+                "url": request.full_url,
+                "method": request.get_method(),
+                "headers": dict(request.header_items()),
+                "json": payload,
+                "timeout": timeout,
+            }
+        )
+        if request.get_method() == "GET":
+            return FakeResponse({"data": []})
+        translation_request = json_module.loads(payload["messages"][1]["content"])
         translations = {"Hola": "Hello", "Gracias": "Thanks"}
         items = [
             {"index": item["index"], "text": translations.get(item["text"], f"EN: {item['text']}")}
-            for item in request["items"]
+            for item in translation_request["items"]
         ]
         return FakeResponse({"choices": [{"message": {"content": json_module.dumps({"items": items})}}]})
+
+
+class FakeServerProcess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode or 0
 
 
 class TranslationTests(unittest.TestCase):
@@ -168,8 +211,20 @@ class TranslationTests(unittest.TestCase):
                     max_new_tokens=256,
                 )
 
+    def test_openai_server_ready_uses_stdlib_opener(self) -> None:
+        opener = FakeUrlOpen()
+
+        self.assertTrue(openai_server_ready("http://localhost:8000/v1", opener=opener))
+        self.assertEqual(opener.calls[0]["url"], "http://localhost:8000/v1/models")
+        self.assertEqual(opener.calls[0]["method"], "GET")
+
+    def test_openai_server_ready_returns_false_on_url_error(self) -> None:
+        opener = FakeUrlOpen(fail_with=URLError("connection refused"))
+
+        self.assertFalse(openai_server_ready("http://localhost:8000/v1", opener=opener))
+
     def test_server_backend_posts_openai_compatible_chat_request(self) -> None:
-        client = FakeHttpClient()
+        client = FakeUrlOpen()
         backend = ServerTranslationBackend(
             server_url="http://localhost:8000/v1",
             model_name="Unbabel/Tower-Plus-72B",
@@ -191,12 +246,15 @@ class TranslationTests(unittest.TestCase):
 
         self.assertEqual(result.texts, ["Hello", "Thanks"])
         self.assertEqual(client.calls[0]["url"], "http://localhost:8000/v1/chat/completions")
+        self.assertEqual(client.calls[0]["method"], "POST")
         self.assertEqual(client.calls[0]["json"]["model"], "Unbabel/Tower-Plus-72B")
         self.assertEqual(client.calls[0]["json"]["temperature"], 0)
         self.assertEqual(client.calls[0]["json"]["max_tokens"], 128)
+        content_type = {key.lower(): value for key, value in client.calls[0]["headers"].items()}["content-type"]
+        self.assertEqual(content_type, "application/json")
 
     def test_server_backend_batches_chat_requests(self) -> None:
-        client = FakeHttpClient()
+        client = FakeUrlOpen()
         backend = ServerTranslationBackend(
             server_url="http://127.0.0.1:8000/v1",
             model_name="Unbabel/Tower-Plus-72B",
@@ -220,6 +278,26 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(batch_sizes, [2, 2, 1])
         self.assertEqual(result.texts, ["EN: eins", "EN: zwei", "EN: drei", "EN: vier", "EN: funf"])
 
+    def test_server_backend_raises_clear_error_on_network_failure(self) -> None:
+        backend = ServerTranslationBackend(
+            server_url="http://localhost:8000/v1",
+            client=FakeUrlOpen(fail_with=URLError("connection refused")),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Translation server request failed.*connection refused"):
+            backend.translate_texts(
+                TranslationRequest(
+                    source_lang="de",
+                    target_lang="en",
+                    texts=["Hallo"],
+                    glossary={},
+                    preserve_markers=(),
+                ),
+                device="cpu",
+                batch_size=1,
+                max_new_tokens=128,
+            )
+
     def test_server_backend_rejects_non_loopback_url(self) -> None:
         with self.assertRaisesRegex(ValueError, "localhost|loopback"):
             ServerTranslationBackend(server_url="https://example.com/v1")
@@ -227,6 +305,48 @@ class TranslationTests(unittest.TestCase):
     def test_server_backend_rejects_url_credentials(self) -> None:
         with self.assertRaisesRegex(ValueError, "credentials"):
             ServerTranslationBackend(server_url="http://user:pass@localhost:8000/v1")
+
+    def test_managed_translation_server_starts_vllm_and_stops_owned_process(self) -> None:
+        process = FakeServerProcess()
+        popen_calls: list[list[str]] = []
+
+        def fake_popen(command: list[str], **_kwargs: Any) -> FakeServerProcess:
+            popen_calls.append(command)
+            return process
+
+        def fake_readiness_check(url: str) -> bool:
+            return url == "http://127.0.0.1:8123/v1" and bool(popen_calls)
+
+        with ManagedTranslationServer.start(
+            server_url=None,
+            model_name=DEFAULT_TRANSLATION_MODEL,
+            log_path=None,
+            executable_resolver=lambda: "vllm",
+            port_picker=lambda: 8123,
+            readiness_check=fake_readiness_check,
+            popen=fake_popen,
+            sleep=lambda _seconds: None,
+            timeout_seconds=1.0,
+        ) as server:
+            self.assertEqual(server.server_url, "http://127.0.0.1:8123/v1")
+            self.assertEqual(
+                popen_calls[0],
+                ["vllm", "serve", DEFAULT_TRANSLATION_MODEL, "--host", "127.0.0.1", "--port", "8123"],
+            )
+            self.assertTrue(server.started)
+
+        self.assertTrue(process.terminated)
+        self.assertFalse(process.killed)
+
+    def test_managed_translation_server_reuses_supplied_url_without_starting_process(self) -> None:
+        with ManagedTranslationServer.start(
+            server_url="http://localhost:8000/v1",
+            model_name=DEFAULT_TRANSLATION_MODEL,
+            log_path=None,
+            popen=lambda _command, **_kwargs: self.fail("server should not start"),
+        ) as server:
+            self.assertEqual(server.server_url, "http://localhost:8000/v1")
+            self.assertFalse(server.started)
 
 
 if __name__ == "__main__":

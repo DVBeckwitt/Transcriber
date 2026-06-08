@@ -24,9 +24,9 @@ Add explicit file English output modes:
 - `post`: transcribe Spanish/German source first, then translate generated SRT output to English.
 - `auto`: post-translate Spanish/German when available, skip English, and keep unsupported or failed post-translation output in the source language with a warning.
 
-Post-translation uses an OpenAI-compatible local server backend through the optional `translation-server` extra. The server URL must be localhost or loopback by default. Subtitle cue requests are batched according to the translation batch size, and translation reports include backend/model, cue count, warnings, fallback count, and selected English output mode without transcript text.
+Post-translation uses an OpenAI-compatible local server backend over Python standard-library HTTP. The server URL must be localhost or loopback by default. When no server URL is provided, the launcher starts `vllm serve <translation model>` on `127.0.0.1`, waits for the OpenAI-compatible `/v1/models` endpoint, uses that server for subtitle translation, and terminates only that owned child process when translation finishes. Subtitle cue requests are batched according to the translation batch size, and translation reports include backend/model, cue count, warnings, fallback count, and selected English output mode without transcript text.
 
-Explicit `post` mode is strict: missing server configuration or translation failure marks the run failed because the user requested English output. `auto` mode is fallback-friendly: unavailable post-translation keeps source output and warns.
+Explicit `post` mode is strict: server startup failure or translation failure marks the run failed because the user requested English output. `auto` mode is fallback-friendly: unavailable post-translation keeps source output and warns.
 
 ## Alternatives Considered
 
@@ -36,7 +36,7 @@ Explicit `post` mode is strict: missing server configuration or translation fail
 - Rejected: Direct mode remains available, but it is not sufficient as the only English conversion mechanism.
 
 ### Use In-Process Transformers Post-Translation
-- Pros: No server URL configuration.
+- Pros: No server process.
 - Cons: Adds heavy model imports and runtime dependencies to the file pipeline, repeats the old helper path, and makes German support harder to keep clean.
 - Rejected: The base package should stay lightweight and unit-testable without model downloads.
 
@@ -49,6 +49,7 @@ Explicit `post` mode is strict: missing server configuration or translation fail
 - Users get a normal settings-flow English conversion choice instead of relying on hidden CLI-only flags.
 - Spanish/German source SRTs are preserved beside English outputs in post mode.
 - `--translate-to-english` remains backward compatible as direct WhisperX translation; no migration is required.
-- Post-translation requires users to run a compatible local server and install the optional `translation-server` extra.
+- Post-translation no longer requires an HTTP client extra. Automatic server startup requires a compatible `vllm` executable in the active Python environment or `PATH`, unless the user supplies `--translation-server-url`.
+- Removing the `translation-server` extra is not a user migration because no replacement package install is required for stdlib HTTP; users only need vLLM or an existing local server for server-backed translation.
 - CI remains model-free: tests use fake backends and fake HTTP clients.
 - Rollback is a normal git revert; no data migration is required.

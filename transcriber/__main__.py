@@ -29,6 +29,7 @@ from transcriber.preflight import check_transcription_preflight, validate_run_co
 from transcriber.translation import (
     DEFAULT_TRANSLATION_MODEL,
     SUPPORTED_POST_TRANSLATION_LANGS,
+    ManagedTranslationServer,
     ServerTranslationBackend,
     normalize_subtitle_whitespace,
     split_speaker_prefix,
@@ -1482,7 +1483,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--translation-server-url",
-        help="OpenAI-compatible local server base URL for post-translation, e.g. http://localhost:8000/v1.",
+        help=(
+            "Optional OpenAI-compatible local server base URL for post-translation. "
+            "If omitted, transcriber starts local vLLM."
+        ),
     )
     parser.add_argument(
         "--save-source-srt",
@@ -1991,9 +1995,9 @@ def should_post_translate_to_english(cfg: RunConfig, source_lang: str | None) ->
     return language in SUPPORTED_POST_TRANSLATION_LANGS
 
 
-def build_post_translation_backend(cfg: RunConfig) -> ServerTranslationBackend:
+def build_post_translation_backend(cfg: RunConfig, server_url: str | None = None) -> ServerTranslationBackend:
     return ServerTranslationBackend(
-        server_url=cfg.translation_server_url or "",
+        server_url=server_url or cfg.translation_server_url or "",
         model_name=cfg.translation_model or DEFAULT_TRANSLATION_MODEL,
     )
 
@@ -2568,12 +2572,26 @@ def transcribe_file(
                     atomic_write_text(source_srt_path, working_srt_path.read_text(encoding="utf-8", errors="ignore"))
                 working_english_srt_path = temporary_sibling_path(outputs.english_srt_path, suffix=".srt.tmp")
                 report(f"Translating {source_lang} transcript to English text...")
+                translation_server: ManagedTranslationServer | None = None
                 try:
+                    translation_server_log_path = outputs.log_path.with_name(
+                        f"{input_path.stem}_translation_server.log"
+                    )
+                    if not cfg.translation_server_url:
+                        report("Starting local post-translation server...")
+                    translation_server = ManagedTranslationServer.start(
+                        server_url=cfg.translation_server_url,
+                        model_name=cfg.translation_model or DEFAULT_TRANSLATION_MODEL,
+                        log_path=translation_server_log_path,
+                    )
+                    if translation_server.started:
+                        report(f'Local post-translation server: "{translation_server.server_url}"')
+                        report(f'Translation server log: "{translation_server_log_path}"')
                     translate_generated_srt_to_english(
                         source_srt_path=source_srt_path,
                         english_srt_path=working_english_srt_path,
                         source_lang=source_lang,
-                        backend=build_post_translation_backend(cfg),
+                        backend=build_post_translation_backend(cfg, server_url=translation_server.server_url),
                         glossary=cfg.glossary,
                         device=cfg.device,
                         batch_size=cfg.translation_batch_size,
@@ -2594,6 +2612,10 @@ def transcribe_file(
                         working_english_srt_path.unlink()
                     if cfg.english_output_mode == "post":
                         raise RuntimeError(f"Explicit post-translation failed: {exc}") from exc
+                finally:
+                    if translation_server is not None and translation_server.started:
+                        report("Stopping local post-translation server...")
+                        translation_server.close()
             elif cfg.post_translate_to_english and not cfg.direct_whisper_translate and source_lang not in {"", "en"}:
                 message = f"Post-translation skipped: source language {source_lang!r} is not supported."
                 append_log_message(outputs.log_path, f"[transcriber] {message}")

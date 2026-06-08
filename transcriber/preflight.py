@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from transcriber.errors import PreflightError
+from transcriber.translation import (
+    DEFAULT_TRANSLATION_SERVER_HOST,
+    DEFAULT_TRANSLATION_SERVER_PORT,
+    local_vllm_executable,
+    openai_server_ready,
+)
 
 
 @dataclass(frozen=True)
@@ -73,20 +79,21 @@ def check_transcription_preflight(*, cfg: Any, hf_token_present: bool, require_f
     )
     if needs_post_translation and str(getattr(cfg, "translation_backend", "")) == "server":
         if not str(getattr(cfg, "translation_server_url", "") or "").strip():
-            message = (
-                "Post-translation server backend needs an OpenAI-compatible local server URL "
-                "(set --translation-server-url)."
-            )
-            if str(getattr(cfg, "english_output_mode", "")) == "post":
-                errors.append(message)
+            vllm_path = local_vllm_executable()
+            default_server_url = f"http://{DEFAULT_TRANSLATION_SERVER_HOST}:{DEFAULT_TRANSLATION_SERVER_PORT}/v1"
+            if vllm_path or openai_server_ready(default_server_url):
+                warnings.append(
+                    "No post-translation server URL was supplied; transcriber will reuse or auto-start a local server."
+                )
             else:
-                warnings.append(message)
-        elif not module_available("httpx"):
-            message = "Post-translation server backend may be unavailable because httpx is not importable."
-            if str(getattr(cfg, "english_output_mode", "")) == "post":
-                errors.append(message)
-            else:
-                warnings.append(message)
+                message = (
+                    "Post-translation auto-start needs the vllm command. Install vLLM, put vllm on PATH, "
+                    "or set --translation-server-url for an existing local server."
+                )
+                if str(getattr(cfg, "english_output_mode", "")) == "post":
+                    errors.append(message)
+                else:
+                    warnings.append(message)
 
     return PreflightReport(errors=tuple(errors), warnings=tuple(warnings))
 
