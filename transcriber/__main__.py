@@ -27,15 +27,8 @@ from transcriber.errors import OutputWriteError
 from transcriber.io import atomic_replace_path, atomic_write_text, temporary_sibling_path
 from transcriber.preflight import check_transcription_preflight, validate_run_config
 from transcriber.translation import (
-    DEFAULT_TRANSLATION_MODEL,
-    SUPPORTED_POST_TRANSLATION_LANGS,
-    ManagedTranslationServer,
-    ServerTranslationBackend,
     normalize_subtitle_whitespace,
     split_speaker_prefix,
-)
-from transcriber.translation import (
-    translate_srt_to_english as translate_generated_srt_to_english,
 )
 
 MEDIA_FILTER = (
@@ -82,7 +75,8 @@ SUBTITLE_PREFERRED_BREAK_CHARS = ".?!,:;"
 
 SPANISH_TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-es-en"
 LANGUAGE_CHOICES = ("auto", "en", "es", "de")
-ENGLISH_OUTPUT_MODE_CHOICES = ("off", "direct", "post", "auto")
+ENGLISH_OUTPUT_MODE_CHOICES = ("off", "direct")
+LEGACY_DIRECT_ENGLISH_OUTPUT_MODE_CHOICES = ("post", "auto")
 TRANSLATION_BACKEND_CHOICES = ("server",)
 DEFAULT_TRANSLATION_BACKEND = "server"
 DEFAULT_TRANSLATION_BATCH_SIZE = 1
@@ -546,14 +540,20 @@ class TeeTextIO:
 
     def write(self, text: str) -> int:
         for stream in self.streams:
-            stream.write(text)
-            if "\n" in text or "\r" in text:
-                stream.flush()
+            try:
+                stream.write(text)
+                if "\n" in text or "\r" in text:
+                    stream.flush()
+            except (OSError, ValueError):
+                continue
         return len(text)
 
     def flush(self) -> None:
         for stream in self.streams:
-            stream.flush()
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                continue
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.streams[-1], name)
@@ -1462,53 +1462,45 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--english-output-mode",
-        choices=ENGLISH_OUTPUT_MODE_CHOICES,
-        help=(
-            "English output mode: off keeps source text, direct uses WhisperX translation, "
-            "post translates generated source files, auto post-translates Spanish/German."
-        ),
+        metavar="{off,direct}",
+        help="English output mode: off keeps source text, direct uses WhisperX translation.",
     )
     parser.add_argument(
         "--post-translate-to-english",
         action="store_true",
-        help="Shortcut for --english-output-mode post.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--translation-backend",
         choices=TRANSLATION_BACKEND_CHOICES,
         default=DEFAULT_TRANSLATION_BACKEND,
-        help="Post-translation backend (default: server).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--translation-model",
-        help=f"Model name for post-translation server requests (default: {DEFAULT_TRANSLATION_MODEL}).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--translation-server-url",
-        help=(
-            "Optional OpenAI-compatible local server base URL for post-translation. "
-            "If omitted, transcriber starts local vLLM."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--translation-batch-size",
         type=int,
         default=DEFAULT_TRANSLATION_BATCH_SIZE,
-        help=f"Number of subtitle cues per post-translation request (default: {DEFAULT_TRANSLATION_BATCH_SIZE}).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--translation-max-new-tokens",
         type=int,
         default=DEFAULT_TRANSLATION_MAX_NEW_TOKENS,
-        help=(
-            f"Maximum generated tokens per post-translation request (default: {DEFAULT_TRANSLATION_MAX_NEW_TOKENS})."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--save-source-srt",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Keep the source-language SRT beside English output (default: on).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--temperature",
@@ -1735,21 +1727,41 @@ def prompt_mode(current: str) -> str:
 
 
 def default_english_output_mode(mode: str) -> str:
-    return "off" if mode == "fast" else "auto"
+    return "off"
+
+
+def normalize_english_output_mode(value: str | None) -> str:
+    mode = (value or "off").strip().lower()
+    if mode in {"", "n", "no", "none", "false", "source"}:
+        return "off"
+    if mode in ENGLISH_OUTPUT_MODE_CHOICES:
+        return mode
+    if mode in {
+        "y",
+        "yes",
+        "on",
+        "true",
+        "translate",
+        "translation",
+        "whisperx",
+        "whisper",
+        *LEGACY_DIRECT_ENGLISH_OUTPUT_MODE_CHOICES,
+    }:
+        return "direct"
+    raise ValueError("english_output_mode must be one of: off, direct.")
 
 
 def prompt_english_output_mode(current: str) -> str:
     if not sys.stdin.isatty():
         return current
-    choice = (
-        input(f"Convert generated output to English [Enter={current}, off/post/direct/auto; recommended=post]: ")
-        .strip()
-        .lower()
-    )
-    if not choice:
+    default = "yes" if current == "direct" else "no"
+    choice = input(f"Translate to English with WhisperX [Enter={default}, y=yes, n=no]: ").strip().lower()
+    if choice == "":
         return current
-    if choice in ENGLISH_OUTPUT_MODE_CHOICES:
-        return choice
+    if choice in {"y", "yes", "on", "true", "direct", "translate", "whisperx", "whisper", "post", "auto"}:
+        return "direct"
+    if choice in {"n", "no", "off", "false", "source"}:
+        return "off"
     return current
 
 
@@ -1830,13 +1842,17 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         args.english_output_mode or args.post_translate_to_english or args.translate_to_english
     )
     if args.post_translate_to_english:
-        english_output_mode = "post"
+        english_output_mode = "direct"
     if args.translate_to_english:
         english_output_mode = "direct"
     if interactive and not english_output_mode_locked:
         english_output_mode = prompt_english_output_mode(english_output_mode)
+    try:
+        english_output_mode = normalize_english_output_mode(english_output_mode)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     direct_whisper_translate = english_output_mode == "direct"
-    post_translate_to_english = english_output_mode in {"post", "auto"}
+    post_translate_to_english = False
 
     temperature = 0.0
     compression_ratio_threshold = 2.4
@@ -1984,37 +2000,6 @@ def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool =
         log_path=log_dir / f"{base}_whisperx.log",
         lock_path=output_dir / f"{base}{LOCK_SUFFIX}",
         status_path=status_utils.status_path_for_srt(srt_path),
-    )
-
-
-def normalize_language_code(language: str | None) -> str:
-    return (language or "").strip().lower().split("-", 1)[0]
-
-
-def source_srt_path_for_language(outputs: OutputPaths, source_lang: str | None) -> Path:
-    language = normalize_language_code(source_lang)
-    if language and language != "auto":
-        return outputs.srt_path.with_name(f"{outputs.srt_path.stem}.{language}.srt")
-    return outputs.source_srt_path
-
-
-def resolved_source_language(cfg: RunConfig, detected_language: str | None) -> str:
-    if cfg.language != "auto":
-        return normalize_language_code(cfg.language)
-    return normalize_language_code(detected_language)
-
-
-def should_post_translate_to_english(cfg: RunConfig, source_lang: str | None) -> bool:
-    language = normalize_language_code(source_lang)
-    if cfg.direct_whisper_translate or not cfg.post_translate_to_english:
-        return False
-    return language in SUPPORTED_POST_TRANSLATION_LANGS
-
-
-def build_post_translation_backend(cfg: RunConfig, server_url: str | None = None) -> ServerTranslationBackend:
-    return ServerTranslationBackend(
-        server_url=server_url or cfg.translation_server_url or "",
-        model_name=cfg.translation_model or DEFAULT_TRANSLATION_MODEL,
     )
 
 
@@ -2391,10 +2376,6 @@ def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report
     report(f"English:   {cfg.english_output_mode}")
     if cfg.english_output_mode == "direct":
         report("Translate: whisperx (direct English output)")
-    elif cfg.english_output_mode == "post":
-        report("Translate: post (source transcript -> English)")
-    elif cfg.english_output_mode == "auto":
-        report("Translate: auto (Spanish/German -> English post-translation)")
     else:
         report("Translate: off")
     report(f"Mode:      {cfg.mode}")
@@ -2574,76 +2555,11 @@ def transcribe_file(
             require_valid_srt_file(working_srt_path)
             finalize_srt_file(working_srt_path)
             require_valid_srt_file(working_srt_path)
-            source_lang = resolved_source_language(cfg, detected_language)
-            should_translate = should_post_translate_to_english(cfg, source_lang)
             if cfg.language == "auto":
                 report(f"Detected language: {detected_language or 'unknown'}.")
-            final_srt_for_outputs = working_srt_path
-            if should_translate:
-                if cfg.glossary_path and not Path(cfg.glossary_path).expanduser().exists():
-                    report(f'Glossary file not found: "{cfg.glossary_path}"')
-                source_srt_path = working_srt_path
-                if cfg.save_source_srt:
-                    source_srt_path = source_srt_path_for_language(outputs, source_lang)
-                    atomic_write_text(source_srt_path, working_srt_path.read_text(encoding="utf-8", errors="ignore"))
-                working_english_srt_path = temporary_sibling_path(outputs.english_srt_path, suffix=".srt.tmp")
-                report(f"Translating {source_lang} transcript to English text...")
-                translation_server: ManagedTranslationServer | None = None
-                try:
-                    translation_server_log_path = outputs.log_path.with_name(
-                        f"{input_path.stem}_translation_server.log"
-                    )
-                    if not cfg.translation_server_url:
-                        report("Starting local post-translation server...")
-                    translation_server = ManagedTranslationServer.start(
-                        server_url=cfg.translation_server_url,
-                        model_name=cfg.translation_model or DEFAULT_TRANSLATION_MODEL,
-                        log_path=translation_server_log_path,
-                    )
-                    if translation_server.started:
-                        report(f'Local post-translation server: "{translation_server.server_url}"')
-                        report(f'Translation server log: "{translation_server_log_path}"')
-                    translate_generated_srt_to_english(
-                        source_srt_path=source_srt_path,
-                        english_srt_path=working_english_srt_path,
-                        source_lang=source_lang,
-                        backend=build_post_translation_backend(cfg, server_url=translation_server.server_url),
-                        glossary=cfg.glossary,
-                        device=cfg.device,
-                        batch_size=cfg.translation_batch_size,
-                        max_new_tokens=cfg.translation_max_new_tokens,
-                        report_path=outputs.translation_report_path,
-                        english_output_mode=cfg.english_output_mode,
-                    )
-                    require_valid_srt_file(working_english_srt_path)
-                    atomic_replace_path(working_english_srt_path, outputs.english_srt_path)
-                    final_srt_for_outputs = outputs.english_srt_path
-                except Exception as exc:
-                    append_log_message(outputs.log_path, f"[transcriber] Translation failed: {exc}")
-                    report("")
-                    report(f"Translation failed: {exc}")
-                    report("Keeping the original transcript text.")
-                    report("")
-                    with contextlib.suppress(OSError):
-                        working_english_srt_path.unlink()
-                    if cfg.english_output_mode == "post":
-                        raise RuntimeError(f"Explicit post-translation failed: {exc}") from exc
-                finally:
-                    if translation_server is not None and translation_server.started:
-                        report("Stopping local post-translation server...")
-                        translation_server.close()
-            elif cfg.post_translate_to_english and not cfg.direct_whisper_translate and source_lang not in {"", "en"}:
-                message = f"Post-translation skipped: source language {source_lang!r} is not supported."
-                append_log_message(outputs.log_path, f"[transcriber] {message}")
-                report(message)
             if cfg.write_llm_txt:
-                build_llm_file(final_srt_for_outputs, outputs.llm_path)
-            if same_path(final_srt_for_outputs, working_srt_path):
-                atomic_replace_path(working_srt_path, outputs.srt_path)
-            else:
-                atomic_write_text(outputs.srt_path, final_srt_for_outputs.read_text(encoding="utf-8", errors="ignore"))
-                with contextlib.suppress(OSError):
-                    working_srt_path.unlink()
+                build_llm_file(working_srt_path, outputs.llm_path)
+            atomic_replace_path(working_srt_path, outputs.srt_path)
             write_status("succeeded")
         except Exception as exc:
             append_log_message(outputs.log_path, f"[transcriber] Output finalization failed: {exc}")

@@ -1,10 +1,15 @@
 # ADR-004: Use Local Server Post-Translation for File English Output
 
 ## Status
-Accepted
+Superseded
 
 ## Date
 2026-06-08
+
+## Superseding Update
+On 2026-06-08, local server post-translation was retired from the visible file transcription command surface. The normal CLI and interactive settings now expose only source-language output (`off`) and WhisperX direct English translation (`direct`). Legacy `post` / `auto` mode values, `--post-translate-to-english`, and old server-tuning flags remain parseable only for saved-command compatibility, are hidden from command help, and resolve to direct WhisperX translation instead of starting vLLM, WSL2, or a local OpenAI-compatible server.
+
+The historical decision below remains useful context for why the local server path was attempted, but it is no longer the active command behavior.
 
 ## Context
 The file transcription pipeline needed a visible English conversion setting anywhere users choose normal transcription settings. The existing `--translate-to-english` path asks WhisperX to translate directly, which preserves compatibility but can be less accurate for Spanish/German subtitle workflows because source-language transcription and cleanup are skipped.

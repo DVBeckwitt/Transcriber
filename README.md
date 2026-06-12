@@ -1,13 +1,11 @@
 # Transcriber
 
 Local WhisperX launcher for fast transcription from audio/video files.
-It can transcribe first, convert generated Spanish/German files to English through a local OpenAI-compatible translation server, or use WhisperX direct English translation for legacy Spanish workflows.
+It can transcribe source-language audio/video files, or use WhisperX direct English translation when translation is requested.
 
 It generates:
-- `your_file.srt` subtitle transcript
+- `your_file.srt` subtitle transcript, in the source language by default or English when WhisperX translation is enabled
 - `your_file_llm.txt` clean text block for LLM workflows
-- optional `your_file.es.srt` / `your_file.de.srt` source subtitles plus `your_file.en.srt` English subtitles when post-translation is enabled
-- optional `your_file.translation.json` audit metadata for post-translation runs
 - `logs/your_file_whisperx.log` full run log in the project folder
 - `logs/transcriber-watcher.log` watch-mode activity log in the project folder
 
@@ -36,16 +34,12 @@ Live caption mode has heavier optional dependencies and requires Python 3.11+:
 pip install -e ".[live]"
 ```
 
-Local post-translation uses Python's standard-library HTTP client to talk to an OpenAI-compatible localhost server. No HTTP client extra is required.
-
 With `uv`, use a Python 3.11+ environment and install optional extras as needed:
 
 ```powershell
 $env:UV_PROJECT_ENVIRONMENT = ".uv-venv"
 uv sync --extra live
 ```
-
-When `--english-output-mode post` or `auto` needs post-translation and no `--translation-server-url` is provided, the launcher tries to start `vllm serve` from the active Python environment or `PATH`, then stops the process when the run finishes. On Windows, if native `vllm` is not available, it falls back to `vllm` in the default WSL2 distribution and still exposes the server through localhost. Install vLLM separately in Windows or WSL if you want this automatic server startup path.
 
 ## Development
 
@@ -91,12 +85,11 @@ Project workflow and governance:
 - Watcher move bug: fixed. Moving completed watcher outputs now checks for the `.srt` before moving media and rolls the media file back if the `.srt` move fails.
 - Transcript merge security bug: fixed. `merge_transcripts.py` skips Hugging Face token files case-insensitively and avoids generated/cache directories.
 - Speaker label option: ready for release. The interactive CLI prompts for speaker labels after language and quality/fast choices. `--speaker-labels` and `--no-speaker-labels` still control whether SRT output includes `SPEAKER_00:` style labels; `--no-speaker-labels` skips diarization and Hugging Face token loading. Existing `--diarize` and `--no-diarize` flags remain supported aliases.
-- File English conversion: ready for release. `--english-output-mode` is visible in the normal settings flow and supports `off`, `direct`, `post`, and `auto`. Server post-translation is local-only by default, auto-starts a local vLLM server when no URL is supplied, falls back to default-distro WSL2 vLLM on Windows when native vLLM is unavailable, preserves source `.es.srt` / `.de.srt`, and writes English `.en.srt` plus compatibility `.srt` when translation succeeds. Post-translation defaults to one subtitle cue per request and a 1024-token generation cap for reliability. It retries residual source-language or dropped-content cues once as single-cue requests, records the quality gate in `your_file.translation.json`, and does not promote failed English candidates. Explicit `post` fails if the local server cannot start, translation fails, or the quality gate still fails; `auto` warns and keeps source output when post-translation is unavailable or rejected. The false preflight failure for missing `httpx` is fixed because post-translation now uses stdlib HTTP. The default local model is `utter-project/EuroLLM-1.7B-Instruct` for local 12 GB GPU compatibility.
-- WSL2 post-translation server fallback: ready for release and smoke-tested on 2026-06-08 with WSL vLLM serving `utter-project/EuroLLM-1.7B-Instruct` through the OpenAI-compatible localhost API. Windows native vLLM remains preferred; default-distro WSL2 vLLM is used only when native vLLM is unavailable. No CLI migration is required, and rollback is a normal git revert.
+- File English conversion: updated on 2026-06-08. The normal settings flow now offers source-language output or WhisperX direct English translation only. `--english-output-mode` visibly supports `off` and `direct`; `--translate-to-english` remains the compatibility alias for direct WhisperX translation. Legacy `post` / `auto` values and the old post-translation server flags are hidden from command help and coerced to direct translation when parsed for old launchers. The local vLLM/WSL2 post-translation path is no longer a command option or preflight requirement.
 - Live caption mode: startup smoke passed with the `live` extra installed. The latency launcher remains direct English and writes `logs\live_english_transcript.txt` by default. The quality launcher uses cascade mode, writes English and bilingual logs, applies mode-aware Spanish prompts, and prints audio diagnostics. The previous direct-mode bilingual log bug is fixed by rejecting bilingual transcript output unless cascade mode is selected. Full live audio validation with Windows loopback input is still pending.
 - Code simplification: accepted. Config preset setup, temporary directory candidate handling, SRT finalization, confidence cleanup, transcript merge collection, speaker-label prompt/config control flow, and live translation-mode helper/parser cleanup were simplified without changing public CLI behavior.
 - Generated artifacts: cleaned. Bytecode caches, sample media/log output, build output, and local uv environments are not part of the committed source.
-- Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. No migration or deprecation is required because direct WhisperX translation and old diarization aliases remain supported. Rollback is `git revert` of the release commit.
+- Release posture: local quality gates, coverage, hook checks, dependency audit, and secret scan pass; deployment is a local CLI/source release. Direct WhisperX translation and old diarization aliases remain supported; the local vLLM/WSL2 post-translation command path is retired from the visible CLI. Rollback is `git revert` of the release commit.
 
 ## Hugging Face token (for speaker labels)
 
@@ -115,11 +108,9 @@ Important:
   - https://hf.co/pyannote/segmentation-3.0
 
 Optional:
-- Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology during post-translation.
+- Add `transcriber_glossary.txt` in the project folder, or pass `--glossary` / `--glossary-file`, to preserve names and terminology in the ASR prompt.
 - Add `--asr-prompt` or `--asr-prompt-file` to bias WhisperX toward names and jargon during transcription.
-- Add `--english-output-mode post` to transcribe the source language first, then convert generated Spanish/German output to English.
-- Add `--english-output-mode auto` to post-translate Spanish/German, skip English, and keep unsupported languages in the source language.
-- Add `--translate-to-english` or `--english-output-mode direct` to use legacy WhisperX translation mode so the `.srt` is written in English directly.
+- Add `--translate-to-english` or `--english-output-mode direct` to use WhisperX translation mode so the `.srt` is written in English directly.
 - Add `--no-speaker-labels` when you do not want `SPEAKER_00:` style labels in the SRT; this also skips diarization and the Hugging Face token requirement.
 - Use `--temperature-schedule`, `--best-of`, `--logprob-threshold`, and related options to control decode fallbacks.
 
@@ -263,40 +254,17 @@ Spanish source audio with direct English SRT output:
 transcriber --input "C:\media\call.wav" --lang es --translate-to-english
 ```
 
+German source audio with direct English SRT output:
+
+```powershell
+transcriber --input "C:\media\meeting.mp4" --lang de --english-output-mode direct
+```
+
 Auto-detect source language without forced English conversion:
 
 ```powershell
 transcriber --input "C:\media\call.wav" --lang auto
 ```
-
-Maximum-accuracy English output from Spanish or German source subtitles:
-
-```powershell
-transcriber --input "C:\media\call.wav" --lang auto --mode quality --english-output-mode post --translation-backend server
-```
-
-Reuse an already-running local EuroLLM server:
-
-```powershell
-vllm serve utter-project/EuroLLM-1.7B-Instruct
-transcriber --input "C:\media\call.wav" --english-output-mode post --translation-backend server --translation-server-url http://localhost:8000/v1
-```
-
-If `--translation-server-url` is omitted, post-translation auto-starts `vllm serve <translation model>` on `127.0.0.1`, waits for the OpenAI-compatible `/v1/models` endpoint, and stops that child process when translation finishes. Native Windows `vllm` is tried first. If it is missing on Windows, the launcher checks the default WSL2 distribution for `vllm` and starts it with `wsl -e sh -lc ...`. If `--translation-server-url` is supplied, the launcher reuses that existing server and does not stop it.
-
-The default post-translation model is `utter-project/EuroLLM-1.7B-Instruct`, a small European-language translation model chosen for local 12 GB GPU systems. Override it with `--translation-model` when you want to use another local server model.
-
-For the WSL2 fallback, WSL must be able to start, the default distribution must have `vllm` on its Linux `PATH`, and Windows localhost forwarding must be working. Install vLLM inside WSL with a Linux Python environment; do not install a Linux NVIDIA display driver inside WSL.
-
-`--translation-server-url` accepts localhost or loopback HTTP(S) URLs such as `http://localhost:8000/v1` or `http://127.0.0.1:8000/v1`. Remote URLs are rejected by default so transcript text is not accidentally sent off-machine.
-
-Post-translation defaults are conservative because the local 1.7B model is more reliable with small requests:
-
-```powershell
-transcriber --input "C:\media\call.wav" --english-output-mode post --translation-batch-size 1 --translation-max-new-tokens 1024
-```
-
-Increasing `--translation-batch-size` can be faster but raises the chance of malformed JSON, dropped items, or untranslated runs. Increasing `--translation-max-new-tokens` gives the model more room to finish a response; it is a cap, not a guarantee that every request will use that many tokens.
 
 German source audio:
 
@@ -343,7 +311,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - WhisperX receives an initial prompt built from `--asr-prompt`, `--asr-prompt-file`, and glossary terms when present.
 - Quality mode uses a fallback temperature schedule by default; fast mode uses a single-pass decode.
 - Interactive one-off runs prompt for language, quality/fast mode, and speaker labels unless those choices are already provided with CLI arguments.
-- Interactive one-off runs also expose `Convert generated output to English` with `off`, `post`, `direct`, and `auto` choices. Quality mode defaults to `auto`; fast mode defaults to `off`.
+- Interactive one-off runs also ask whether to translate to English with WhisperX. The default is no unless direct translation was already selected by CLI flag.
 - Watch mode monitors the top level of the watched folder for supported media files.
 - The default recordings watcher also monitors `%USERPROFILE%\Videos\escuela` for supported video files.
 - Watch mode waits for a file to stop changing before transcription starts.
@@ -356,12 +324,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 - Language is auto-detected unless you force `--lang en`, `--lang es`, or `--lang de`.
 - `--english-output-mode off` keeps generated subtitles/transcripts in the detected or forced source language.
 - `--english-output-mode direct` or `--translate-to-english` asks WhisperX to write English subtitle text directly.
-- `--english-output-mode post` transcribes Spanish/German source first, writes `your_file.es.srt` or `your_file.de.srt`, then writes English `your_file.en.srt` and compatibility `your_file.srt`.
-- In explicit `post` mode, the launcher auto-starts a local vLLM server when no server URL is supplied. On Windows it can start default-distro WSL2 vLLM when native vLLM is unavailable. Startup or translation failure marks the run failed instead of silently producing source-only output.
-- `--english-output-mode auto` post-translates Spanish/German when a local server can be reused or auto-started, skips translation for English, and keeps unsupported or failed post-translation output in the source language with a warning.
-- Post-translation writes `your_file.translation.json` with backend/model, cue count, batch size, token cap, warnings, selected English mode, and `quality_check` fields. It does not include the transcript text.
-- The post-translation quality gate looks for obvious residual Spanish/German text and dropped cue content after the model returns valid JSON. Flagged cues are retried once individually. If they still fail, explicit `post` fails and `auto` keeps source-language output instead of promoting the bad English candidate.
-- Local model JSON/index mistakes are recovered when the server still returns exactly one translated text item per input cue; recovery warnings are written to the translation report. Changed cue/item counts fail for single-cue requests and trigger per-cue retry for larger batches, so subtitle timing is kept one-to-one or the run fails.
+- Legacy `post` / `auto` English mode values are no longer visible command choices. If an old launcher passes them, they are treated as direct WhisperX translation instead of starting a local translation server.
 - If speaker labels are disabled, the launcher skips diarization and writes SRT text without `SPEAKER_00:` prefixes.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
@@ -389,14 +352,7 @@ python -m transcriber --live-loopback-test --seconds 10 --output loopback_test.w
 --glossary-file    Glossary text file (one entry per line)
 --asr-prompt       Optional text prompt to bias WhisperX toward names and jargon
 --asr-prompt-file  Text file with extra ASR prompt lines
---english-output-mode  off | direct | post | auto
---post-translate-to-english  Shortcut for --english-output-mode post
---translation-backend  server
---translation-model    Model name for the local translation server (default: utter-project/EuroLLM-1.7B-Instruct)
---translation-server-url  Optional OpenAI-compatible localhost/loopback server base URL; omitted means auto-start vLLM
---translation-batch-size  Subtitle cues per post-translation request (default: 1)
---translation-max-new-tokens  Generated-token cap per post-translation request (default: 1024)
---save-source-srt / --no-save-source-srt
+--english-output-mode  off | direct
 --translate-to-english  Use WhisperX translation mode to write English subtitles directly
 --temperature      Single decoding temperature
 --temperature-schedule  Comma-separated fallback temperatures

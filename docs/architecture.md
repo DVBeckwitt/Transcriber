@@ -10,7 +10,7 @@ CLI args / batch files
   -> build_config
   -> resolve input or watch targets
   -> transcribe_file
-  -> WhisperX / translation / cleanup
+  -> WhisperX / cleanup
   -> output files next to source media
 ```
 
@@ -49,16 +49,16 @@ reference Spanish text + committed bilingual transcript
 
 ## Module Map
 
-- `transcriber/__main__.py`: CLI surface, `RunConfig`, output path contracts, WhisperX execution, subtitle cleanup, file post-translation orchestration, watch mode, and completed-file movement.
-- `transcriber/translation.py`: file post-translation contracts and helpers. It defines `TranslationRequest`, `TranslationResult`, the backend protocol, glossary placeholders, source-SRT to English-SRT conversion, translation reports, the OpenAI-compatible local server backend, and owned vLLM server lifecycle management. Heavy model/server imports stay lazy.
+- `transcriber/__main__.py`: CLI surface, `RunConfig`, output path contracts, WhisperX execution, subtitle cleanup, watch mode, and completed-file movement.
+- `transcriber/translation.py`: legacy local-server post-translation contracts and helpers retained outside the current command surface. The file/watch pipeline no longer calls this module for English conversion; keep heavy model/server imports lazy while this code remains.
 - `transcriber/live.py`: live-mode configuration and coordinator. It starts/stops capture, WhisperLiveKit streaming, caption updates, translation-mode validation, and optional English-only or bilingual transcript saving.
 - `transcriber/live_audio.py`: Windows WASAPI loopback device discovery, loopback test WAV writing, and PCM conversion to 16 kHz mono signed 16-bit little-endian audio.
 - `transcriber/live_wlk.py`: WhisperLiveKit subprocess command construction, readiness polling, WebSocket protocol handling, and caption-state extraction.
 - `transcriber/live_window.py`: Tkinter always-on-top caption window fed through a thread-safe queue.
 - `merge_transcripts.py`: standalone text utility for recursively merging transcript `.txt` files while skipping token files and generated/cache directories.
 - `tools/evaluate_live_transcript.py`: source-repo developer tool for deterministic CER/WER checks against committed live bilingual transcript text. It is not a packaged console script.
-- `tests/test_helpers.py`: unit tests for config, prompts, watcher policy, file movement failure handling, file post-translation orchestration, confidence cleanup, and transcript merging.
-- `tests/test_translation.py`: unit tests for file post-translation helpers, report metadata, local server batching, URL safety, and response validation.
+- `tests/test_helpers.py`: unit tests for config, prompts, watcher policy, file movement failure handling, WhisperX direct translation orchestration, confidence cleanup, and transcript merging.
+- `tests/test_translation.py`: unit tests for legacy file post-translation helpers, report metadata, local server batching, URL safety, and response validation.
 - `*.bat`: Windows launchers. They should stay thin wrappers around `python -m transcriber`; `live_translate.bat` is the latency/direct launcher and `live_translate_quality.bat` is the accuracy/cascade launcher.
 - `.github/workflows/ci.yml`: CI contract for tests with coverage, lint, format, type checking, CLI startup, package build, dependency audit, pre-commit hooks, and secret scanning.
 - `docs/decisions/`: ADRs for decisions that future agents should not re-decide from scratch.
@@ -67,10 +67,10 @@ reference Spanish text + committed bilingual transcript
 
 - CLI options documented in `README.md` are user-facing. Preserve them unless a change explicitly deprecates behavior.
 - `RunConfig` is the internal configuration object passed through transcription and watcher flows. `speaker_labels` records the user-facing SRT display choice; `diarize` records whether WhisperX diarization should run.
-- `OutputPaths` defines where compatibility `.srt`, source-language `.source/.es/.de.srt`, English `.en.srt`, translation reports, `*_llm.txt`, logs, and lock files are expected.
-- File English output mode is explicit. `direct` uses WhisperX translation and preserves legacy behavior; `post` transcribes Spanish/German source first and then writes English output through `transcriber.translation`; `auto` post-translates Spanish/German, skips English, and warns while preserving unsupported source output; `off` keeps source-language output only. Server-backed post-translation accepts localhost/loopback URLs by default, auto-starts `vllm serve` when no URL is supplied, falls back to default-distro WSL2 vLLM on Windows when native vLLM is unavailable, stops only the process it started, and fails explicit `post` runs when English output cannot be produced. The default local post-translation model is `utter-project/EuroLLM-1.7B-Instruct`, chosen to fit local 12 GB GPU systems; larger models remain opt-in through `--translation-model`. Local post-translation defaults to one cue per request and a 1024-token cap. `--translation-batch-size` and `--translation-max-new-tokens` are additive tuning knobs that flow through `RunConfig`. Local model response parsing requires one translated item per source cue, recovers by item order when only returned indexes are malformed, and retries malformed multi-cue batches as single-cue requests before failing. After valid JSON parsing, `translate_srt_to_english` runs a quality gate for obvious residual Spanish/German text and dropped cue content, retries failed cues once individually, writes `quality_check` metadata to the translation report, and only writes/promotes English SRT output when the gate passes. Explicit `post` fails after an unrecovered quality failure; `auto` preserves source-language output through the existing translation-failure fallback.
+- `OutputPaths` defines where compatibility `.srt`, legacy source/English/translation-report paths, `*_llm.txt`, logs, and lock files are expected.
+- File English output mode is explicit. `off` keeps source-language output only. `direct` uses WhisperX translation and is the only visible English conversion path. Legacy `post` / `auto` values and old post-translation server flags are hidden from help and normalize to direct translation when parsed for old launchers; they do not start vLLM, WSL2, or a local OpenAI-compatible server.
 - `WatchTarget` defines per-folder watcher policy, including allowed extensions, destination moves, and rename strategy.
-- Live mode is only entered through `--live`, `--live-list-devices`, or `--live-loopback-test`. It does not call `transcribe_file`, WhisperX alignment, PyAnnote diarization, SRT cue generation, or file post-translation.
+- Live mode is only entered through `--live`, `--live-list-devices`, or `--live-loopback-test`. It does not call `transcribe_file`, WhisperX alignment, PyAnnote diarization, SRT cue generation, or legacy file post-translation helpers.
 - `LiveConfig` is the live-mode boundary between CLI parsing and runtime orchestration. New live quality controls should be added there first, then passed through to `live_wlk.build_wlk_command` without changing file/watch `RunConfig`.
 - `CaptionState` is the live UI and live transcript contract. Full-mode WhisperLiveKit updates replace the partial caption line instead of appending it. In direct mode, committed pairs intentionally have empty source text because WLK committed `text` is already English; in cascade mode, committed pairs preserve each line's source-language text with its English translation.
 - `tools/evaluate_live_transcript.py` parses the committed Spanish bilingual transcript text format written by cascade mode: numbered entries with `ES:` and `EN:` lines. Keep it dependency-free and deterministic so it remains usable without WhisperLiveKit, audio hardware, network, GPU, or model downloads.
@@ -89,17 +89,17 @@ reference Spanish text + committed bilingual transcript
 - The live translation-mode helper/parser cleanup is an internal refactor only. It does not change CLI options, defaults, direct/cascade transcript semantics, WLK command flags, CI gates, or migration posture.
 - Live-mode error status: missing optional live dependencies now report a clear install message instead of a traceback, and WLK subprocess startup failures terminate the child process before returning an error.
 - Live-mode rollout status: additive local beta. Startup smoke has passed with the `live` extra installed, but full Windows loopback audio validation is still pending. No existing file transcription/watch behavior is migrated or deprecated, and `live_translate.bat` remains the fast path.
-- File post-translation rollout status: additive local CLI feature. No existing direct WhisperX translation path is deprecated; `--translate-to-english` remains the compatibility alias for `direct`. Explicit `post` starts a local vLLM OpenAI-compatible server when no URL is supplied and fails when English output cannot be produced. On Windows, auto-start can use default-distro WSL2 vLLM when native vLLM is unavailable; the WSL shell command path is quoted and unit-tested against model-name shell metacharacters. `auto` is fallback-friendly and keeps source output with a warning when post-translation is unavailable or rejected by the quality gate. Missing `httpx` is no longer a preflight blocker because the server backend uses stdlib HTTP. The default post-translation model is `utter-project/EuroLLM-1.7B-Instruct` for local 12 GB GPU compatibility and has passed local WSL2 vLLM smoke testing through the OpenAI-compatible API.
+- File English conversion rollout status: the local vLLM/WSL2 post-translation command path is retired from the visible CLI. No existing direct WhisperX translation path is deprecated; `--translate-to-english` remains the compatibility alias for `direct`. Legacy `post` / `auto` inputs remain parseable only to avoid breaking saved commands, and now resolve to direct WhisperX translation.
 - Rollback is git-based: revert the release commit and rerun the full validation gate.
 
 ## Change Guide
 
 - CLI argument or config behavior: update `parse_args`, `build_config`, README CLI options, and tests.
-- File post-translation behavior: update `transcriber/translation.py`, the finalization branch in `transcribe_file`, README output-mode docs, and fake-backend tests. Do not add heavyweight model imports at module import time.
+- File English conversion behavior: update `build_config`, `run_whisperx_direct`, the finalization branch in `transcribe_file`, README output-mode docs, and helper tests. Do not reintroduce heavyweight model/server imports at module import time.
 - Live-mode behavior: update `transcriber/live.py`, `transcriber/live_audio.py`, `transcriber/live_wlk.py`, `transcriber/live_window.py`, README live commands, and live tests.
 - Live transcript evaluation: update `tools/evaluate_live_transcript.py` and `tests/test_live_eval.py`.
 - Transcription execution: update `transcribe_file`, WhisperX helpers, and tests that mock execution.
-- Translation behavior: update translation helpers and tests around backend requests, reports, batching, and token limits.
+- Legacy translation helper behavior: update `transcriber/translation.py` and `tests/test_translation.py`. This module is not part of the current file/watch command surface.
 - Watch folder policy: update `build_watch_targets`, `run_watch_loop`, watcher docs, and tests.
 - Completed-file movement: update `move_completed_watch_outputs` and regression tests for missing or locked `.srt` files.
 - Transcript merging: update `merge_transcripts.py` and merge utility tests.

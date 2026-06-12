@@ -130,7 +130,7 @@ class FakeUrlOpen:
 
 
 class ScriptedUrlOpen:
-    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
+    def __init__(self, responses: list[dict[str, Any] | str | Exception]) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
@@ -150,7 +150,8 @@ class ScriptedUrlOpen:
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return FakeResponse({"choices": [{"message": {"content": json_module.dumps(response)}}]})
+        content = response if isinstance(response, str) else json_module.dumps(response)
+        return FakeResponse({"choices": [{"message": {"content": content}}]})
 
 
 class FakeServerProcess:
@@ -512,6 +513,58 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(client.calls[0]["json"]["max_tokens"], 128)
         content_type = {key.lower(): value for key, value in client.calls[0]["headers"].items()}["content-type"]
         self.assertEqual(content_type, "application/json")
+
+    def test_server_backend_recovers_fenced_json_content(self) -> None:
+        client = ScriptedUrlOpen(
+            [
+                '```json\n{"items": [{"index": 0, "text": "Hello"}]}\n```',
+            ]
+        )
+        backend = ServerTranslationBackend(
+            server_url="http://localhost:8000/v1",
+            model_name="custom-translation-model",
+            client=client,
+        )
+
+        result = backend.translate_texts(
+            TranslationRequest(
+                source_lang="de",
+                target_lang="en",
+                texts=["Hallo"],
+                glossary={},
+                preserve_markers=(),
+            ),
+            device="cpu",
+            batch_size=1,
+            max_new_tokens=128,
+        )
+
+        self.assertEqual(result.texts, ["Hello"])
+        self.assertTrue(any("fenced JSON" in warning for warning in result.warnings))
+
+    def test_server_backend_recovers_single_plain_text_content(self) -> None:
+        client = ScriptedUrlOpen(["Hello"])
+        backend = ServerTranslationBackend(
+            server_url="http://localhost:8000/v1",
+            model_name="custom-translation-model",
+            client=client,
+        )
+
+        result = backend.translate_texts(
+            TranslationRequest(
+                source_lang="de",
+                target_lang="en",
+                texts=["Hallo"],
+                glossary={},
+                preserve_markers=(),
+            ),
+            device="cpu",
+            batch_size=1,
+            max_new_tokens=128,
+        )
+
+        self.assertEqual(result.texts, ["Hello"])
+        self.assertTrue(any("plain text" in warning for warning in result.warnings))
 
     def test_server_backend_batches_chat_requests(self) -> None:
         client = FakeUrlOpen()

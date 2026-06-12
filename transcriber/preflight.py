@@ -6,13 +6,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from transcriber.errors import PreflightError
-from transcriber.translation import (
-    DEFAULT_TRANSLATION_MODEL,
-    DEFAULT_TRANSLATION_SERVER_HOST,
-    DEFAULT_TRANSLATION_SERVER_PORT,
-    local_vllm_command,
-    openai_server_ready,
-)
 
 
 @dataclass(frozen=True)
@@ -75,33 +68,6 @@ def check_transcription_preflight(*, cfg: Any, hf_token_present: bool, require_f
     if bool(getattr(cfg, "diarize", False)) and not hf_token_present:
         errors.append("Speaker diarization requires HF_TOKEN or hf_token.txt/HF_TOKEN.txt.")
 
-    needs_post_translation = bool(getattr(cfg, "post_translate_to_english", False)) and not bool(
-        getattr(cfg, "direct_whisper_translate", False)
-    )
-    if needs_post_translation and str(getattr(cfg, "translation_backend", "")) == "server":
-        if not str(getattr(cfg, "translation_server_url", "") or "").strip():
-            default_server_url = f"http://{DEFAULT_TRANSLATION_SERVER_HOST}:{DEFAULT_TRANSLATION_SERVER_PORT}/v1"
-            server_ready = openai_server_ready(default_server_url)
-            can_start_server = server_ready or bool(
-                local_vllm_command(
-                    DEFAULT_TRANSLATION_MODEL,
-                    DEFAULT_TRANSLATION_SERVER_PORT,
-                )
-            )
-            if can_start_server:
-                warnings.append(
-                    "No post-translation server URL was supplied; transcriber will reuse or auto-start a local server."
-                )
-            else:
-                message = (
-                    "Post-translation auto-start needs the vllm command. Install vLLM in Windows or WSL, "
-                    "put vllm on PATH, or set --translation-server-url for an existing local server."
-                )
-                if str(getattr(cfg, "english_output_mode", "")) == "post":
-                    errors.append(message)
-                else:
-                    warnings.append(message)
-
     return PreflightReport(errors=tuple(errors), warnings=tuple(warnings))
 
 
@@ -113,8 +79,8 @@ def validate_run_config(cfg: Any | None = None, **values: float | None) -> Prefl
             errors.append("language must be one of: auto, en, es, de.")
         if str(getattr(cfg, "mode", "")) not in {"quality", "fast"}:
             errors.append("mode must be one of: quality, fast.")
-        if str(getattr(cfg, "english_output_mode", "")) not in {"off", "direct", "post", "auto"}:
-            errors.append("english_output_mode must be one of: off, direct, post, auto.")
+        if str(getattr(cfg, "english_output_mode", "")) not in {"off", "direct"}:
+            errors.append("english_output_mode must be one of: off, direct.")
         if str(getattr(cfg, "translation_backend", "")) not in {"server"}:
             errors.append("translation_backend must be one of: server.")
         for field in (

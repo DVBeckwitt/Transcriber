@@ -28,6 +28,7 @@ DEFAULT_TRANSLATION_SERVER_HOST = "127.0.0.1"
 DEFAULT_TRANSLATION_SERVER_PORT = 8000
 DEFAULT_TRANSLATION_SERVER_START_TIMEOUT_SECONDS = 30 * 60.0
 _WORD_RE = re.compile(r"[A-Za-z\u00c0-\u024f]+")
+_JSON_CODE_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 _GERMAN_MARKER_RE = re.compile(r"[\u00c4\u00d6\u00dc\u00e4\u00f6\u00fc\u00df]")
 _SPANISH_MARKER_RE = re.compile(
     r"[\u00c1\u00c9\u00cd\u00d3\u00da\u00dc\u00d1\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00f1\u00bf\u00a1]"
@@ -889,11 +890,62 @@ def _chat_completion_content(data: Any) -> str:
 
 
 def _parse_indexed_translation_content(content: str, *, expected_count: int) -> _ParsedTranslationBatch:
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise _TranslationResponseFormatError("Translation server response was not valid JSON.") from exc
+    json_error: json.JSONDecodeError | None = None
+    format_error: _TranslationResponseFormatError | None = None
+    for candidate, warning in _translation_json_candidates(content):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            json_error = exc
+            continue
+        try:
+            parsed = _parse_indexed_translation_payload(payload, expected_count=expected_count)
+        except _TranslationResponseFormatError as exc:
+            format_error = exc
+            continue
+        if warning:
+            return _ParsedTranslationBatch(texts=parsed.texts, warnings=[warning, *parsed.warnings])
+        return parsed
 
+    if format_error is not None:
+        raise format_error
+
+    plain_text = normalize_subtitle_whitespace(content)
+    if expected_count == 1 and plain_text:
+        return _ParsedTranslationBatch(
+            texts=[plain_text],
+            warnings=["Recovered single-item translation from plain text model response."],
+        )
+
+    if json_error is not None:
+        raise _TranslationResponseFormatError("Translation server response was not valid JSON.") from json_error
+    raise _TranslationResponseFormatError("Translation server response was not valid JSON.")
+
+
+def _translation_json_candidates(content: str) -> list[tuple[str, str | None]]:
+    stripped = content.strip()
+    candidates: list[tuple[str, str | None]] = [(stripped, None)]
+
+    for match in _JSON_CODE_BLOCK_RE.finditer(content):
+        candidate = match.group(1).strip()
+        if candidate:
+            candidates.append((candidate, "Recovered translation response from fenced JSON content."))
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append((stripped[start : end + 1], "Recovered translation response from embedded JSON content."))
+
+    deduped: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for candidate, warning in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            deduped.append((candidate, warning))
+    return deduped
+
+
+def _parse_indexed_translation_payload(payload: Any, *, expected_count: int) -> _ParsedTranslationBatch:
     raw_items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(raw_items, list):
         raise _TranslationResponseFormatError("Translation server JSON did not contain an items array.")

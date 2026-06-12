@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json as json_module
 import shutil
 import sys
 import unittest
@@ -22,6 +21,7 @@ from transcriber.__main__ import (
     ESCUELA_RENAME_STRATEGY,
     VIDEO_EXTENSIONS,
     RunConfig,
+    TeeTextIO,
     TimedToken,
     apply_confidence_cleanup,
     build_asr_prompt,
@@ -48,7 +48,6 @@ from transcriber.__main__ import (
     translate_spanish_texts,
 )
 from transcriber.preflight import PreflightReport, check_transcription_preflight
-from transcriber.translation import TranslationRequest, TranslationResult
 
 
 def make_cfg(**overrides: object) -> RunConfig:
@@ -116,74 +115,14 @@ def speaker_labeled_result() -> dict[str, Any]:
     }
 
 
-class FakePostTranslationBackend:
-    name = "fake"
-    model_name = "fake-model"
-
-    def translate_texts(
-        self,
-        request: TranslationRequest,
-        *,
-        device: str,
-        batch_size: int,
-        max_new_tokens: int,
-    ) -> TranslationResult:
-        translations = {
-            "Gracias": "Thanks",
-            "Hallo": "Hello",
-            "Hola": "Hello",
-        }
-        return TranslationResult(
-            texts=[translations.get(text, f"English: {text}") for text in request.texts],
-            backend=self.name,
-            model=self.model_name,
-            warnings=[],
-        )
-
-
-class FailingPostTranslationBackend:
-    name = "failing"
-    model_name = "failing-model"
-
-    def translate_texts(
-        self,
-        request: TranslationRequest,
-        *,
-        device: str,
-        batch_size: int,
-        max_new_tokens: int,
-    ) -> TranslationResult:
-        raise RuntimeError("server unavailable")
-
-
-class ResidualPostTranslationBackend:
-    name = "residual"
-    model_name = "residual-model"
-
-    def translate_texts(
-        self,
-        request: TranslationRequest,
-        *,
-        device: str,
-        batch_size: int,
-        max_new_tokens: int,
-    ) -> TranslationResult:
-        return TranslationResult(
-            texts=list(request.texts),
-            backend=self.name,
-            model=self.model_name,
-            warnings=[],
-        )
-
-
 class HelperTests(unittest.TestCase):
-    def test_build_config_defaults_to_auto(self) -> None:
+    def test_build_config_defaults_to_source_language_output(self) -> None:
         cfg = build_config(parse_args([]), interactive=False)
         self.assertEqual(cfg.language, "auto")
         self.assertFalse(cfg.translate_to_english)
-        self.assertEqual(cfg.english_output_mode, "auto")
+        self.assertEqual(cfg.english_output_mode, "off")
         self.assertFalse(cfg.direct_whisper_translate)
-        self.assertTrue(cfg.post_translate_to_english)
+        self.assertFalse(cfg.post_translate_to_english)
         self.assertTrue(cfg.speaker_labels)
         self.assertTrue(cfg.diarize)
         self.assertEqual(cfg.translation_batch_size, 1)
@@ -197,6 +136,17 @@ class HelperTests(unittest.TestCase):
 
         self.assertEqual(cfg.translation_batch_size, 2)
         self.assertEqual(cfg.translation_max_new_tokens, 1536)
+
+    def test_tee_text_io_ignores_closed_streams(self) -> None:
+        closed_stream = io.StringIO()
+        live_stream = io.StringIO()
+        closed_stream.close()
+        tee = TeeTextIO(closed_stream, live_stream)
+
+        self.assertEqual(tee.write("reset\n"), len("reset\n"))
+        tee.flush()
+
+        self.assertEqual(live_stream.getvalue(), "reset\n")
 
     def test_fast_mode_defaults_to_no_speaker_labels(self) -> None:
         cfg = build_config(parse_args(["--mode", "fast"]), interactive=False)
@@ -265,55 +215,80 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(cfg.direct_whisper_translate)
         self.assertFalse(cfg.post_translate_to_english)
 
-    def test_english_output_mode_post_sets_post_translation(self) -> None:
+    def test_english_output_mode_post_is_legacy_direct_whisperx(self) -> None:
         cfg = build_config(parse_args(["--english-output-mode", "post"]), interactive=False)
 
-        self.assertFalse(cfg.translate_to_english)
-        self.assertEqual(cfg.english_output_mode, "post")
-        self.assertFalse(cfg.direct_whisper_translate)
-        self.assertTrue(cfg.post_translate_to_english)
+        self.assertTrue(cfg.translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "direct")
+        self.assertTrue(cfg.direct_whisper_translate)
+        self.assertFalse(cfg.post_translate_to_english)
 
-    def test_post_translate_shortcut_sets_post_translation(self) -> None:
+    def test_post_translate_shortcut_is_legacy_direct_whisperx(self) -> None:
         cfg = build_config(parse_args(["--post-translate-to-english"]), interactive=False)
 
-        self.assertEqual(cfg.english_output_mode, "post")
-        self.assertTrue(cfg.post_translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "direct")
+        self.assertTrue(cfg.translate_to_english)
+        self.assertTrue(cfg.direct_whisper_translate)
+        self.assertFalse(cfg.post_translate_to_english)
+
+    def test_english_output_mode_auto_is_legacy_direct_whisperx(self) -> None:
+        cfg = build_config(parse_args(["--english-output-mode", "auto"]), interactive=False)
+
+        self.assertEqual(cfg.english_output_mode, "direct")
+        self.assertTrue(cfg.translate_to_english)
+        self.assertTrue(cfg.direct_whisper_translate)
+        self.assertFalse(cfg.post_translate_to_english)
+
+    def test_cli_help_hides_post_translation_server_options(self) -> None:
+        stdout = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, contextlib.redirect_stdout(stdout):
+            parse_args(["--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        help_text = stdout.getvalue()
+        self.assertIn("--english-output-mode {off,direct}", help_text)
+        self.assertNotIn("--post-translate-to-english", help_text)
+        self.assertNotIn("--translation-server-url", help_text)
+        self.assertNotIn("--translation-batch-size", help_text)
+        self.assertNotIn("--save-source-srt", help_text)
+        self.assertNotIn("vLLM", help_text)
 
     @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
-    @patch("builtins.input", side_effect=["post", "n"])
-    def test_interactive_prompt_can_select_post_english_conversion(
+    @patch("builtins.input", side_effect=["y", "n"])
+    def test_interactive_prompt_can_select_direct_english_conversion(
         self,
         _input: MagicMock,
         _isatty: MagicMock,
     ) -> None:
         cfg = build_config(parse_args(["--lang", "es", "--mode", "quality"]), interactive=True)
 
-        self.assertEqual(cfg.english_output_mode, "post")
-        self.assertTrue(cfg.post_translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "direct")
+        self.assertTrue(cfg.direct_whisper_translate)
+        self.assertFalse(cfg.post_translate_to_english)
 
-    def test_spanish_language_defaults_to_translation(self) -> None:
+    def test_spanish_language_defaults_to_source_language_output(self) -> None:
         cfg = build_config(parse_args(["--lang", "es"]), interactive=False)
         self.assertFalse(cfg.translate_to_english)
-        self.assertEqual(cfg.english_output_mode, "auto")
-        self.assertTrue(cfg.post_translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "off")
+        self.assertFalse(cfg.post_translate_to_english)
 
-    def test_german_language_defaults_to_auto_post_translation(self) -> None:
+    def test_german_language_defaults_to_source_language_output(self) -> None:
         cfg = build_config(parse_args(["--lang", "de"]), interactive=False)
 
         self.assertEqual(cfg.language, "de")
         self.assertFalse(cfg.translate_to_english)
-        self.assertEqual(cfg.english_output_mode, "auto")
-        self.assertTrue(cfg.post_translate_to_english)
+        self.assertEqual(cfg.english_output_mode, "off")
+        self.assertFalse(cfg.post_translate_to_english)
 
     def test_german_legacy_language_token_is_supported(self) -> None:
         cfg = build_config(parse_args(["g"]), interactive=False)
 
         self.assertEqual(cfg.language, "de")
         self.assertFalse(cfg.translate_to_english)
-        self.assertEqual(cfg.english_output_mode, "auto")
+        self.assertEqual(cfg.english_output_mode, "off")
 
     @patch("transcriber.__main__.sys.stdin.isatty", return_value=True)
-    @patch("builtins.input", side_effect=["g", "auto"])
+    @patch("builtins.input", side_effect=["g", "n"])
     def test_interactive_prompt_accepts_german(
         self,
         _input: MagicMock,
@@ -323,7 +298,7 @@ class HelperTests(unittest.TestCase):
 
         self.assertEqual(cfg.language, "de")
         self.assertFalse(cfg.translate_to_english)
-        self.assertEqual(cfg.english_output_mode, "auto")
+        self.assertEqual(cfg.english_output_mode, "off")
 
     def test_temperature_schedule_parser(self) -> None:
         self.assertEqual(parse_temperature_schedule("0.0, 0.2,0.4"), (0.0, 0.2, 0.4))
@@ -525,76 +500,21 @@ class HelperTests(unittest.TestCase):
             self.assertIsNotNone(record)
             self.assertEqual((record or {}).get("status"), "succeeded")
 
-    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
     @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
     @patch("transcriber.__main__.preprocess_audio_for_whisperx")
     @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_post_translates_spanish_and_preserves_source_srt(
+    def test_transcribe_file_direct_translation_uses_whisperx_output_only(
         self,
         run_logged: MagicMock,
         preprocess: MagicMock,
         _preflight: MagicMock,
-        _backend: MagicMock,
     ) -> None:
         cfg = make_cfg(
             language="es",
-            english_output_mode="post",
-            post_translate_to_english=True,
-            translation_server_url="http://localhost:8000/v1",
-            speaker_labels=False,
-            diarize=False,
-            compute_type="float32",
-        )
-        with TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "meeting.wav"
-            source.write_bytes(b"audio")
-            preprocess.return_value = source
-
-            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
-                srt_path = args[2]
-                assert isinstance(srt_path, Path)
-                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nSPEAKER_00: Hola\n", encoding="utf-8")
-                return 0, "es"
-
-            run_logged.side_effect = fake_run
-
-            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
-            outputs = output_paths_for_input(source, cfg)
-            record = status_utils.read_status_file(outputs.status_path) or {}
-
-            self.assertEqual(rc, 0)
-            self.assertEqual(
-                (source.parent / "meeting.es.srt").read_text(encoding="utf-8").strip().splitlines()[-1],
-                "SPEAKER_00: Hola",
-            )
-            self.assertIn("SPEAKER_00: Hello", outputs.english_srt_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                outputs.srt_path.read_text(encoding="utf-8"), outputs.english_srt_path.read_text(encoding="utf-8")
-            )
-            self.assertIn("SPEAKER_00: Hello", outputs.llm_path.read_text(encoding="utf-8"))
-            self.assertEqual(record.get("english_output_mode"), "post")
-
-    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
-    @patch("transcriber.__main__.ManagedTranslationServer.start")
-    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
-    @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_auto_starts_and_closes_translation_server_when_url_missing(
-        self,
-        run_logged: MagicMock,
-        preprocess: MagicMock,
-        _preflight: MagicMock,
-        start_server: MagicMock,
-        backend: MagicMock,
-    ) -> None:
-        server = MagicMock()
-        server.server_url = "http://127.0.0.1:8123/v1"
-        server.started = True
-        start_server.return_value = server
-        cfg = make_cfg(
-            language="de",
-            english_output_mode="post",
-            post_translate_to_english=True,
+            translate_to_english=True,
+            english_output_mode="direct",
+            direct_whisper_translate=True,
+            post_translate_to_english=False,
             translation_server_url=None,
             speaker_labels=False,
             diarize=False,
@@ -606,177 +526,9 @@ class HelperTests(unittest.TestCase):
             preprocess.return_value = source
 
             def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
-                srt_path = args[2]
-                assert isinstance(srt_path, Path)
-                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHallo\n", encoding="utf-8")
-                return 0, "de"
-
-            run_logged.side_effect = fake_run
-
-            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
-
-            self.assertEqual(rc, 0)
-            start_server.assert_called_once()
-            self.assertIsNone(start_server.call_args.kwargs["server_url"])
-            backend.assert_called_once()
-            self.assertEqual(backend.call_args.kwargs["server_url"], "http://127.0.0.1:8123/v1")
-            server.close.assert_called_once()
-
-    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
-    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
-    @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_auto_post_translates_german_when_detected(
-        self,
-        run_logged: MagicMock,
-        preprocess: MagicMock,
-        _preflight: MagicMock,
-        _backend: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="auto",
-            english_output_mode="auto",
-            post_translate_to_english=True,
-            translation_server_url="http://localhost:8000/v1",
-            speaker_labels=False,
-            diarize=False,
-            compute_type="float32",
-        )
-        with TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "meeting.wav"
-            source.write_bytes(b"audio")
-            preprocess.return_value = source
-
-            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
-                srt_path = args[2]
-                assert isinstance(srt_path, Path)
-                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHallo\n", encoding="utf-8")
-                return 0, "de"
-
-            run_logged.side_effect = fake_run
-
-            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
-            outputs = output_paths_for_input(source, cfg)
-
-            self.assertEqual(rc, 0)
-            self.assertTrue((source.parent / "meeting.de.srt").exists())
-            self.assertIn("Hello", outputs.english_srt_path.read_text(encoding="utf-8"))
-
-    @patch("transcriber.__main__.build_post_translation_backend", return_value=ResidualPostTranslationBackend())
-    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
-    @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_auto_preserves_source_when_translation_quality_fails(
-        self,
-        run_logged: MagicMock,
-        preprocess: MagicMock,
-        _preflight: MagicMock,
-        _backend: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="auto",
-            english_output_mode="auto",
-            post_translate_to_english=True,
-            translation_server_url="http://localhost:8000/v1",
-            speaker_labels=False,
-            diarize=False,
-            write_llm_txt=False,
-            compute_type="float32",
-        )
-        with TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "meeting.wav"
-            source.write_bytes(b"audio")
-            preprocess.return_value = source
-
-            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
-                srt_path = args[2]
-                assert isinstance(srt_path, Path)
-                srt_path.write_text(
-                    "1\n00:00:00,000 --> 00:00:01,000\nHallo, mein Name ist Armin.\n",
-                    encoding="utf-8",
-                )
-                return 0, "de"
-
-            run_logged.side_effect = fake_run
-
-            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
-            outputs = output_paths_for_input(source, cfg)
-            report = json_module.loads(outputs.translation_report_path.read_text(encoding="utf-8"))
-
-            self.assertEqual(rc, 0)
-            self.assertTrue((source.parent / "meeting.de.srt").exists())
-            self.assertFalse(outputs.english_srt_path.exists())
-            self.assertIn("Hallo, mein Name ist Armin.", outputs.srt_path.read_text(encoding="utf-8"))
-            self.assertFalse(report["quality_check"]["passed"])
-            self.assertEqual(report["quality_check"]["failed_cue_indexes"], [1])
-
-    @patch("transcriber.__main__.build_post_translation_backend", return_value=FakePostTranslationBackend())
-    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
-    @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_honors_no_save_source_srt(
-        self,
-        run_logged: MagicMock,
-        preprocess: MagicMock,
-        _preflight: MagicMock,
-        _backend: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="es",
-            english_output_mode="post",
-            post_translate_to_english=True,
-            translation_server_url="http://localhost:8000/v1",
-            save_source_srt=False,
-            speaker_labels=False,
-            diarize=False,
-            compute_type="float32",
-        )
-        with TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "meeting.wav"
-            source.write_bytes(b"audio")
-            preprocess.return_value = source
-
-            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
-                srt_path = args[2]
-                assert isinstance(srt_path, Path)
-                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHola\n", encoding="utf-8")
-                return 0, "es"
-
-            run_logged.side_effect = fake_run
-
-            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
-            outputs = output_paths_for_input(source, cfg)
-
-            self.assertEqual(rc, 0)
-            self.assertFalse((source.parent / "meeting.es.srt").exists())
-            self.assertTrue(outputs.english_srt_path.exists())
-
-    @patch("transcriber.__main__.build_post_translation_backend")
-    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
-    @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_post_mode_skips_english_source(
-        self,
-        run_logged: MagicMock,
-        preprocess: MagicMock,
-        _preflight: MagicMock,
-        backend: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="en",
-            english_output_mode="post",
-            post_translate_to_english=True,
-            speaker_labels=False,
-            diarize=False,
-            write_llm_txt=False,
-            compute_type="float32",
-        )
-        with TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "meeting.wav"
-            source.write_bytes(b"audio")
-            preprocess.return_value = source
-
-            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
+                run_cfg = args[0]
+                assert isinstance(run_cfg, RunConfig)
+                self.assertTrue(run_cfg.direct_whisper_translate)
                 srt_path = args[2]
                 assert isinstance(srt_path, Path)
                 srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
@@ -786,56 +538,15 @@ class HelperTests(unittest.TestCase):
 
             rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
             outputs = output_paths_for_input(source, cfg)
-
-            self.assertEqual(rc, 0)
-            self.assertEqual(outputs.srt_path.read_text(encoding="utf-8").strip().splitlines()[-1], "Hello")
-            self.assertFalse(outputs.english_srt_path.exists())
-            backend.assert_not_called()
-
-    @patch("transcriber.__main__.build_post_translation_backend", return_value=FailingPostTranslationBackend())
-    @patch("transcriber.__main__.check_transcription_preflight", return_value=PreflightReport())
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
-    @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_explicit_post_fails_when_translation_fails(
-        self,
-        run_logged: MagicMock,
-        preprocess: MagicMock,
-        _preflight: MagicMock,
-        _backend: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="es",
-            english_output_mode="post",
-            post_translate_to_english=True,
-            translation_server_url="http://localhost:8000/v1",
-            speaker_labels=False,
-            diarize=False,
-            write_llm_txt=False,
-            compute_type="float32",
-        )
-        with TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "meeting.wav"
-            source.write_bytes(b"audio")
-            preprocess.return_value = source
-
-            def fake_run(*args: object, **_kwargs: object) -> tuple[int, str]:
-                srt_path = args[2]
-                assert isinstance(srt_path, Path)
-                srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHola\n", encoding="utf-8")
-                return 0, "es"
-
-            run_logged.side_effect = fake_run
-
-            rc = transcribe_file(cfg, source, report=lambda _: None, stale_lock_seconds=1)
-            outputs = output_paths_for_input(source, cfg)
             record = status_utils.read_status_file(outputs.status_path) or {}
 
-            self.assertEqual(rc, 1)
-            self.assertEqual(record.get("status"), "failed")
-            self.assertIn("Explicit post-translation failed", str(record.get("error")))
-            self.assertTrue((source.parent / "meeting.es.srt").exists())
-            self.assertFalse(outputs.srt_path.exists())
+            self.assertEqual(rc, 0)
+            self.assertEqual(record.get("status"), "succeeded")
+            self.assertEqual(record.get("english_output_mode"), "direct")
+            self.assertEqual(outputs.srt_path.read_text(encoding="utf-8").strip().splitlines()[-1], "Hello")
             self.assertFalse(outputs.english_srt_path.exists())
+            self.assertFalse(outputs.translation_report_path.exists())
+            self.assertFalse((source.parent / "meeting.es.srt").exists())
 
     @patch("transcriber.__main__.resolve_input_path")
     @patch("transcriber.__main__.transcribe_file")
@@ -1098,100 +809,8 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(kwargs["no_repeat_ngram_size"], 3)
         self.assertTrue(kwargs["early_stopping"])
 
-    @patch("transcriber.preflight.local_vllm_command", return_value=["vllm"])
-    @patch("transcriber.preflight.module_available")
-    def test_preflight_allows_explicit_post_translation_without_url_when_vllm_can_start(
-        self,
-        module_available: MagicMock,
-        _local_vllm_command: MagicMock,
-    ) -> None:
-        module_available.side_effect = lambda module_name: module_name != "httpx"
-        cfg = make_cfg(
-            language="de",
-            english_output_mode="post",
-            post_translate_to_english=True,
-            translation_backend="server",
-            translation_server_url=None,
-            diarize=False,
-            device="cpu",
-        )
-
-        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
-
-        self.assertFalse(report.errors)
-        self.assertTrue(any("auto-start" in warning for warning in report.warnings))
-
-    @patch("transcriber.preflight.openai_server_ready", return_value=False)
-    @patch("transcriber.preflight.local_vllm_command", return_value=None)
     @patch("transcriber.preflight.module_available", return_value=True)
-    def test_preflight_fails_when_explicit_post_translation_cannot_start_server(
-        self,
-        _module_available: MagicMock,
-        _local_vllm_command: MagicMock,
-        _openai_server_ready: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="de",
-            english_output_mode="post",
-            post_translate_to_english=True,
-            translation_backend="server",
-            translation_server_url=None,
-            diarize=False,
-            device="cpu",
-        )
-
-        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
-
-        self.assertTrue(any("vllm" in error for error in report.errors))
-
-    @patch("transcriber.preflight.openai_server_ready", return_value=True)
-    @patch("transcriber.preflight.local_vllm_command", return_value=None)
-    @patch("transcriber.preflight.module_available", return_value=True)
-    def test_preflight_allows_explicit_post_translation_without_vllm_when_default_server_is_ready(
-        self,
-        _module_available: MagicMock,
-        _local_vllm_command: MagicMock,
-        _openai_server_ready: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="de",
-            english_output_mode="post",
-            post_translate_to_english=True,
-            translation_backend="server",
-            translation_server_url=None,
-            diarize=False,
-            device="cpu",
-        )
-
-        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
-
-        self.assertFalse(report.errors)
-        self.assertTrue(any("reuse or auto-start" in warning for warning in report.warnings))
-
-    @patch("transcriber.preflight.local_vllm_command", return_value=["vllm"])
-    @patch("transcriber.preflight.module_available", return_value=True)
-    def test_preflight_warns_when_auto_post_translation_has_no_url(
-        self,
-        _module_available: MagicMock,
-        _local_vllm_command: MagicMock,
-    ) -> None:
-        cfg = make_cfg(
-            language="auto",
-            english_output_mode="auto",
-            post_translate_to_english=True,
-            translation_backend="server",
-            translation_server_url=None,
-            diarize=False,
-            device="cpu",
-        )
-
-        report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
-
-        self.assertTrue(any("auto-start" in warning for warning in report.warnings))
-        self.assertFalse(report.errors)
-
-    @patch("transcriber.preflight.module_available", return_value=True)
-    def test_preflight_does_not_warn_about_server_for_direct_translation(self, _module_available: MagicMock) -> None:
+    def test_preflight_does_not_warn_about_post_translation_server(self, _module_available: MagicMock) -> None:
         cfg = make_cfg(
             english_output_mode="direct",
             direct_whisper_translate=True,
@@ -1204,6 +823,7 @@ class HelperTests(unittest.TestCase):
         report = check_transcription_preflight(cfg=cfg, hf_token_present=False, require_ffmpeg=False)
 
         self.assertFalse(any("OpenAI-compatible" in warning for warning in report.warnings))
+        self.assertFalse(any("vllm" in warning.lower() for warning in report.warnings))
 
     def test_confidence_cleanup_marks_low_confidence(self) -> None:
         cfg = make_cfg()
