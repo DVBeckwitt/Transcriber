@@ -9,6 +9,14 @@ It generates:
 - `logs/your_file_whisperx.log` full run log in the project folder
 - `logs/transcriber-watcher.log` watch-mode activity log in the project folder
 
+## Change status
+
+### 2026-06-20
+
+- Feature: added `--no-speaker-labels` for movie-style subtitle and LLM transcript output.
+- Status: implemented and verified with `python -m unittest discover -s tests`.
+- Migration/deprecation: none; default speaker-label behavior remains unchanged.
+
 ## What you need before running
 
 - Python 3.10+
@@ -25,6 +33,14 @@ It generates:
 
 ```powershell
 pip install -e .
+```
+
+## Development checks
+
+Run the local quality gate before committing:
+
+```powershell
+python -m unittest discover -s tests
 ```
 
 ## Hugging Face token (for diarization)
@@ -148,6 +164,12 @@ Force no diarization:
 transcriber --input "C:\media\meeting.mp4" --no-diarize
 ```
 
+Movie-style subtitles without speaker labels:
+
+```powershell
+transcriber --input "C:\media\movie.mp4" --no-speaker-labels
+```
+
 Watch a folder and wait for files to stop changing before transcribing:
 
 ```powershell
@@ -172,6 +194,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - If you pass `--translate-to-english`, WhisperX writes English subtitle text directly.
 - If the detected language is Spanish and `--translate-to-english` is not set, the launcher falls back to the existing post-translation step.
 - When diarization is enabled, short speaker blips are smoothed by default.
+- Use `--no-speaker-labels` to keep diarization timing and speaker-change splits while hiding labels like `SPEAKER_00:` in `.srt` and `*_llm.txt` output.
 - Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
 
@@ -185,6 +208,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 --asr-prompt       Optional text prompt to bias WhisperX toward names and jargon
 --asr-prompt-file  Text file with extra ASR prompt lines
 --translate-to-english  Use WhisperX translation mode to write English subtitles directly
+--no-speaker-labels      Hide diarization speaker labels in transcript output
 --temperature      Single decoding temperature
 --temperature-schedule  Comma-separated fallback temperatures
 --best-of          Sampling candidates when temperature is above 0

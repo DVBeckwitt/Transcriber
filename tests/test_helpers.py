@@ -13,6 +13,8 @@ from transcriber.__main__ import (
     SRTCue,
     TimedToken,
     apply_confidence_cleanup,
+    build_llm_file,
+    build_srt_cues_from_result,
     build_translation_prompt,
     load_translation_glossary,
     is_watchable_media,
@@ -25,6 +27,7 @@ from transcriber.__main__ import (
     render_uncertain_markup,
     smooth_timed_tokens,
     translation_context_for_cue,
+    write_direct_srt_from_result,
 )
 
 
@@ -48,6 +51,7 @@ def make_cfg(**overrides: object) -> RunConfig:
         diarize_smoothing=True,
         min_speaker_turn_ms=900,
         min_speaker_turn_tokens=2,
+        include_speaker_labels=True,
         confidence_cleanup=True,
         confidence_cleanup_mode="mark",
         low_confidence_logprob=-1.0,
@@ -79,6 +83,15 @@ class HelperTests(unittest.TestCase):
     def test_translate_flag_enables_direct_whisperx_output(self) -> None:
         cfg = build_config(parse_args(["--translate-to-english"]), interactive=False)
         self.assertTrue(cfg.translate_to_english)
+
+    def test_speaker_labels_are_enabled_by_default(self) -> None:
+        cfg = build_config(parse_args([]), interactive=False)
+        self.assertTrue(cfg.include_speaker_labels)
+
+    def test_no_speaker_labels_flag_disables_rendered_labels_only(self) -> None:
+        cfg = build_config(parse_args(["--no-speaker-labels", "--diarize"]), interactive=False)
+        self.assertFalse(cfg.include_speaker_labels)
+        self.assertTrue(cfg.diarize)
 
     def test_spanish_language_defaults_to_translation(self) -> None:
         cfg = build_config(parse_args(["--lang", "es"]), interactive=False)
@@ -225,6 +238,83 @@ class HelperTests(unittest.TestCase):
         marker = "__UNCERTAIN_65__hola__UNCERTAIN_END__"
         self.assertEqual(render_uncertain_markup(marker, "srt"), "hola")
         self.assertEqual(render_uncertain_markup(marker, "llm"), "[hola] [65% confidence]")
+
+    def test_timed_srt_keeps_speaker_labels_by_default(self) -> None:
+        result = {
+            "segments": [
+                {
+                    "words": [
+                        {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "SPEAKER_00"},
+                        {"word": "there.", "start": 0.5, "end": 1.0, "speaker": "SPEAKER_00"},
+                        {"word": "Come", "start": 1.0, "end": 1.5, "speaker": "SPEAKER_01"},
+                        {"word": "in.", "start": 1.5, "end": 2.0, "speaker": "SPEAKER_01"},
+                    ]
+                }
+            ]
+        }
+
+        cues = build_srt_cues_from_result(result, make_cfg(diarize_smoothing=False))
+
+        self.assertEqual([cue.text for cue in cues], ["SPEAKER_00: Hello there.", "SPEAKER_01: Come in."])
+
+    def test_timed_srt_hides_speaker_labels_without_losing_speaker_splits(self) -> None:
+        result = {
+            "segments": [
+                {
+                    "words": [
+                        {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "SPEAKER_00"},
+                        {"word": "there.", "start": 0.5, "end": 1.0, "speaker": "SPEAKER_00"},
+                        {"word": "Come", "start": 1.0, "end": 1.5, "speaker": "SPEAKER_01"},
+                        {"word": "in.", "start": 1.5, "end": 2.0, "speaker": "SPEAKER_01"},
+                    ]
+                }
+            ]
+        }
+
+        cues = build_srt_cues_from_result(
+            result,
+            make_cfg(diarize_smoothing=False, include_speaker_labels=False),
+        )
+
+        self.assertEqual([cue.text for cue in cues], ["Hello there.", "Come in."])
+
+    def test_segment_fallback_srt_hides_speaker_labels(self) -> None:
+        result = {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "text": "Hello there.",
+                    "speaker": "SPEAKER_00",
+                }
+            ]
+        }
+
+        cues = build_srt_cues_from_result(result, make_cfg(include_speaker_labels=False))
+
+        self.assertEqual([cue.text for cue in cues], ["Hello there."])
+
+    def test_llm_file_uses_no_label_srt_body(self) -> None:
+        result = {
+            "segments": [
+                {
+                    "words": [
+                        {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "SPEAKER_00"},
+                        {"word": "there.", "start": 0.5, "end": 1.0, "speaker": "SPEAKER_00"},
+                    ]
+                }
+            ]
+        }
+        with TemporaryDirectory() as tmpdir:
+            srt_path = Path(tmpdir) / "movie.srt"
+            llm_path = Path(tmpdir) / "movie_llm.txt"
+
+            write_direct_srt_from_result(result, srt_path, make_cfg(include_speaker_labels=False))
+            build_llm_file(srt_path, llm_path)
+
+            transcript_body = llm_path.read_text(encoding="utf-8").split("TRANSCRIPT:\n", 1)[1]
+            self.assertEqual(transcript_body, "Hello there.")
+            self.assertNotIn("SPEAKER_", transcript_body)
 
     def test_speaker_smoothing_merges_short_blips(self) -> None:
         tokens = [

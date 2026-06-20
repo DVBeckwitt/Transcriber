@@ -125,6 +125,7 @@ class RunConfig:
     diarize_smoothing: bool
     min_speaker_turn_ms: int
     min_speaker_turn_tokens: int
+    include_speaker_labels: bool
     confidence_cleanup: bool
     confidence_cleanup_mode: str
     low_confidence_logprob: float
@@ -855,7 +856,7 @@ def finalize_timed_cue(index: int, prefix: str, tokens: Sequence[TimedToken]) ->
     return SRTCue(index=index, start_ms=start_ms, end_ms=end_ms, text=wrapped_text)
 
 
-def build_segment_fallback_cues(result: dict[str, Any]) -> list[SRTCue]:
+def build_segment_fallback_cues(result: dict[str, Any], include_speaker_labels: bool = True) -> list[SRTCue]:
     cues: list[SRTCue] = []
     for raw_segment in result.get("segments", []):
         if not isinstance(raw_segment, dict):
@@ -867,7 +868,7 @@ def build_segment_fallback_cues(result: dict[str, Any]) -> list[SRTCue]:
         text = normalize_subtitle_whitespace(str(raw_segment.get("text") or ""))
         if not text:
             continue
-        prefix = speaker_prefix(raw_segment.get("speaker"))
+        prefix = speaker_prefix(raw_segment.get("speaker")) if include_speaker_labels else ""
         cues.extend(split_cue_for_subtitles(SRTCue(index=0, start_ms=start_ms, end_ms=end_ms, text=f"{prefix}{text}")))
 
     for idx, cue in enumerate(cues, start=1):
@@ -876,53 +877,58 @@ def build_segment_fallback_cues(result: dict[str, Any]) -> list[SRTCue]:
 
 
 def build_srt_cues_from_result(result: dict[str, Any], cfg: RunConfig | None = None) -> list[SRTCue]:
+    include_speaker_labels = True if cfg is None else cfg.include_speaker_labels
     tokens = extract_timed_tokens(result, cfg)
     if not tokens:
-        return build_segment_fallback_cues(result)
+        return build_segment_fallback_cues(result, include_speaker_labels=include_speaker_labels)
 
     cues: list[SRTCue] = []
     current_tokens: list[TimedToken] = []
-    current_prefix = ""
+    current_speaker = ""
+
+    def current_prefix() -> str:
+        return speaker_prefix(current_speaker) if include_speaker_labels else ""
 
     def flush_current() -> None:
-        nonlocal current_tokens, current_prefix
+        nonlocal current_tokens, current_speaker
         if not current_tokens:
             return
-        cues.append(finalize_timed_cue(len(cues) + 1, current_prefix, current_tokens))
+        cues.append(finalize_timed_cue(len(cues) + 1, current_prefix(), current_tokens))
         current_tokens = []
-        current_prefix = ""
+        current_speaker = ""
 
     for token in tokens:
-        token_prefix = speaker_prefix(token.speaker)
+        token_speaker = normalize_speaker_label(token.speaker)
         if not current_tokens:
             current_tokens = [token]
-            current_prefix = token_prefix
+            current_speaker = token_speaker
             continue
 
-        if token_prefix and current_prefix and token_prefix != current_prefix:
+        if token_speaker and current_speaker and token_speaker != current_speaker:
             flush_current()
             current_tokens = [token]
-            current_prefix = token_prefix
+            current_speaker = token_speaker
             continue
 
         candidate_tokens = [*current_tokens, token]
-        if cue_candidate_is_valid(candidate_tokens, current_prefix):
+        prefix = current_prefix()
+        if cue_candidate_is_valid(candidate_tokens, prefix):
             current_tokens = candidate_tokens
-            if should_soft_break(current_tokens, current_prefix):
+            if should_soft_break(current_tokens, prefix):
                 flush_current()
             continue
 
         flush_current()
         current_tokens = [token]
-        current_prefix = token_prefix
+        current_speaker = token_speaker
 
-        if not cue_candidate_is_valid(current_tokens, current_prefix):
+        if not cue_candidate_is_valid(current_tokens, current_prefix()):
             flush_current()
 
     flush_current()
 
     if not cues:
-        return build_segment_fallback_cues(result)
+        return build_segment_fallback_cues(result, include_speaker_labels=include_speaker_labels)
 
     for idx, cue in enumerate(cues, start=1):
         cue.index = idx
@@ -1507,6 +1513,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Use WhisperX translate mode so English SRT output is written directly.",
     )
     parser.add_argument(
+        "--no-speaker-labels",
+        dest="include_speaker_labels",
+        action="store_false",
+        help="Hide diarization speaker labels in rendered transcript outputs.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         help="Single decoding temperature. Overrides the preset temperature schedule.",
@@ -1876,6 +1888,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         diarize_smoothing=diarize_smoothing,
         min_speaker_turn_ms=max(0, int(args.min_speaker_turn_ms)),
         min_speaker_turn_tokens=max(0, int(args.min_speaker_turn_tokens)),
+        include_speaker_labels=bool(args.include_speaker_labels),
         confidence_cleanup=bool(args.confidence_cleanup),
         confidence_cleanup_mode=args.confidence_cleanup_mode,
         low_confidence_logprob=float(args.low_confidence_logprob),
