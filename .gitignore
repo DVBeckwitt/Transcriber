@@ -4,3 +4,5 @@ hf_token.txt
 .tmp_transcriber_temp/
 logs/
 *.log
+__pycache__/
+*.py[cod]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import MagicMock, patch
@@ -21,11 +22,16 @@ from transcriber.__main__ import (
     translate_spanish_texts,
     output_paths_for_input,
     parse_args,
+    parse_detected_language_from_log,
     parse_glossary_entries,
     parse_temperature_schedule,
+    preprocess_audio_for_whisperx,
     project_dir,
+    read_text_tail,
     render_uncertain_markup,
+    should_fallback_without_diarization,
     smooth_timed_tokens,
+    transcribe_file,
     translation_context_for_cue,
     write_direct_srt_from_result,
 )
@@ -114,6 +120,56 @@ class HelperTests(unittest.TestCase):
         self.assertIn("highpass=f=60,lowpass=f=8000", command)
         self.assertEqual(command[-1], "out.wav")
 
+    @patch("transcriber.__main__.subprocess.run")
+    def test_audio_preprocess_uses_timeout(self, run: MagicMock) -> None:
+        run.side_effect = FileNotFoundError()
+        with TemporaryDirectory() as tmpdir:
+            reports: list[str] = []
+
+            result = preprocess_audio_for_whisperx(Path("in.mp4"), Path(tmpdir), report=reports.append)
+
+            self.assertEqual(result, Path("in.mp4"))
+            self.assertIn("timeout", run.call_args.kwargs)
+            self.assertGreater(run.call_args.kwargs["timeout"], 0)
+
+    @patch("transcriber.__main__.subprocess.run")
+    def test_audio_preprocess_truncates_long_stderr(self, run: MagicMock) -> None:
+        run.side_effect = subprocess.CalledProcessError(
+            1,
+            ["ffmpeg"],
+            stderr="x" * 1200,
+        )
+        with TemporaryDirectory() as tmpdir:
+            reports: list[str] = []
+
+            result = preprocess_audio_for_whisperx(Path("in.mp4"), Path(tmpdir), report=reports.append)
+
+            self.assertEqual(result, Path("in.mp4"))
+            self.assertTrue(any("[truncated]" in line for line in reports))
+            self.assertLess(max(len(line) for line in reports), 700)
+
+    def test_read_text_tail_returns_recent_content_only(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "large.log"
+            log_path.write_text("old-" + ("x" * 100) + "-tail", encoding="utf-8")
+
+            text = read_text_tail(log_path, max_chars=10)
+
+            self.assertEqual(text, "xxxxx-tail")
+
+    def test_log_parsers_use_recent_tail_content(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "large.log"
+            log_path.write_text(
+                ("older noise\n" * 1000)
+                + "Could not download 'pyannote/speaker-diarization-3.1' pipeline.\n"
+                + "Detected language: Spanish (0.98)\n",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(should_fallback_without_diarization(log_path))
+            self.assertEqual(parse_detected_language_from_log(log_path), "spanish")
+
     def test_opus_files_are_watchable(self) -> None:
         with TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "clip.opus"
@@ -132,6 +188,42 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(outputs.llm_path.parent, source.parent)
             self.assertEqual(outputs.lock_path.parent, source.parent)
             self.assertEqual(outputs.log_path.parent, project_dir() / "logs")
+
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_rejects_unsupported_input_before_work(self, run_logged: MagicMock) -> None:
+        cfg = make_cfg(diarize=False)
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "notes.txt"
+            source.write_text("not media", encoding="utf-8")
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+            reports: list[str] = []
+
+            rc = transcribe_file(cfg, source, report=reports.append)
+
+            self.assertEqual(rc, 1)
+            self.assertFalse(outputs.srt_path.exists())
+            self.assertFalse(outputs.llm_path.exists())
+            self.assertFalse(outputs.lock_path.exists())
+            self.assertTrue(any("Unsupported media file" in line for line in reports))
+            run_logged.assert_not_called()
+
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_rejects_directory_before_work(self, run_logged: MagicMock) -> None:
+        cfg = make_cfg(diarize=False)
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "recordings.mp4"
+            source.mkdir()
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+            reports: list[str] = []
+
+            rc = transcribe_file(cfg, source, report=reports.append)
+
+            self.assertEqual(rc, 1)
+            self.assertFalse(outputs.srt_path.exists())
+            self.assertFalse(outputs.llm_path.exists())
+            self.assertFalse(outputs.lock_path.exists())
+            self.assertTrue(any("Input is not a file" in line for line in reports))
+            run_logged.assert_not_called()
 
     def test_glossary_parsing_and_prompt(self) -> None:
         glossary = parse_glossary_entries(["OpenAI => OpenAI", "esfuerzo|effort", "termino"])

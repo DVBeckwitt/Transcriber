@@ -48,6 +48,9 @@ WATCH_RETRY_COOLDOWN_SECONDS = 300.0
 FALLBACK_TEMP_DIR_NAME = ".tmp_transcriber_temp"
 LOCK_SUFFIX = ".transcribing.lock"
 DEFAULT_STALE_LOCK_SECONDS = 12 * 60 * 60
+AUDIO_PREPROCESS_TIMEOUT_SECONDS = 30 * 60
+SUBPROCESS_ERROR_DETAIL_LIMIT = 500
+LOG_TAIL_READ_CHARS = 256 * 1024
 
 SUBTITLE_MAX_LINES = 2
 SUBTITLE_MAX_CHARS_PER_LINE = 42
@@ -179,7 +182,6 @@ class PendingWatchFile:
     last_attempt_at: float | None = None
 
 
-UNSUPPORTED_GLOBAL_RE = re.compile(r"Unsupported global: GLOBAL ([A-Za-z0-9_\.]+)")
 DIARIZATION_FALLBACK_PATTERNS = (
     "could not download 'pyannote/speaker-diarization-3.1' pipeline.",
     "visit https://hf.co/pyannote/speaker-diarization-3.1 to accept the user conditions.",
@@ -1452,17 +1454,46 @@ def build_audio_preprocess_command(input_path: Path, output_path: Path) -> list[
     ]
 
 
+def format_subprocess_error_detail(value: object, limit: int = SUBPROCESS_ERROR_DETAIL_LIMIT) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()} ... [truncated]"
+
+
 def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Reporter = print) -> Path:
     output_path = temp_dir / f"{input_path.stem}.preprocessed.wav"
     command = build_audio_preprocess_command(input_path, output_path)
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=AUDIO_PREPROCESS_TIMEOUT_SECONDS,
+        )
     except FileNotFoundError:
         report("[transcriber] ffmpeg not found; using the original input audio.")
         return input_path
+    except subprocess.TimeoutExpired:
+        report(
+            "[transcriber] Audio preprocessing timed out "
+            f"after {AUDIO_PREPROCESS_TIMEOUT_SECONDS:g}s; using the original input audio."
+        )
+        with contextlib.suppress(OSError):
+            output_path.unlink()
+        return input_path
     except subprocess.CalledProcessError as exc:
-        detail = f": {exc.stderr.strip()}" if exc.stderr and exc.stderr.strip() else ""
+        stderr = format_subprocess_error_detail(exc.stderr)
+        detail = f": {stderr}" if stderr else ""
         report(f"[transcriber] Audio preprocessing failed; using the original input audio{detail}")
         with contextlib.suppress(OSError):
             output_path.unlink()
@@ -2006,38 +2037,6 @@ def load_hf_token(base_dir: Path) -> str | None:
     return None
 
 
-def add_common_safe_globals() -> None:
-    try:
-        import torch
-    except Exception:
-        return
-
-    safe: list[object] = []
-    try:
-        import omegaconf
-
-        safe.extend([omegaconf.listconfig.ListConfig, omegaconf.dictconfig.DictConfig])
-    except Exception:
-        pass
-
-    try:
-        from torch.torch_version import TorchVersion
-
-        safe.append(TorchVersion)
-    except Exception:
-        pass
-
-    try:
-        from pyannote.audio.core.task import Problem, Resolution, Specifications
-
-        safe.extend([Specifications, Problem, Resolution])
-    except Exception:
-        pass
-
-    if safe:
-        torch.serialization.add_safe_globals(safe)
-
-
 @contextlib.contextmanager
 def allow_trusted_checkpoint_loads() -> Iterable[None]:
     try:
@@ -2060,43 +2059,28 @@ def allow_trusted_checkpoint_loads() -> Iterable[None]:
         torch.load = original_load
 
 
-def try_add_unsupported_global(exc: Exception) -> bool:
+def read_text_tail(path: Path, max_chars: int = LOG_TAIL_READ_CHARS) -> str:
+    if max_chars <= 0:
+        return ""
+    max_bytes = max_chars * 4
     try:
-        import torch
-    except Exception:
-        return False
-
-    match = UNSUPPORTED_GLOBAL_RE.search(str(exc))
-    if not match:
-        return False
-
-    qualname = match.group(1)
-    if "." not in qualname:
-        return False
-    module_name, object_name = qualname.rsplit(".", 1)
-    try:
-        obj = getattr(importlib.import_module(module_name), object_name)
-    except Exception:
-        return False
-
-    torch.serialization.add_safe_globals([obj])
-    return True
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="ignore")[-max_chars:]
 
 
 def should_fallback_without_diarization(log_path: Path) -> bool:
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="ignore").lower()
-    except Exception:
-        return False
+    text = read_text_tail(log_path).lower()
     return any(pattern in text for pattern in DIARIZATION_FALLBACK_PATTERNS)
 
 
 def parse_detected_language_from_log(log_path: Path) -> str | None:
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return None
-
+    text = read_text_tail(log_path)
     matches = re.findall(r"Detected language:\s*([A-Za-z-]+)\s*\(", text)
     if not matches:
         return None
@@ -2293,9 +2277,10 @@ def transcribe_file(
     report: Reporter = print,
     stale_lock_seconds: float = DEFAULT_STALE_LOCK_SECONDS,
 ) -> int:
-    if not input_path.exists():
+    error = input_path_error(input_path)
+    if error is not None:
         report("")
-        report(f'File not found: "{input_path}"')
+        report(error)
         report("")
         return 1
 
@@ -2448,6 +2433,17 @@ def make_watch_reporter(log_path: Path) -> Reporter:
 
 def is_watchable_media(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+
+
+def input_path_error(input_path: Path) -> str | None:
+    if not input_path.exists():
+        return f'File not found: "{input_path}"'
+    if not input_path.is_file():
+        return f'Input is not a file: "{input_path}"'
+    if input_path.suffix.lower() not in MEDIA_EXTENSIONS:
+        supported = ", ".join(sorted(MEDIA_EXTENSIONS))
+        return f'Unsupported media file: "{input_path}" (supported: {supported})'
+    return None
 
 
 def iter_watch_candidates(watch_dir: Path) -> Iterable[Path]:
