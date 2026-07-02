@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import sys
@@ -34,6 +35,7 @@ TOKEN_HEADER = "X-Transcribe-Proxy-Token"
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 LANGUAGES = {"auto", "en", "es"}
 TERMINAL_STATUSES = {"succeeded", "failed"}
+JOB_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
 
 TranscribeRunner = Callable[..., int]
 
@@ -161,6 +163,25 @@ class JobStore:
                     self._jobs.pop(job_id, None)
         for record in expired:
             shutil.rmtree(record.work_dir, ignore_errors=True)
+        self.cleanup_expired_directories(cutoff)
+
+    def cleanup_expired_directories(self, cutoff_epoch: float) -> None:
+        active_dirs: set[Path] = set()
+        with self._lock:
+            active_dirs = {record.work_dir.resolve() for record in self._jobs.values()}
+
+        candidates: list[Path] = []
+        with contextlib.suppress(OSError):
+            candidates = list(self.work_dir.iterdir())
+        for candidate in candidates:
+            if not candidate.is_dir() or not JOB_DIR_RE.fullmatch(candidate.name):
+                continue
+            with contextlib.suppress(OSError):
+                resolved = candidate.resolve()
+                if resolved in active_dirs:
+                    continue
+                if candidate.stat().st_mtime <= cutoff_epoch:
+                    shutil.rmtree(candidate, ignore_errors=True)
 
 
 def normalize_config(config: ServerConfig) -> ServerConfig:
@@ -384,6 +405,14 @@ def create_app(config: ServerConfig, transcribe_runner: TranscribeRunner = trans
             return json_error(401, "UNAUTHORIZED", "Missing or invalid proxy token.")
         return await call_next(request)
 
+    @app.middleware("http")
+    async def add_security_headers(request: Any, call_next: Callable[..., Any]) -> Any:
+        response = await call_next(request)
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
+
     @app.exception_handler(ApiError)
     async def handle_api_error(request: Any, exc: ApiError) -> Any:
         return json_error(exc.status_code, exc.code, exc.message)
@@ -496,7 +525,11 @@ def build_arg_parser(env: Mapping[str, str] | None = None) -> argparse.ArgumentP
     parser = argparse.ArgumentParser(description="Run the Transcriber LAN worker API.")
     parser.add_argument("--host", default=env.get("TRANSCRIBE_SERVER_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int_env(env, "TRANSCRIBE_SERVER_PORT", DEFAULT_PORT))
-    parser.add_argument("--proxy-token", default=env.get("TRANSCRIBE_PROXY_TOKEN"))
+    parser.add_argument(
+        "--proxy-token",
+        default=env.get("TRANSCRIBE_PROXY_TOKEN"),
+        help="Shared proxy token. Prefer TRANSCRIBE_PROXY_TOKEN so the token is not visible in process listings.",
+    )
     parser.add_argument("--work-dir", default=str(path_env(env, "TRANSCRIBE_WORK_DIR", default_work_dir())))
     parser.add_argument(
         "--max-upload-bytes",

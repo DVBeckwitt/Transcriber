@@ -31,6 +31,16 @@ try {
 
 Write-Host ""
 Write-Host "Transcriber server extras installed in $VenvPath"
-Write-Host "Install WhisperX and the right PyTorch build in the same venv before running real jobs."
+
+& $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('whisperx') else 1)"
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "WhisperX is not installed in this venv. Real transcription jobs will fail until WhisperX and a compatible PyTorch build are installed here."
+}
+
+if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+    Write-Warning "ffmpeg was not found on PATH. The transcriber can run, but media preprocessing will fall back to the original source."
+}
+
+Write-Host "Use the same venv for WhisperX, PyTorch, and transcriber-local[server]."
 Write-Host "Start the worker with:"
 Write-Host "  .\run_transcriber_server.bat --host 0.0.0.0"

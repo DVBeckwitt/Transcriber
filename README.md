@@ -10,13 +10,20 @@ It generates:
 - `logs/your_file_whisperx.log` full run log in the project folder
 - `logs/transcriber-watcher.log` watch-mode activity log in the project folder
 
+## Documentation
+
+- [LAN worker runbook](docs/worker-server.md): install, configure, start, validate, and troubleshoot the FastAPI worker.
+- [Security notes](docs/security.md): threat model, implemented controls, network hardening, and preflight checklist.
+- This README: local CLI/watch workflows, options, and core runtime behavior.
+
 ## Change status
 
 ### 2026-07-02
 
 - Feature: added optional FastAPI worker mode with authenticated upload, job status, and transcript download endpoints.
-- Security note: every worker API request requires `X-Transcribe-Proxy-Token`; the server fails closed when no token is configured.
+- Hardening: every worker API request requires `X-Transcribe-Proxy-Token`; the server fails closed when no token is configured; worker responses include no-store/security headers.
 - LAN setup: added Windows install/run helpers and firewall guidance for allowing TCP 8092 only from the homepage machine LAN IP.
+- Operations: added worker runbook, security notes, `.env.example`, runtime module checks, and stale job directory cleanup after restarts.
 - Migration/deprecation: none; existing CLI behavior and defaults are unchanged.
 
 ### 2026-06-24
@@ -175,6 +182,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --lang auto
 ### LAN worker server
 
 The server mode is owned by this repo and is optional. It does not add CORS; put it behind the homepage nginx same-origin proxy.
+For the complete operational guide, see [docs/worker-server.md](docs/worker-server.md). For hardening notes, see [docs/security.md](docs/security.md).
 
 Install on the worker PC:
 
@@ -188,6 +196,8 @@ Set a shared proxy token on the worker PC. Use the same value in the homepage `.
 [Environment]::SetEnvironmentVariable("TRANSCRIBE_PROXY_TOKEN", "<long-random-token>", "User")
 [Environment]::SetEnvironmentVariable("TRANSCRIBE_WORK_DIR", "D:\TranscriberJobs", "User")
 ```
+
+Prefer `TRANSCRIBE_PROXY_TOKEN` over `--proxy-token`; command-line arguments can be visible in process listings.
 
 Start locally only, the default:
 
@@ -208,6 +218,8 @@ Defaults:
 - Completed job TTL: 24 hours
 - Device/compute type: `cuda` / `float16`
 - Work dir: `<repo>\.transcriber_server_jobs`
+
+The Windows launcher fails before startup if the token is missing or if the selected Python environment cannot import `whisperx`, `fastapi`, `uvicorn`, and `multipart`.
 
 Config can be set with environment variables or matching CLI args:
 - `TRANSCRIBE_PROXY_TOKEN` / `--proxy-token`

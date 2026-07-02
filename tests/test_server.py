@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -34,13 +35,14 @@ class ServerTests(unittest.TestCase):
         token: str = TOKEN,
         device: str = "cpu",
         compute_type: str = "float32",
+        job_ttl_seconds: int = 24 * 60 * 60,
     ) -> TestClient:
         config = ServerConfig(
             proxy_token=token,
             work_dir=Path(tmpdir),
             max_upload_bytes=max_upload_bytes,
             max_workers=1,
-            job_ttl_seconds=24 * 60 * 60,
+            job_ttl_seconds=job_ttl_seconds,
             device=device,
             compute_type=compute_type,
         )
@@ -79,6 +81,20 @@ class ServerTests(unittest.TestCase):
             response = client.get("/api/transcriptions/health", headers=auth_headers())
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["status"], "ok")
+
+    def test_api_responses_include_security_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self.make_client(tmpdir)
+
+            unauthorized = client.get("/api/transcriptions/health")
+            self.assertEqual(unauthorized.headers["cache-control"], "no-store")
+            self.assertEqual(unauthorized.headers["x-content-type-options"], "nosniff")
+            self.assertEqual(unauthorized.headers["referrer-policy"], "no-referrer")
+
+            ok = client.get("/api/transcriptions/health", headers=auth_headers())
+            self.assertEqual(ok.headers["cache-control"], "no-store")
+            self.assertEqual(ok.headers["x-content-type-options"], "nosniff")
+            self.assertEqual(ok.headers["referrer-policy"], "no-referrer")
 
     def test_rejects_invalid_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -216,6 +232,26 @@ class ServerTests(unittest.TestCase):
                 404,
                 "JOB_NOT_FOUND",
             )
+
+    def test_cleanup_removes_stale_untracked_job_directories_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir)
+            stale_job_dir = work_dir / ("a" * 32)
+            fresh_job_dir = work_dir / ("b" * 32)
+            non_job_dir = work_dir / "manual-notes"
+            stale_job_dir.mkdir()
+            fresh_job_dir.mkdir()
+            non_job_dir.mkdir()
+            old = time.time() - 10
+            os.utime(stale_job_dir, (old, old))
+
+            client = self.make_client(tmpdir, job_ttl_seconds=1)
+            response = client.get("/api/transcriptions/health", headers=auth_headers())
+
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(stale_job_dir.exists())
+            self.assertTrue(fresh_job_dir.exists())
+            self.assertTrue(non_job_dir.exists())
 
 
 if __name__ == "__main__":

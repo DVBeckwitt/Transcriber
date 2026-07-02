@@ -1,6 +1,11 @@
 # Local secrets
 HF_TOKEN.txt
 hf_token.txt
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
 .tmp_transcriber_temp/
 .transcriber_server_jobs/
 logs/
