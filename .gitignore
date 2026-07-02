@@ -2,7 +2,9 @@
 HF_TOKEN.txt
 hf_token.txt
 .tmp_transcriber_temp/
+.transcriber_server_jobs/
 logs/
 *.log
 __pycache__/
 *.py[cod]
+*.egg-info/

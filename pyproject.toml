@@ -9,8 +9,19 @@ dependencies = [
     "sacremoses",
 ]
 
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+]
+
 [project.scripts]
 transcriber = "transcriber.__main__:main"
+transcriber-server = "transcriber.server:main"
+
+[tool.setuptools.packages.find]
+include = ["transcriber*"]
 
 [build-system]
 requires = ["setuptools>=68"]

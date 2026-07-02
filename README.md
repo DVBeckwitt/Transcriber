@@ -2,6 +2,7 @@
 
 Local WhisperX launcher for fast transcription from audio/video files.
 It can transcribe first, or ask WhisperX to translate directly into English output when you want an English SRT from Spanish audio.
+It can also run as an optional LAN worker API for a same-origin homepage upload proxy.
 
 It generates:
 - `your_file.srt` subtitle transcript
@@ -10,6 +11,13 @@ It generates:
 - `logs/transcriber-watcher.log` watch-mode activity log in the project folder
 
 ## Change status
+
+### 2026-07-02
+
+- Feature: added optional FastAPI worker mode with authenticated upload, job status, and transcript download endpoints.
+- Security note: every worker API request requires `X-Transcribe-Proxy-Token`; the server fails closed when no token is configured.
+- LAN setup: added Windows install/run helpers and firewall guidance for allowing TCP 8092 only from the homepage machine LAN IP.
+- Migration/deprecation: none; existing CLI behavior and defaults are unchanged.
 
 ### 2026-06-24
 
@@ -44,11 +52,30 @@ It generates:
 pip install -e .
 ```
 
+Optional LAN worker API install:
+
+```powershell
+pip install -e ".[server]"
+```
+
+or run the Windows helper:
+
+```powershell
+.\install_transcriber_server.ps1
+```
+
 ## Development checks
 
 Run the local quality gate before committing:
 
 ```powershell
+python -m unittest discover -s tests
+```
+
+Server tests require the optional server extras:
+
+```powershell
+pip install -e ".[server]"
 python -m unittest discover -s tests
 ```
 
@@ -143,6 +170,83 @@ Watch mode from the CLI:
 
 ```powershell
 transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --lang auto --mode quality
+```
+
+### LAN worker server
+
+The server mode is owned by this repo and is optional. It does not add CORS; put it behind the homepage nginx same-origin proxy.
+
+Install on the worker PC:
+
+```powershell
+.\install_transcriber_server.ps1
+```
+
+Set a shared proxy token on the worker PC. Use the same value in the homepage `.env`:
+
+```powershell
+[Environment]::SetEnvironmentVariable("TRANSCRIBE_PROXY_TOKEN", "<long-random-token>", "User")
+[Environment]::SetEnvironmentVariable("TRANSCRIBE_WORK_DIR", "D:\TranscriberJobs", "User")
+```
+
+Start locally only, the default:
+
+```powershell
+.\run_transcriber_server.bat
+```
+
+Start for LAN access:
+
+```powershell
+.\run_transcriber_server.bat --host 0.0.0.0 --port 8092
+```
+
+Defaults:
+- Host/port: `127.0.0.1:8092`
+- Upload limit: 10 GB
+- Max worker jobs: 1
+- Completed job TTL: 24 hours
+- Device/compute type: `cuda` / `float16`
+- Work dir: `<repo>\.transcriber_server_jobs`
+
+Config can be set with environment variables or matching CLI args:
+- `TRANSCRIBE_PROXY_TOKEN` / `--proxy-token`
+- `TRANSCRIBE_SERVER_HOST` / `--host`
+- `TRANSCRIBE_SERVER_PORT` / `--port`
+- `TRANSCRIBE_WORK_DIR` / `--work-dir`
+- `TRANSCRIBE_MAX_UPLOAD_BYTES` / `--max-upload-bytes`
+- `TRANSCRIBE_MAX_WORKERS` / `--max-workers`
+- `TRANSCRIBE_JOB_TTL_SECONDS` / `--job-ttl-seconds`
+- `TRANSCRIBE_DEVICE` / `--device`
+- `TRANSCRIBE_COMPUTE_TYPE` / `--compute-type`
+
+API requests must include:
+
+```text
+X-Transcribe-Proxy-Token: <same-token>
+```
+
+Endpoints:
+- `GET /api/transcriptions/health`
+- `POST /api/transcriptions` multipart fields: `file`, `language=auto|en|es`
+- `GET /api/transcriptions/{jobId}`
+- `GET /api/transcriptions/{jobId}/transcript.txt`
+- `GET /api/transcriptions/{jobId}/transcript.srt`
+
+Server jobs always use CLI-equivalent quality mode, the selected language, configurable device/compute type, and `--no-speaker-labels`.
+Uploaded source media is deleted after success or failure. Transcript artifacts are kept until the TTL cleanup removes old completed jobs.
+
+Windows Firewall on the worker PC should allow TCP 8092 only from the homepage machine LAN IP. Run PowerShell as Administrator and replace the remote address:
+
+```powershell
+New-NetFirewallRule -DisplayName "Transcriber Worker 8092 from homepage" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8092 -RemoteAddress <homepage-lan-ip> -Profile Private
+```
+
+Homepage `.env`:
+
+```dotenv
+TRANSCRIBE_PROXY_TOKEN=<same-token>
+TRANSCRIBE_API_UPSTREAM=http://<worker-lan-ip>:8092
 ```
 
 ## Common command examples
