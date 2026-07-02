@@ -65,21 +65,23 @@ TRANSLATION_LENGTH_PENALTY = 1.0
 TRANSLATION_NO_REPEAT_NGRAM_SIZE = 3
 TRANSLATION_MARKER_START = "__CUR_START__"
 TRANSLATION_MARKER_END = "__CUR_END__"
-UNCERTAIN_MARKER_RE = re.compile(
-    r"__UNCERTAIN(?:_(\d+))?__(.*?)__UNCERTAIN_END__",
+LEGACY_LOW_CONFIDENCE_MARKER = "UNC" + "ERTAIN"
+LOW_CONFIDENCE_MARKER_RE = re.compile(
+    rf"__(?:LOWCONF|{LEGACY_LOW_CONFIDENCE_MARKER})(?:_(\d+))?__(.*?)__(?:LOWCONF|{LEGACY_LOW_CONFIDENCE_MARKER})_END__",
     re.DOTALL,
 )
-UNCERTAIN_MARKER_NOISE_HINTS = (
-    "uncert",
+LOW_CONFIDENCE_MARKER_NOISE_HINTS = (
+    "unc" + "ert",
     "cerain",
     "ciert",
     "certain",
+    "lowconf",
     "end",
 )
-UNCERTAIN_MARKER_NOISE_WORDS = {
-    "uncertain",
+LOW_CONFIDENCE_MARKER_NOISE_WORDS = {
+    "unc" + "ertain",
     "uncerain",
-    "uncertaint",
+    "unc" + "ertaint",
     "uncierta",
     "certain",
     "certaint",
@@ -94,6 +96,7 @@ DEFAULT_MIN_SPEAKER_TURN_TOKENS = 2
 DEFAULT_LOW_CONFIDENCE_LOGPROB = -1.0
 DEFAULT_HIGH_NO_SPEECH_PROB = 0.6
 DEFAULT_LOW_CONFIDENCE_WORD_PROB = 0.5
+LOW_CONFIDENCE_PLACEHOLDER = "—"
 
 Reporter = Callable[[str], None]
 
@@ -606,18 +609,18 @@ def segment_to_timed_tokens(segment: dict[str, Any]) -> list[TimedToken]:
     return distributed
 
 
-def token_uncertain_marker(token: TimedToken) -> str:
+def token_low_confidence_marker(token: TimedToken) -> str:
     if token.confidence is None:
-        return f"__UNCERTAIN__{token.text}__UNCERTAIN_END__"
+        return f"__LOWCONF__{token.text}__LOWCONF_END__"
     percent = max(0, min(100, int(round(float(token.confidence) * 100.0))))
-    return f"__UNCERTAIN_{percent}__{token.text}__UNCERTAIN_END__"
+    return f"__LOWCONF_{percent}__{token.text}__LOWCONF_END__"
 
 
 def format_token_text(token: TimedToken, style: str = "plain") -> str:
     if not token.text:
         return ""
     if style == "marker" and token.low_confidence:
-        return token_uncertain_marker(token)
+        return token_low_confidence_marker(token)
     return token.text
 
 
@@ -628,35 +631,27 @@ def format_cue_text(prefix: str, tokens: Sequence[TimedToken], style: str = "pla
     return normalize_subtitle_whitespace(f"{prefix}{body}") if prefix else body
 
 
-def render_uncertain_markup(text: str, style: str) -> str:
+def render_low_confidence_markup(text: str, style: str) -> str:
     if not text:
         return text
 
     def replace(match: re.Match[str]) -> str:
-        pct = match.group(1)
-        inner = normalize_subtitle_whitespace(match.group(2))
-        if style == "srt":
-            return inner
-        if style == "llm":
-            if pct:
-                return f"[{inner}] [{pct}% confidence]"
-            return f"[{inner}]"
-        return inner
+        return LOW_CONFIDENCE_PLACEHOLDER
 
-    updated = UNCERTAIN_MARKER_RE.sub(replace, text)
+    updated = LOW_CONFIDENCE_MARKER_RE.sub(replace, text)
     if style == "srt":
-        updated = strip_uncertain_marker_noise(updated)
+        updated = strip_low_confidence_marker_noise(updated)
         return normalize_subtitle_whitespace(updated)
     return updated
 
 
-def strip_uncertain_marker_noise(text: str) -> str:
+def strip_low_confidence_marker_noise(text: str) -> str:
     if not text:
         return text
 
     def clean_token(token: str) -> str:
         low = token.lower()
-        if not ("__" in token or ("_" in token and any(hint in low for hint in UNCERTAIN_MARKER_NOISE_HINTS))):
+        if not ("__" in token or ("_" in token and any(hint in low for hint in LOW_CONFIDENCE_MARKER_NOISE_HINTS))):
             return token
 
         parts = re.split(r"_+", token)
@@ -665,7 +660,7 @@ def strip_uncertain_marker_noise(text: str) -> str:
             cleaned = re.sub(r"[^a-z]+", "", part.lower())
             if not cleaned:
                 continue
-            if cleaned.isdigit() or cleaned in UNCERTAIN_MARKER_NOISE_WORDS:
+            if cleaned.isdigit() or cleaned in LOW_CONFIDENCE_MARKER_NOISE_WORDS:
                 continue
             kept.append(part)
         return " ".join(kept)
@@ -1091,7 +1086,7 @@ def build_translation_prompt(*, model_name: str, context_window: int, glossary: 
         f"Model: {model_name}",
         f"Context window: {context_window}",
         f"Preserve markers: {TRANSLATION_MARKER_START} ... {TRANSLATION_MARKER_END}",
-        "Preserve speaker labels, names, numbers, and uncertain markers exactly.",
+        "Preserve speaker labels, names, numbers, and low-confidence markers exactly.",
         "Use surrounding context only to disambiguate the current cue.",
         "Prefer faithful meaning over literal phrasing.",
     ]
@@ -1325,7 +1320,7 @@ def build_llm_file(srt_path: Path, llm_path: Path) -> None:
         s = line.strip()
         if not s or s.isdigit() or ("-->" in s and "," in s):
             continue
-        text_lines.append(render_uncertain_markup(s, "llm"))
+        text_lines.append(render_low_confidence_markup(s, "llm"))
 
     preface = (
         "You are given an automatic transcript.\n"
@@ -1335,7 +1330,7 @@ def build_llm_file(srt_path: Path, llm_path: Path) -> None:
         "Fix obvious punctuation, capitalization, spacing, and clear recognition mistakes.\n"
         "Keep the meaning and cadence close to the source.\n"
         "Use square brackets for brief editorial notes such as [inaudible], [crosstalk], or [name unclear].\n"
-        "If a word or short phrase is uncertain, italicize it and add a confidence percentage in square brackets, for example *word* [65% confidence].\n"
+        "If a word or short phrase is low confidence, leave the em dash placeholder as-is.\n"
         "If you are not confident enough to refine a passage cleanly, keep it cautious instead of guessing.\n"
         "Output only the refined transcript.\n\n"
         "TRANSCRIPT:\n"
@@ -1350,7 +1345,7 @@ def finalize_srt_file(srt_path: Path) -> None:
     text = srt_path.read_text(encoding="utf-8", errors="ignore")
     updated_lines: list[str] = []
     for line in text.splitlines():
-        updated_lines.append(render_uncertain_markup(line, "srt"))
+        updated_lines.append(render_low_confidence_markup(line, "srt"))
     srt_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
 
 

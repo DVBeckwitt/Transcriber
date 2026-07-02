@@ -22,6 +22,7 @@ from .__main__ import (
     parse_args as parse_transcriber_args,
     parse_srt_cues,
     project_dir,
+    render_low_confidence_markup,
     transcribe_file,
 )
 
@@ -320,14 +321,14 @@ def extract_plain_transcript(srt_path: Path) -> str:
     text = srt_path.read_text(encoding="utf-8", errors="ignore")
     cues = parse_srt_cues(text)
     if cues:
-        return "\n".join(cue.text.strip() for cue in cues if cue.text.strip()).rstrip() + "\n"
+        return "\n".join(render_low_confidence_markup(cue.text.strip(), "srt") for cue in cues if cue.text.strip()).rstrip() + "\n"
 
     lines: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.isdigit() or ("-->" in stripped and "," in stripped):
             continue
-        lines.append(stripped)
+        lines.append(render_low_confidence_markup(stripped, "srt"))
     return "\n".join(lines).rstrip() + ("\n" if lines else "")
 
 

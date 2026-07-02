@@ -324,7 +324,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - If the detected language is Spanish and `--translate-to-english` is not set, the launcher falls back to the existing post-translation step.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Use `--no-speaker-labels` when you do not want the generated `.srt` or `*_llm.txt` to report who spoke. It keeps diarization timing and speaker-change splits while hiding labels like `SPEAKER_00:`.
-- Low-confidence words are italicized in the `.srt` output and shown with confidence percentages in `*_llm.txt`.
+- Low-confidence words are rendered as `—` in `.srt`, `*_llm.txt`, and worker `transcript.txt` output.
 - If diarization fails due token/access issues, the launcher can retry without diarization and continue transcription.
 
 ## CLI options

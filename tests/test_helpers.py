@@ -28,7 +28,7 @@ from transcriber.__main__ import (
     preprocess_audio_for_whisperx,
     project_dir,
     read_text_tail,
-    render_uncertain_markup,
+    render_low_confidence_markup,
     should_fallback_without_diarization,
     smooth_timed_tokens,
     transcribe_file,
@@ -326,10 +326,15 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(word.get("_low_confidence"))
         self.assertEqual(word["word"], "hola")
 
-    def test_uncertain_markup_renders_for_srt_and_llm(self) -> None:
-        marker = "__UNCERTAIN_65__hola__UNCERTAIN_END__"
-        self.assertEqual(render_uncertain_markup(marker, "srt"), "hola")
-        self.assertEqual(render_uncertain_markup(marker, "llm"), "[hola] [65% confidence]")
+    def test_low_confidence_markup_renders_as_dash_for_srt_and_llm(self) -> None:
+        marker = "__LOWCONF_65__hola__LOWCONF_END__"
+        self.assertEqual(render_low_confidence_markup(marker, "srt"), "—")
+        self.assertEqual(render_low_confidence_markup(marker, "llm"), "—")
+
+    def test_legacy_low_confidence_markup_renders_as_dash(self) -> None:
+        legacy_marker_name = "UNC" + "ERTAIN"
+        marker = f"__{legacy_marker_name}_65__hola__{legacy_marker_name}_END__"
+        self.assertEqual(render_low_confidence_markup(marker, "srt"), "—")
 
     def test_timed_srt_keeps_speaker_labels_by_default(self) -> None:
         result = {

@@ -174,7 +174,7 @@ class ServerTests(unittest.TestCase):
                     "Hello there.\n\n"
                     "2\n"
                     "00:00:01,000 --> 00:00:02,000\n"
-                    "Second line.\n"
+                    "__LOWCONF_65__Second line.__LOWCONF_END__\n"
                 ),
                 encoding="utf-8",
             )
@@ -198,7 +198,7 @@ class ServerTests(unittest.TestCase):
 
             text = client.get(f"/api/transcriptions/{job_id}/transcript.txt", headers=auth_headers())
             self.assertEqual(text.status_code, 200)
-            self.assertEqual(text.text, "Hello there.\nSecond line.\n")
+            self.assertEqual(text.text, "Hello there.\n—\n")
 
     def test_failed_job_deletes_uploaded_source_and_uses_consistent_errors(self) -> None:
         uploaded_sources: list[Path] = []
