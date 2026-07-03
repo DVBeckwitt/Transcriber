@@ -244,6 +244,7 @@ The worker intentionally avoids returning stack traces, local file paths, or Whi
 - Cleanup runs opportunistically when API requests arrive.
 - The server also removes stale UUID-shaped job directories older than the TTL after restarts.
 - Jobs invoke the existing CLI-equivalent internals with quality mode, selected language, configurable `device` and `compute_type`, and hidden rendered speaker labels.
+- CUDA jobs use the shared CLI cleanup path: GPU cache flushing runs after transcription and Spanish post-translation attempts, including error paths.
 - The worker process keeps job state in memory. After a process restart, old status URLs are not restored, but stale directories are still cleaned by TTL.
 
 ## Validation Checklist

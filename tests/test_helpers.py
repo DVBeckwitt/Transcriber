@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
+import contextlib
 import subprocess
-from tempfile import TemporaryDirectory
+import sys
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from transcriber.__main__ import (
@@ -17,6 +20,7 @@ from transcriber.__main__ import (
     build_llm_file,
     build_srt_cues_from_result,
     build_translation_prompt,
+    flush_gpu_memory,
     load_translation_glossary,
     is_watchable_media,
     translate_spanish_texts,
@@ -29,12 +33,42 @@ from transcriber.__main__ import (
     project_dir,
     read_text_tail,
     render_low_confidence_markup,
+    run_whisperx_direct_logged,
     should_fallback_without_diarization,
     smooth_timed_tokens,
     transcribe_file,
     translation_context_for_cue,
     write_direct_srt_from_result,
 )
+
+
+class FakeTensor:
+    def to(self, device: object) -> "FakeTensor":
+        return self
+
+
+def make_cuda_translation_mocks(
+    load_translator: MagicMock,
+    flush_gpu: MagicMock,
+) -> tuple[list[tuple[str, object]], MagicMock, MagicMock, SimpleNamespace]:
+    events: list[tuple[str, object]] = []
+    tokenizer = MagicMock()
+    tokenizer.return_value = {
+        "input_ids": FakeTensor(),
+        "attention_mask": FakeTensor(),
+    }
+
+    model = MagicMock()
+    model.to.side_effect = lambda device: events.append(("model.to", device))
+    load_translator.return_value = (tokenizer, model)
+    flush_gpu.side_effect = lambda device: events.append(("flush", device))
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=MagicMock(return_value=True)),
+        device=MagicMock(side_effect=lambda name: f"{name}-device"),
+        no_grad=MagicMock(return_value=contextlib.nullcontext()),
+    )
+    return events, tokenizer, model, fake_torch
 
 
 def make_cfg(**overrides: object) -> RunConfig:
@@ -229,6 +263,50 @@ class HelperTests(unittest.TestCase):
             self.assertTrue(any("Input is not a file" in line for line in reports))
             run_logged.assert_not_called()
 
+    @patch("transcriber.__main__.flush_gpu_memory")
+    @patch("transcriber.__main__.run_whisperx_direct")
+    def test_run_whisperx_direct_logged_flushes_gpu_after_success(
+        self, run_direct: MagicMock, flush_gpu: MagicMock
+    ) -> None:
+        run_direct.return_value = "en"
+        cfg = make_cfg(device="cuda")
+
+        with TemporaryDirectory() as tmpdir:
+            rc, detected_language = run_whisperx_direct_logged(
+                cfg,
+                Path("input.wav"),
+                Path("output.srt"),
+                hf_token=None,
+                diarize=False,
+                log_path=Path(tmpdir) / "whisperx.log",
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(detected_language, "en")
+        flush_gpu.assert_called_once_with("cuda")
+
+    @patch("transcriber.__main__.flush_gpu_memory")
+    @patch("transcriber.__main__.run_whisperx_direct")
+    def test_run_whisperx_direct_logged_flushes_gpu_after_failure(
+        self, run_direct: MagicMock, flush_gpu: MagicMock
+    ) -> None:
+        run_direct.side_effect = RuntimeError("boom")
+        cfg = make_cfg(device="cuda")
+
+        with TemporaryDirectory() as tmpdir:
+            rc, detected_language = run_whisperx_direct_logged(
+                cfg,
+                Path("input.wav"),
+                Path("output.srt"),
+                hf_token=None,
+                diarize=False,
+                log_path=Path(tmpdir) / "whisperx.log",
+            )
+
+        self.assertEqual(rc, 1)
+        self.assertIsNone(detected_language)
+        flush_gpu.assert_called_once_with("cuda")
+
     def test_glossary_parsing_and_prompt(self) -> None:
         glossary = parse_glossary_entries(["OpenAI => OpenAI", "esfuerzo|effort", "termino"])
         prompt = build_translation_prompt(model_name="model", context_window=1, glossary=glossary)
@@ -272,6 +350,54 @@ class HelperTests(unittest.TestCase):
 
             self.assertEqual(glossary["OpenAI"], "OpenAI")
 
+    def test_flush_gpu_memory_skips_cpu_devices(self) -> None:
+        cuda = SimpleNamespace(
+            is_available=MagicMock(return_value=True),
+            empty_cache=MagicMock(),
+            ipc_collect=MagicMock(),
+        )
+        fake_torch = SimpleNamespace(cuda=cuda)
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            flush_gpu_memory("cpu")
+
+        cuda.is_available.assert_not_called()
+        cuda.empty_cache.assert_not_called()
+        cuda.ipc_collect.assert_not_called()
+
+    def test_flush_gpu_memory_releases_cuda_cache(self) -> None:
+        cuda = SimpleNamespace(
+            is_available=MagicMock(return_value=True),
+            empty_cache=MagicMock(),
+            ipc_collect=MagicMock(),
+        )
+        fake_torch = SimpleNamespace(cuda=cuda)
+
+        with (
+            patch("transcriber.__main__.gc.collect") as collect,
+            patch.dict(sys.modules, {"torch": fake_torch}),
+        ):
+            flush_gpu_memory("cuda")
+
+        collect.assert_called_once()
+        cuda.is_available.assert_called_once()
+        cuda.empty_cache.assert_called_once()
+        cuda.ipc_collect.assert_called_once()
+
+    def test_flush_gpu_memory_suppresses_cleanup_errors(self) -> None:
+        cuda = SimpleNamespace(
+            is_available=MagicMock(return_value=True),
+            empty_cache=MagicMock(side_effect=RuntimeError("boom")),
+            ipc_collect=MagicMock(side_effect=RuntimeError("boom")),
+        )
+        fake_torch = SimpleNamespace(cuda=cuda)
+
+        with (
+            patch("transcriber.__main__.gc.collect"),
+            patch.dict(sys.modules, {"torch": fake_torch}),
+        ):
+            flush_gpu_memory("cuda")
+
     def test_translation_context_includes_neighbors(self) -> None:
         cues = [
             SRTCue(index=1, start_ms=0, end_ms=1000, text="SPEAKER_1: Hola"),
@@ -299,12 +425,78 @@ class HelperTests(unittest.TestCase):
         result = translate_spanish_texts(["Hola"], device="cpu", batch_size=1)
 
         self.assertEqual(result, ["Hello there"])
+        model.to.assert_called_once()
+        self.assertEqual(str(model.to.call_args.args[0]), "cpu")
         model.generate.assert_called_once()
         kwargs = model.generate.call_args.kwargs
         self.assertEqual(kwargs["num_beams"], 4)
         self.assertEqual(kwargs["length_penalty"], 1.0)
         self.assertEqual(kwargs["no_repeat_ngram_size"], 3)
         self.assertTrue(kwargs["early_stopping"])
+
+    @patch("transcriber.__main__.flush_gpu_memory")
+    @patch("transcriber.__main__.load_spanish_to_english_translator")
+    def test_translation_flushes_gpu_after_cuda_success(
+        self, load_translator: MagicMock, flush_gpu: MagicMock
+    ) -> None:
+        events, tokenizer, model, fake_torch = make_cuda_translation_mocks(
+            load_translator, flush_gpu
+        )
+        tokenizer.batch_decode.return_value = ["Hello there"]
+        model.generate.return_value = object()
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            result = translate_spanish_texts(["Hola"], device="cuda", batch_size=1)
+
+        self.assertEqual(result, ["Hello there"])
+        self.assertEqual(
+            events,
+            [("model.to", "cuda-device"), ("model.to", "cpu-device"), ("flush", "cuda")],
+        )
+
+    @patch("transcriber.__main__.flush_gpu_memory")
+    @patch("transcriber.__main__.load_spanish_to_english_translator")
+    def test_translation_flushes_gpu_after_cuda_failure(
+        self, load_translator: MagicMock, flush_gpu: MagicMock
+    ) -> None:
+        events, _, model, fake_torch = make_cuda_translation_mocks(
+            load_translator, flush_gpu
+        )
+        model.generate.side_effect = RuntimeError("boom")
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            with self.assertRaises(RuntimeError):
+                translate_spanish_texts(["Hola"], device="cuda", batch_size=1)
+
+        self.assertEqual(
+            events,
+            [("model.to", "cuda-device"), ("model.to", "cpu-device"), ("flush", "cuda")],
+        )
+
+    @patch("transcriber.__main__.flush_gpu_memory")
+    @patch("transcriber.__main__.load_spanish_to_english_translator")
+    def test_translation_flushes_gpu_when_cuda_model_move_fails(
+        self, load_translator: MagicMock, flush_gpu: MagicMock
+    ) -> None:
+        events, _, model, fake_torch = make_cuda_translation_mocks(
+            load_translator, flush_gpu
+        )
+
+        def move_model(device: object) -> None:
+            events.append(("model.to", device))
+            if device == "cuda-device":
+                raise RuntimeError("cuda oom")
+
+        model.to.side_effect = move_model
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            with self.assertRaises(RuntimeError):
+                translate_spanish_texts(["Hola"], device="cuda", batch_size=1)
+
+        self.assertEqual(
+            events,
+            [("model.to", "cuda-device"), ("model.to", "cpu-device"), ("flush", "cuda")],
+        )
 
     def test_confidence_cleanup_marks_low_confidence(self) -> None:
         cfg = make_cfg()

@@ -18,6 +18,13 @@ It generates:
 
 ## Change status
 
+### 2026-07-03
+
+- Bug/error handling: CUDA GPU memory cleanup now runs after WhisperX direct runs and Spanish post-translation attempts, including success, generation errors, and CUDA model-transfer failures.
+- Runtime behavior: the cached Spanish-to-English translator is moved back to CPU before the CUDA cache is flushed, so the cached model does not keep VRAM after a run.
+- Migration/deprecation: none; CLI options, server configuration, and output formats are unchanged.
+- Status: fixed and verified with `python -m unittest discover -s tests`.
+
 ### 2026-07-02
 
 - Feature: added optional FastAPI worker mode with authenticated upload, job status, and transcript download endpoints.
@@ -322,6 +329,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - Language is auto-detected unless you force `--lang en` or `--lang es`.
 - If you pass `--translate-to-english`, WhisperX writes English subtitle text directly.
 - If the detected language is Spanish and `--translate-to-english` is not set, the launcher falls back to the existing post-translation step.
+- CUDA runs perform best-effort GPU cleanup after WhisperX and Spanish post-translation paths, including failure paths.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Use `--no-speaker-labels` when you do not want the generated `.srt` or `*_llm.txt` to report who spoke. It keeps diarization timing and speaker-change splits while hiding labels like `SPEAKER_00:`.
 - Low-confidence words are rendered as `—` in `.srt`, `*_llm.txt`, and worker `transcript.txt` output.

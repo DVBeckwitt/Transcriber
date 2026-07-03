@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import gc
 import importlib
 import inspect
 import math
@@ -484,6 +485,38 @@ def resolve_whisperx_symbol(whisperx_module: Any, symbol_name: str) -> Any:
     raise AttributeError(
         f"Could not find whisperx symbol {symbol_name!r} in {whisperx_module.__name__} or its supported compatibility modules."
     )
+
+
+def flush_gpu_memory(device: str | None = None) -> None:
+    normalized_device = str(device or "").strip().lower()
+    if normalized_device and not normalized_device.startswith("cuda"):
+        return
+
+    try:
+        import torch
+    except Exception:
+        return
+
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None:
+        return
+
+    is_available = getattr(cuda, "is_available", None)
+    if callable(is_available):
+        try:
+            if not is_available():
+                return
+        except Exception:
+            return
+
+    with contextlib.suppress(Exception):
+        gc.collect()
+
+    for cleanup_name in ("empty_cache", "ipc_collect"):
+        cleanup = getattr(cuda, cleanup_name, None)
+        if callable(cleanup):
+            with contextlib.suppress(Exception):
+                cleanup()
 
 
 def segment_is_low_confidence(
@@ -1188,38 +1221,53 @@ def translate_spanish_texts(
     except Exception:
         torch = None
 
-    use_cuda = bool(torch is not None and device.startswith("cuda") and getattr(torch.cuda, "is_available", lambda: False)())
-    if torch is not None:
-        target_device = torch.device("cuda" if use_cuda else "cpu")
-        model.to(target_device)
-        model.eval()
-    else:
-        target_device = None
-
+    use_cuda = False
+    target_device: Any = None
     translated: list[str] = []
-    for batch in chunked_text([text.strip() for text in texts], batch_size):
-        inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
+    inputs: dict[str, Any] | None = None
+    outputs: Any = None
+    try:
+        use_cuda = bool(
+            torch is not None
+            and device.startswith("cuda")
+            and getattr(torch.cuda, "is_available", lambda: False)()
         )
-        if target_device is not None:
-            inputs = {key: value.to(target_device) for key, value in inputs.items()}
-        with torch.no_grad() if torch is not None else contextlib.nullcontext():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                num_beams=num_beams,
-                length_penalty=TRANSLATION_LENGTH_PENALTY,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                early_stopping=True,
-            )
-        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        translated.extend(text.strip() for text in decoded)
+        if torch is not None:
+            target_device = torch.device("cuda" if use_cuda else "cpu")
+            model.to(target_device)
+            model.eval()
 
-    return translated
+        for batch in chunked_text([text.strip() for text in texts], batch_size):
+            inputs = tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            )
+            if target_device is not None:
+                inputs = {key: value.to(target_device) for key, value in inputs.items()}
+            with torch.no_grad() if torch is not None else contextlib.nullcontext():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    length_penalty=TRANSLATION_LENGTH_PENALTY,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    early_stopping=True,
+                )
+            decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            translated.extend(text.strip() for text in decoded)
+        return translated
+    finally:
+        inputs = None
+        outputs = None
+        if use_cuda and torch is not None:
+            with contextlib.suppress(Exception):
+                model.to(torch.device("cpu"))
+        model = None
+        tokenizer = None
+        flush_gpu_memory(device)
 
 
 def translate_srt_to_english(
@@ -2091,11 +2139,6 @@ def run_whisperx_direct(
 ) -> str | None:
     import whisperx
 
-    try:
-        import torch
-    except Exception:
-        torch = None
-
     whisper_language = None if cfg.language == "auto" else cfg.language
     whisper_task = "translate" if cfg.translate_to_english else "transcribe"
 
@@ -2182,10 +2225,6 @@ def run_whisperx_direct(
     print("[transcriber] Writing subtitle-sized SRT from in-memory timings...")
     write_direct_srt_from_result(result, srt_path, cfg)
 
-    if torch is not None and getattr(torch, "cuda", None) is not None:
-        with contextlib.suppress(Exception):
-            torch.cuda.empty_cache()
-
     return detected_language
 
 
@@ -2200,18 +2239,23 @@ def run_whisperx_direct_logged(
 ) -> tuple[int, str | None]:
     mode = "a" if append else "w"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open(mode, encoding="utf-8", errors="ignore") as log:
-        with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-            try:
-                detected_language = run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
-                if detected_language is None:
-                    detected_language = parse_detected_language_from_log(log_path)
-                return 0, detected_language
-            except Exception:
-                import traceback
+    try:
+        with log_path.open(mode, encoding="utf-8", errors="ignore") as log:
+            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                try:
+                    detected_language = run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
+                    if detected_language is None:
+                        detected_language = parse_detected_language_from_log(log_path)
+                    return_code = 0
+                except Exception:
+                    import traceback
 
-                traceback.print_exc()
-                return 1, None
+                    traceback.print_exc()
+                    return_code = 1
+                    detected_language = None
+        return return_code, detected_language
+    finally:
+        flush_gpu_memory(cfg.device)
 
 
 def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report: Reporter = print) -> None:
