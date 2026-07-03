@@ -62,7 +62,7 @@ def make_cfg(**overrides: object) -> RunConfig:
         confidence_cleanup_mode="mark",
         low_confidence_logprob=-1.0,
         high_no_speech_prob=0.6,
-        low_confidence_word_prob=0.5,
+        low_confidence_word_prob=0.10,
         device="cpu",
         compute_type="float32",
         translation_context_window=2,
@@ -85,6 +85,10 @@ class HelperTests(unittest.TestCase):
         cfg = build_config(parse_args([]), interactive=False)
         self.assertEqual(cfg.language, "auto")
         self.assertFalse(cfg.translate_to_english)
+
+    def test_build_config_uses_less_aggressive_word_confidence_default(self) -> None:
+        cfg = build_config(parse_args([]), interactive=False)
+        self.assertEqual(cfg.low_confidence_word_prob, 0.10)
 
     def test_translate_flag_enables_direct_whisperx_output(self) -> None:
         cfg = build_config(parse_args(["--translate-to-english"]), interactive=False)

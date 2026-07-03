@@ -163,6 +163,7 @@ class ServerTests(unittest.TestCase):
             self.assertFalse(seen[0].include_speaker_labels)
             self.assertEqual(seen[0].device, "cuda")
             self.assertEqual(seen[0].compute_type, "int8")
+            self.assertEqual(seen[0].low_confidence_word_prob, 0.10)
 
     def test_downloads_srt_and_extracted_plain_text_transcript(self) -> None:
         def runner(cfg: RunConfig, source_path: Path, report=print) -> int:
