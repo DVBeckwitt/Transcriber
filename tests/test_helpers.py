@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import transcriber.__main__ as transcriber_main
+
 from transcriber.__main__ import (
     build_audio_preprocess_command,
     build_asr_prompt,
@@ -107,6 +109,7 @@ def make_cfg(**overrides: object) -> RunConfig:
         glossary={},
         glossary_path=None,
         asr_prompt=None,
+        warm_vram=False,
         dry_run=False,
     )
     for key, value in overrides.items():
@@ -123,6 +126,13 @@ class HelperTests(unittest.TestCase):
     def test_build_config_uses_less_aggressive_word_confidence_default(self) -> None:
         cfg = build_config(parse_args([]), interactive=False)
         self.assertEqual(cfg.low_confidence_word_prob, 0.10)
+
+    def test_warm_vram_defaults_off_and_can_be_enabled(self) -> None:
+        self.assertFalse(build_config(parse_args([]), interactive=False).warm_vram)
+        self.assertTrue(build_config(parse_args(["--warm-vram"]), interactive=False).warm_vram)
+        self.assertFalse(
+            build_config(parse_args(["--warm-vram", "--no-warm-vram"]), interactive=False).warm_vram
+        )
 
     def test_translate_flag_enables_direct_whisperx_output(self) -> None:
         cfg = build_config(parse_args(["--translate-to-english"]), interactive=False)
@@ -207,6 +217,13 @@ class HelperTests(unittest.TestCase):
 
             self.assertTrue(should_fallback_without_diarization(log_path))
             self.assertEqual(parse_detected_language_from_log(log_path), "spanish")
+
+    def test_diarization_fallback_matches_exception_type(self) -> None:
+        self.assertTrue(
+            transcriber_main.diarization_error_allows_fallback(
+                AttributeError("'NoneType' object has no attribute 'to'")
+            )
+        )
 
     def test_opus_files_are_watchable(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -398,6 +415,275 @@ class HelperTests(unittest.TestCase):
         ):
             flush_gpu_memory("cuda")
 
+    @patch("transcriber.__main__.flush_gpu_memory")
+    def test_cold_cleanup_clears_warm_model_caches_and_flushes_gpu(self, flush_gpu: MagicMock) -> None:
+        transcriber_main._WARM_ASR_MODEL_CACHE[("asr",)] = object()
+        transcriber_main._WARM_ALIGN_MODEL_CACHE[("align",)] = object()
+        transcriber_main._WARM_DIARIZATION_MODEL_CACHE[("diarize",)] = object()
+
+        transcriber_main.cleanup_after_transcription_run(make_cfg(device="cuda", warm_vram=False))
+
+        self.assertEqual(transcriber_main._WARM_ASR_MODEL_CACHE, {})
+        self.assertEqual(transcriber_main._WARM_ALIGN_MODEL_CACHE, {})
+        self.assertEqual(transcriber_main._WARM_DIARIZATION_MODEL_CACHE, {})
+        flush_gpu.assert_called_once_with("cuda")
+
+    @patch("transcriber.__main__.flush_gpu_memory")
+    def test_warm_cleanup_preserves_model_caches_and_skips_gpu_flush(self, flush_gpu: MagicMock) -> None:
+        asr_model = object()
+        align_model = object()
+        diarize_model = object()
+        transcriber_main._WARM_ASR_MODEL_CACHE[("asr",)] = asr_model
+        transcriber_main._WARM_ALIGN_MODEL_CACHE[("align",)] = align_model
+        transcriber_main._WARM_DIARIZATION_MODEL_CACHE[("diarize",)] = diarize_model
+
+        try:
+            transcriber_main.cleanup_after_transcription_run(make_cfg(device="cuda", warm_vram=True))
+
+            self.assertIs(transcriber_main._WARM_ASR_MODEL_CACHE[("asr",)], asr_model)
+            self.assertIs(transcriber_main._WARM_ALIGN_MODEL_CACHE[("align",)], align_model)
+            self.assertIs(transcriber_main._WARM_DIARIZATION_MODEL_CACHE[("diarize",)], diarize_model)
+            flush_gpu.assert_not_called()
+        finally:
+            transcriber_main.clear_warm_model_caches()
+
+    def test_warm_vram_reuses_asr_and_align_models(self) -> None:
+        model = MagicMock()
+        model.transcribe.return_value = {
+            "language": "en",
+            "segments": [
+                {
+                    "words": [
+                        {"word": "Hello", "start": 0.0, "end": 0.5},
+                        {"word": "there.", "start": 0.5, "end": 1.0},
+                    ]
+                }
+            ],
+        }
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(return_value=model),
+            load_audio=MagicMock(return_value=object()),
+            load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
+            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+        )
+
+        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+            cfg = make_cfg(language="en", diarize=False, warm_vram=True)
+            try:
+                for idx in range(2):
+                    transcriber_main.run_whisperx_direct(
+                        cfg,
+                        Path("input.wav"),
+                        Path(tmpdir) / f"output-{idx}.srt",
+                        hf_token=None,
+                        diarize=False,
+                    )
+            finally:
+                transcriber_main.clear_warm_model_caches()
+
+        self.assertEqual(fake_whisperx.load_model.call_count, 1)
+        self.assertEqual(fake_whisperx.load_align_model.call_count, 1)
+        self.assertEqual(model.transcribe.call_count, 2)
+
+    def test_warm_vram_keeps_direct_run_inside_cache_lock(self) -> None:
+        class RecordingLock:
+            def __init__(self) -> None:
+                self.depth = 0
+                self.enter_count = 0
+
+            def __enter__(self) -> "RecordingLock":
+                self.depth += 1
+                self.enter_count += 1
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+                self.depth -= 1
+
+        lock = RecordingLock()
+        model = MagicMock()
+
+        def transcribe(*args: object, **kwargs: object) -> dict[str, object]:
+            self.assertGreater(lock.depth, 0)
+            return {
+                "language": "en",
+                "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}],
+            }
+
+        model.transcribe.side_effect = transcribe
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(return_value=model),
+            load_audio=MagicMock(return_value=object()),
+            load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
+            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+        )
+
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx}),
+            patch("transcriber.__main__._WARM_MODEL_CACHE_LOCK", lock),
+        ):
+            try:
+                transcriber_main.run_whisperx_direct(
+                    make_cfg(language="en", diarize=False, warm_vram=True),
+                    Path("input.wav"),
+                    Path(tmpdir) / "output.srt",
+                    hf_token=None,
+                    diarize=False,
+                )
+            finally:
+                transcriber_main.clear_warm_model_caches()
+
+        self.assertGreaterEqual(lock.enter_count, 3)
+
+    def test_cold_vram_loads_asr_and_align_models_per_run(self) -> None:
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(),
+            load_audio=MagicMock(return_value=object()),
+            load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
+            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+        )
+        fake_whisperx.load_model.side_effect = [
+            MagicMock(
+                transcribe=MagicMock(
+                    return_value={
+                        "language": "en",
+                        "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}],
+                    }
+                )
+            ),
+            MagicMock(
+                transcribe=MagicMock(
+                    return_value={
+                        "language": "en",
+                        "segments": [{"words": [{"word": "Again", "start": 0.0, "end": 0.5}]}],
+                    }
+                )
+            ),
+        ]
+
+        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+            cfg = make_cfg(language="en", diarize=False, warm_vram=False)
+            for idx in range(2):
+                transcriber_main.run_whisperx_direct(
+                    cfg,
+                    Path("input.wav"),
+                    Path(tmpdir) / f"output-{idx}.srt",
+                    hf_token=None,
+                    diarize=False,
+                )
+
+        self.assertEqual(fake_whisperx.load_model.call_count, 2)
+        self.assertEqual(fake_whisperx.load_align_model.call_count, 2)
+
+    def test_warm_vram_reuses_diarization_pipeline_without_raw_token_cache_key(self) -> None:
+        model = MagicMock()
+        model.transcribe.return_value = {
+            "language": "en",
+            "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}],
+        }
+        diarize_model = MagicMock(return_value="diarize-segments")
+        raw_token = "fake"
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(return_value=model),
+            load_audio=MagicMock(return_value=object()),
+            load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
+            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            DiarizationPipeline=MagicMock(return_value=diarize_model),
+            assign_word_speakers=MagicMock(side_effect=lambda diarize_segments, result: result),
+        )
+        fake_torch = SimpleNamespace(load=MagicMock())
+
+        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}):
+            cfg = make_cfg(language="en", diarize=True, warm_vram=True)
+            try:
+                for idx in range(2):
+                    transcriber_main.run_whisperx_direct(
+                        cfg,
+                        Path("input.wav"),
+                        Path(tmpdir) / f"diarized-{idx}.srt",
+                        hf_token=raw_token,
+                        diarize=True,
+                    )
+            finally:
+                cache_keys = list(transcriber_main._WARM_DIARIZATION_MODEL_CACHE)
+                transcriber_main.clear_warm_model_caches()
+
+        self.assertEqual(fake_whisperx.DiarizationPipeline.call_count, 1)
+        self.assertEqual(diarize_model.call_count, 2)
+        self.assertNotIn(raw_token, repr(cache_keys))
+
+    def test_cold_vram_loads_diarization_pipeline_per_run(self) -> None:
+        model = MagicMock()
+        model.transcribe.return_value = {
+            "language": "en",
+            "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}],
+        }
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(return_value=model),
+            load_audio=MagicMock(return_value=object()),
+            load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
+            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            DiarizationPipeline=MagicMock(side_effect=[MagicMock(return_value="one"), MagicMock(return_value="two")]),
+            assign_word_speakers=MagicMock(side_effect=lambda diarize_segments, result: result),
+        )
+        fake_torch = SimpleNamespace(load=MagicMock())
+
+        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}):
+            cfg = make_cfg(language="en", diarize=True, warm_vram=False)
+            for idx in range(2):
+                transcriber_main.run_whisperx_direct(
+                    cfg,
+                    Path("input.wav"),
+                    Path(tmpdir) / f"diarized-{idx}.srt",
+                    hf_token="fake",
+                    diarize=True,
+                )
+
+        self.assertEqual(fake_whisperx.DiarizationPipeline.call_count, 2)
+
+    @patch("transcriber.__main__.load_hf_token", return_value="hf_token")
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx", side_effect=lambda path, temp_dir, report=print: path)
+    def test_known_diarization_failure_does_not_rerun_transcription(
+        self,
+        preprocess_audio: MagicMock,
+        load_token: MagicMock,
+    ) -> None:
+        model = MagicMock()
+        model.transcribe.return_value = {
+            "language": "en",
+            "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}],
+        }
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(return_value=model),
+            load_audio=MagicMock(return_value=object()),
+            load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
+            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            DiarizationPipeline=MagicMock(
+                side_effect=RuntimeError("Could not download 'pyannote/speaker-diarization-3.1' pipeline.")
+            ),
+        )
+        fake_torch = SimpleNamespace(load=MagicMock())
+
+        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}):
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            reports: list[str] = []
+
+            rc = transcribe_file(make_cfg(language="en", diarize=True), source, report=reports.append)
+
+            srt_path = source.with_suffix(".srt")
+            self.assertEqual(rc, 0)
+            self.assertTrue(srt_path.exists())
+            self.assertIn("Hello", srt_path.read_text(encoding="utf-8"))
+            self.assertEqual(model.transcribe.call_count, 1)
+            self.assertTrue(any("completed without speaker diarization" in line for line in reports))
+
     def test_translation_context_includes_neighbors(self) -> None:
         cues = [
             SRTCue(index=1, start_ms=0, end_ms=1000, text="SPEAKER_1: Hola"),
@@ -433,6 +719,37 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(kwargs["length_penalty"], 1.0)
         self.assertEqual(kwargs["no_repeat_ngram_size"], 3)
         self.assertTrue(kwargs["early_stopping"])
+
+    @patch("transcriber.__main__.translate_spanish_texts")
+    def test_translation_marker_fallbacks_are_batched(self, translate_texts: MagicMock) -> None:
+        calls: list[list[str]] = []
+
+        def fake_translate(texts: list[str], *args: object, **kwargs: object) -> list[str]:
+            calls.append(list(texts))
+            if len(calls) == 1:
+                return ["missing markers", "also missing markers"]
+            return ["Hello.", "Goodbye."]
+
+        translate_texts.side_effect = fake_translate
+
+        with TemporaryDirectory() as tmpdir:
+            srt_path = Path(tmpdir) / "spanish.srt"
+            srt_path.write_text(
+                (
+                    "1\n"
+                    "00:00:00,000 --> 00:00:01,000\n"
+                    "Hola.\n\n"
+                    "2\n"
+                    "00:00:01,000 --> 00:00:02,000\n"
+                    "Adios.\n"
+                ),
+                encoding="utf-8",
+            )
+
+            transcriber_main.translate_srt_to_english(srt_path, "cpu", context_window=0)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], ["Hola.", "Adios."])
 
     @patch("transcriber.__main__.flush_gpu_memory")
     @patch("transcriber.__main__.load_spanish_to_english_translator")
@@ -608,6 +925,66 @@ class HelperTests(unittest.TestCase):
             transcript_body = llm_path.read_text(encoding="utf-8").split("TRANSCRIPT:\n", 1)[1]
             self.assertEqual(transcript_body, "Hello there.")
             self.assertNotIn("SPEAKER_", transcript_body)
+
+    def test_finalize_transcript_outputs_updates_srt_and_llm_together(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            srt_path = Path(tmpdir) / "movie.srt"
+            llm_path = Path(tmpdir) / "movie_llm.txt"
+            srt_path.write_text(
+                (
+                    "1\n"
+                    "00:00:00,000 --> 00:00:01,000\n"
+                    "Hello.\n\n"
+                    "2\n"
+                    "00:00:01,000 --> 00:00:02,000\n"
+                    "__LOWCONF_65__unclear__LOWCONF_END__\n"
+                ),
+                encoding="utf-8",
+            )
+
+            transcriber_main.finalize_transcript_outputs(srt_path, llm_path)
+
+            self.assertNotIn("__LOWCONF", srt_path.read_text(encoding="utf-8"))
+            transcript_body = llm_path.read_text(encoding="utf-8").split("TRANSCRIPT:\n", 1)[1]
+            self.assertEqual(transcript_body, "Hello.\n—")
+
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx", side_effect=lambda path, temp_dir, report=print: path)
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    def test_transcribe_file_uses_combined_transcript_finalizer(
+        self,
+        run_logged: MagicMock,
+        preprocess_audio: MagicMock,
+    ) -> None:
+        def run_and_write_srt(
+            cfg: RunConfig,
+            input_path: Path,
+            srt_path: Path,
+            hf_token: str | None,
+            diarize: bool,
+            log_path: Path,
+            append: bool = False,
+        ) -> tuple[int, str | None]:
+            srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello.\n", encoding="utf-8")
+            return 0, "en"
+
+        run_logged.side_effect = run_and_write_srt
+
+        with TemporaryDirectory() as tmpdir, patch("transcriber.__main__.finalize_transcript_outputs") as finalize:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+
+            rc = transcribe_file(make_cfg(language="en", diarize=False), source, report=lambda _message: None)
+
+        self.assertEqual(rc, 0)
+        finalize.assert_called_once()
+
+    def test_write_direct_srt_allows_empty_transcript_when_no_cues(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            srt_path = Path(tmpdir) / "silent.srt"
+
+            write_direct_srt_from_result({"segments": []}, srt_path, make_cfg())
+
+            self.assertEqual(srt_path.read_text(encoding="utf-8"), "")
 
     def test_speaker_smoothing_merges_short_blips(self) -> None:
         tokens = [

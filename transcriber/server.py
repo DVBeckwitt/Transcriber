@@ -22,6 +22,7 @@ from .__main__ import (
     parse_args as parse_transcriber_args,
     parse_srt_cues,
     project_dir,
+    read_text_tail,
     render_low_confidence_markup,
     transcribe_file,
 )
@@ -37,6 +38,43 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 LANGUAGES = {"auto", "en", "es"}
 TERMINAL_STATUSES = {"succeeded", "failed"}
 JOB_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_FAILURE_REPORT_LINES = 20
+MAX_FAILURE_LOG_CHARS = 16 * 1024
+MAX_FAILURE_LOG_LINES = 80
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(token|password|secret|api[_-]?key)(\b\s*[:=]\s*)([^\s,;]+)"
+)
+HF_TOKEN_RE = re.compile(r"\bhf_[A-Za-z0-9_-]{10,}\b")
+LOCAL_PATH_RE = re.compile(r"[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\)*[^\\/:*?\"<>|\r\n]*")
+DIAGNOSTIC_NOISE_PREFIXES = (
+    "input:",
+    "output:",
+    "llm:",
+    "log:",
+    "lock:",
+    "outdir:",
+    "lang:",
+    "translate:",
+    "mode:",
+    "model:",
+    "diarize:",
+    "smooth:",
+    "cleanup:",
+    "decode:",
+    "see the log:",
+    "check the log:",
+)
+DIAGNOSTIC_FAILURE_TERMS = (
+    "runtimeerror:",
+    "exception:",
+    "error:",
+    "failed",
+    "failure",
+    "not found",
+    "no active speech",
+    "no subtitle cues",
+    "returned no",
+)
 
 TranscribeRunner = Callable[..., int]
 
@@ -60,6 +98,7 @@ class ServerConfig:
     job_ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS
     device: str = "cuda"
     compute_type: str = "float16"
+    warm_vram: bool = False
 
 
 @dataclass
@@ -75,7 +114,7 @@ class JobRecord:
     updated_at: str
     created_at_epoch: float
     updated_at_epoch: float
-    error: dict[str, str] | None = None
+    error: dict[str, Any] | None = None
 
     @property
     def status_url(self) -> str:
@@ -109,7 +148,7 @@ class JobStore:
             language=language,
             status="queued",
             work_dir=job_dir,
-            source_path=job_dir / f"transcript{extension}",
+            source_path=job_dir / f"{job_id}{extension}",
             srt_path=job_dir / "transcript.srt",
             txt_path=job_dir / "transcript.txt",
             created_at=now,
@@ -137,10 +176,19 @@ class JobStore:
     def mark_succeeded(self, job_id: str) -> None:
         self._update(job_id, status="succeeded", error=None)
 
-    def mark_failed(self, job_id: str, code: str, message: str) -> None:
-        self._update(job_id, status="failed", error={"code": code, "message": message})
+    def mark_failed(
+        self,
+        job_id: str,
+        code: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if details:
+            error["details"] = dict(details)
+        self._update(job_id, status="failed", error=error)
 
-    def _update(self, job_id: str, *, status: str, error: dict[str, str] | None) -> None:
+    def _update(self, job_id: str, *, status: str, error: dict[str, Any] | None) -> None:
         now_epoch = time.time()
         now = utc_now_iso()
         with self._lock:
@@ -167,13 +215,14 @@ class JobStore:
         self.cleanup_expired_directories(cutoff)
 
     def cleanup_expired_directories(self, cutoff_epoch: float) -> None:
-        active_dirs: set[Path] = set()
         with self._lock:
             active_dirs = {record.work_dir.resolve() for record in self._jobs.values()}
 
-        candidates: list[Path] = []
-        with contextlib.suppress(OSError):
+        try:
             candidates = list(self.work_dir.iterdir())
+        except OSError:
+            return
+
         for candidate in candidates:
             if not candidate.is_dir() or not JOB_DIR_RE.fullmatch(candidate.name):
                 continue
@@ -215,6 +264,7 @@ def normalize_config(config: ServerConfig) -> ServerConfig:
         job_ttl_seconds=int(config.job_ttl_seconds),
         device=device,
         compute_type=compute_type,
+        warm_vram=bool(config.warm_vram),
     )
 
 
@@ -312,6 +362,7 @@ def build_job_config(source_path: Path, language: str, server_config: ServerConf
             server_config.device,
             "--compute-type",
             server_config.compute_type,
+            "--warm-vram" if server_config.warm_vram else "--no-warm-vram",
         ]
     )
     return build_config(args, interactive=False)
@@ -332,6 +383,82 @@ def extract_plain_transcript(srt_path: Path) -> str:
     return "\n".join(lines).rstrip() + ("\n" if lines else "")
 
 
+def scrub_diagnostic_text(text: str) -> str:
+    scrubbed = text.replace("\x00", "")
+    scrubbed = SECRET_ASSIGNMENT_RE.sub(r"\1\2<redacted>", scrubbed)
+    scrubbed = HF_TOKEN_RE.sub("hf_<redacted>", scrubbed)
+    scrubbed = LOCAL_PATH_RE.sub("<local-path>", scrubbed)
+    return scrubbed.strip()
+
+
+def scrub_diagnostic_lines(lines: Sequence[str], limit: int) -> list[str]:
+    scrubbed: list[str] = []
+    for line in lines[-limit:]:
+        cleaned = scrub_diagnostic_text(str(line))
+        if cleaned:
+            scrubbed.append(cleaned)
+    return scrubbed
+
+
+def read_failure_log_lines(log_path: Path | None) -> list[str]:
+    if log_path is None:
+        return []
+    text = read_text_tail(log_path, max_chars=MAX_FAILURE_LOG_CHARS)
+    return [line for line in text.splitlines() if line.strip()][-MAX_FAILURE_LOG_LINES:]
+
+
+def diagnostic_line_is_noise(line: str) -> bool:
+    lower = line.lower().strip()
+    return lower.startswith(DIAGNOSTIC_NOISE_PREFIXES) or lower in {"arguments: ()", "call stack:"}
+
+
+def diagnostic_line_is_failure(line: str) -> bool:
+    lower = line.lower()
+    return any(term in lower for term in DIAGNOSTIC_FAILURE_TERMS)
+
+
+def normalize_failure_message(line: str) -> str:
+    for prefix in ("RuntimeError:", "Exception:", "Error:"):
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip() or "Transcription failed."
+    return line
+
+
+def summarize_failure_message(exc: Exception, reports: Sequence[str], log_lines: Sequence[str]) -> str:
+    for lines in (log_lines, reports):
+        for line in reversed(scrub_diagnostic_lines(lines, max(len(lines), 1))):
+            if diagnostic_line_is_noise(line):
+                continue
+            if diagnostic_line_is_failure(line):
+                return normalize_failure_message(line)
+
+    fallback = scrub_diagnostic_text(str(exc))
+    if fallback and fallback.lower() != "transcription failed":
+        return normalize_failure_message(fallback)
+    return "Transcription failed."
+
+
+def failure_details(
+    exc: Exception,
+    reports: Sequence[str],
+    log_lines: Sequence[str],
+    log_path: Path | None,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {"exceptionType": type(exc).__name__}
+    if log_path is not None:
+        details["logName"] = log_path.name
+
+    report_lines = scrub_diagnostic_lines(reports, MAX_FAILURE_REPORT_LINES)
+    if report_lines:
+        details["reports"] = report_lines
+
+    log_tail = scrub_diagnostic_lines(log_lines, MAX_FAILURE_LOG_LINES)
+    if log_tail:
+        details["logTail"] = log_tail
+
+    return details
+
+
 def run_transcription_job(
     job_id: str,
     store: JobStore,
@@ -344,6 +471,7 @@ def run_transcription_job(
 
     store.mark_running(job_id)
     reports: list[str] = []
+    outputs = None
     try:
         cfg = build_job_config(record.source_path, record.language, server_config)
         outputs = output_paths_for_input(record.source_path, cfg, create_dirs=True)
@@ -356,8 +484,15 @@ def run_transcription_job(
             shutil.copyfile(outputs.srt_path, record.srt_path)
         record.txt_path.write_text(extract_plain_transcript(record.srt_path), encoding="utf-8")
         store.mark_succeeded(job_id)
-    except Exception:
-        store.mark_failed(job_id, "TRANSCRIPTION_FAILED", "Transcription failed.")
+    except Exception as exc:
+        log_path = outputs.log_path if outputs is not None else None
+        log_lines = read_failure_log_lines(log_path)
+        store.mark_failed(
+            job_id,
+            "TRANSCRIPTION_FAILED",
+            summarize_failure_message(exc, reports, log_lines),
+            details=failure_details(exc, reports, log_lines, log_path),
+        )
     finally:
         with contextlib.suppress(OSError):
             record.source_path.unlink()
@@ -516,6 +651,18 @@ def int_env(env: Mapping[str, str], name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer.") from exc
 
 
+def bool_env(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean.")
+
+
 def path_env(env: Mapping[str, str], name: str, default: Path) -> Path:
     raw = env.get(name)
     return Path(raw).expanduser() if raw and raw.strip() else default
@@ -549,6 +696,12 @@ def build_arg_parser(env: Mapping[str, str] | None = None) -> argparse.ArgumentP
         choices=("float16", "float32", "int8"),
         default=env.get("TRANSCRIBE_COMPUTE_TYPE", "float16"),
     )
+    parser.add_argument(
+        "--warm-vram",
+        action=argparse.BooleanOptionalAction,
+        default=bool_env(env, "TRANSCRIBE_WARM_VRAM", False),
+        help="Keep compatible WhisperX models loaded between jobs for faster repeated runs (default: off).",
+    )
     return parser
 
 
@@ -566,6 +719,7 @@ def config_from_env_and_args(argv: Sequence[str] | None = None, env: Mapping[str
         job_ttl_seconds=args.job_ttl_seconds,
         device=args.device,
         compute_type=args.compute_type,
+        warm_vram=args.warm_vram,
     )
 
 

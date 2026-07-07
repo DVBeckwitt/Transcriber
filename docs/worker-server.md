@@ -89,8 +89,9 @@ Useful optional values:
 | `TRANSCRIBE_JOB_TTL_SECONDS` | `86400` | Completed job retention, default 24 hours |
 | `TRANSCRIBE_DEVICE` | `cuda` | WhisperX device, for example `cuda` or `cpu` |
 | `TRANSCRIBE_COMPUTE_TYPE` | `float16` | WhisperX compute type: `float16`, `float32`, or `int8` |
+| `TRANSCRIBE_WARM_VRAM` | `false` | Keep compatible WhisperX ASR, alignment, and diarization models loaded between jobs; warm model use is serialized in process |
 
-Current scripts also accept equivalent CLI args such as `--host`, `--port`, and `--work-dir`.
+Current scripts also accept equivalent CLI args such as `--host`, `--port`, `--work-dir`, `--warm-vram`, and `--no-warm-vram`.
 
 ## Start The Worker
 
@@ -210,7 +211,7 @@ Statuses:
 | `queued` | Upload accepted, waiting for worker slot |
 | `running` | Transcription is in progress |
 | `succeeded` | Transcript artifacts are ready |
-| `failed` | Job failed; response includes a generic error |
+| `failed` | Job failed; response includes a safe error summary and may include sanitized diagnostics |
 
 ### Downloads
 
@@ -229,12 +230,20 @@ All client-facing errors use:
 {
   "error": {
     "code": "ERROR_CODE",
-    "message": "Safe client-facing message."
+    "message": "Safe client-facing message.",
+    "details": {
+      "exceptionType": "RuntimeError",
+      "logName": "0123456789abcdef0123456789abcdef_whisperx.log",
+      "reports": ["Worker report lines, sanitized and truncated."],
+      "logTail": ["Worker log tail lines, sanitized and truncated."]
+    }
   }
 }
 ```
 
-The worker intentionally avoids returning stack traces, local file paths, or WhisperX internals.
+`details` is optional. Job failure details are bounded and scrubbed for local paths and obvious secret-looking values; inspect `logs\*_whisperx.log` on the worker for the full raw log when needed.
+
+The worker intentionally avoids returning raw stack traces, local file paths, process IDs, or full WhisperX logs.
 
 ## Runtime Behavior
 
@@ -244,7 +253,8 @@ The worker intentionally avoids returning stack traces, local file paths, or Whi
 - Cleanup runs opportunistically when API requests arrive.
 - The server also removes stale UUID-shaped job directories older than the TTL after restarts.
 - Jobs invoke the existing CLI-equivalent internals with quality mode, selected language, configurable `device` and `compute_type`, and hidden rendered speaker labels.
-- CUDA jobs use the shared CLI cleanup path: GPU cache flushing runs after transcription and Spanish post-translation attempts, including error paths.
+- CUDA jobs use the shared CLI cleanup path. By default, warm model caches are cleared and GPU cache flushing runs after transcription and Spanish post-translation attempts, including error paths.
+- Warm VRAM mode is opt-in with `TRANSCRIBE_WARM_VRAM=true` or `--warm-vram`. It can speed up repeated jobs by retaining compatible WhisperX models in process memory, at the cost of keeping VRAM allocated until the process exits or a cold run clears caches. Warm model use is serialized inside the worker process to avoid concurrent reuse of cached model instances.
 - The worker process keeps job state in memory. After a process restart, old status URLs are not restored, but stale directories are still cleaned by TTL.
 
 ## Validation Checklist

@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import warnings
+from unittest.mock import patch
 
 try:
     with warnings.catch_warnings():
@@ -15,7 +16,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without optional
     raise unittest.SkipTest("FastAPI server extras are not installed") from exc
 
 from transcriber.__main__ import RunConfig, output_paths_for_input
-from transcriber.server import ServerConfig, create_app
+import transcriber.server as server_module
+from transcriber.server import ServerConfig, config_from_env_and_args, create_app
 
 
 TOKEN = "test-token"
@@ -164,6 +166,22 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(seen[0].device, "cuda")
             self.assertEqual(seen[0].compute_type, "int8")
             self.assertEqual(seen[0].low_confidence_word_prob, 0.10)
+            self.assertFalse(seen[0].warm_vram)
+
+    def test_server_warm_vram_config_defaults_off_and_can_be_toggled(self) -> None:
+        base_env = {"TRANSCRIBE_PROXY_TOKEN": TOKEN}
+
+        self.assertFalse(config_from_env_and_args([], env=base_env).warm_vram)
+        self.assertTrue(
+            config_from_env_and_args([], env={**base_env, "TRANSCRIBE_WARM_VRAM": "true"}).warm_vram
+        )
+        self.assertTrue(config_from_env_and_args(["--warm-vram"], env=base_env).warm_vram)
+        self.assertFalse(
+            config_from_env_and_args(
+                ["--warm-vram", "--no-warm-vram"],
+                env={**base_env, "TRANSCRIBE_WARM_VRAM": "true"},
+            ).warm_vram
+        )
 
     def test_downloads_srt_and_extracted_plain_text_transcript(self) -> None:
         def runner(cfg: RunConfig, source_path: Path, report=print) -> int:
@@ -207,6 +225,8 @@ class ServerTests(unittest.TestCase):
         def runner(cfg: RunConfig, source_path: Path, report=print) -> int:
             uploaded_sources.append(source_path)
             self.assertTrue(source_path.exists())
+            report('Log: "C:\\Users\\Kenpo\\secret\\transcript_whisperx.log"')
+            report("Worker failure: no subtitle cues.")
             return 1
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -222,6 +242,11 @@ class ServerTests(unittest.TestCase):
             status_payload = self.wait_for_terminal_status(client, job_id)
 
             self.assertEqual(status_payload["status"], "failed")
+            self.assertEqual(status_payload["error"]["code"], "TRANSCRIPTION_FAILED")
+            self.assertEqual(status_payload["error"]["message"], "Worker failure: no subtitle cues.")
+            self.assertEqual(status_payload["error"]["details"]["logName"], f"{job_id}_whisperx.log")
+            self.assertIn("Worker failure: no subtitle cues.", status_payload["error"]["details"]["reports"])
+            self.assertNotIn("C:\\Users\\Kenpo", "\n".join(status_payload["error"]["details"]["reports"]))
             self.assertFalse(uploaded_sources[0].exists())
             self.assert_error(
                 client.get(f"/api/transcriptions/{job_id}/transcript.txt", headers=auth_headers()),
@@ -233,6 +258,17 @@ class ServerTests(unittest.TestCase):
                 404,
                 "JOB_NOT_FOUND",
             )
+
+    def test_failure_log_reader_uses_bounded_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "worker.log"
+            log_path.write_text("old\n" * 1000 + "recent\n", encoding="utf-8")
+
+            with patch("transcriber.server.read_text_tail", return_value="line one\nline two\n") as read_tail:
+                lines = server_module.read_failure_log_lines(log_path)
+
+        self.assertEqual(lines, ["line one", "line two"])
+        read_tail.assert_called_once_with(log_path, max_chars=server_module.MAX_FAILURE_LOG_CHARS)
 
     def test_cleanup_removes_stale_untracked_job_directories_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

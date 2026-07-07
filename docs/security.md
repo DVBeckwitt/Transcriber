@@ -21,11 +21,11 @@ This project is a local transcription launcher plus an optional LAN worker API. 
 - Token comparison uses constant-time comparison.
 - No CORS middleware is added; the homepage proxy should provide same-origin access.
 - File uploads are limited by configurable byte count, defaulting to 10 GB.
-- Upload filenames are not used for storage paths; the server stores each job as `transcript.<ext>` inside a UUID job directory.
+- Upload filenames are not used for storage paths; the server stores each upload with the UUID job ID as its stem inside the UUID job directory.
 - Only extensions already supported by the CLI are accepted.
 - Supported languages are limited to `auto`, `en`, and `es`.
-- Errors use `{ "error": { "code": "...", "message": "..." } }`.
-- Client errors do not include stack traces, local paths, process IDs, or full WhisperX logs.
+- Errors use `{ "error": { "code": "...", "message": "...", "details": { ... } } }`; `details` is optional.
+- Client errors do not include raw stack traces, local paths, process IDs, or full WhisperX logs.
 - Uploaded source media is deleted in a `finally` block after each job.
 - Completed artifacts are retained only until the configured TTL.
 - Stale UUID-shaped job directories older than the TTL are cleaned after restarts.

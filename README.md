@@ -18,6 +18,15 @@ It generates:
 
 ## Change status
 
+### 2026-07-07
+
+- Performance: added default-off warm VRAM mode with `--warm-vram` / `--no-warm-vram` and worker `TRANSCRIBE_WARM_VRAM` support for repeated jobs.
+- Bug/error handling: known diarization access/model failures now continue from the already completed ASR/alignment pass instead of rerunning transcription without diarization, including known `AttributeError` forms.
+- Performance: Spanish translation marker fallback retries are batched; worker failure log summaries read bounded tails; final SRT/LLM output finalization uses one SRT read.
+- Runtime behavior: warm VRAM model use is serialized in process so cached WhisperX/PyTorch model instances are not used concurrently by worker jobs.
+- Migration/deprecation: none; defaults remain cold and clear GPU caches after each job.
+- Status: fixed and verified with `python -m unittest discover -s tests`, `python -m compileall -q transcriber tests`, `git diff --check`, and staged secret scan.
+
 ### 2026-07-03
 
 - Bug/error handling: CUDA GPU memory cleanup now runs after WhisperX direct runs and Spanish post-translation attempts, including success, generation errors, and CUDA model-transfer failures.
@@ -224,6 +233,7 @@ Defaults:
 - Max worker jobs: 1
 - Completed job TTL: 24 hours
 - Device/compute type: `cuda` / `float16`
+- Warm VRAM: off
 - Work dir: `<repo>\.transcriber_server_jobs`
 
 The Windows launcher fails before startup if the token is missing or if the selected Python environment cannot import `whisperx`, `fastapi`, `uvicorn`, and `multipart`.
@@ -238,6 +248,7 @@ Config can be set with environment variables or matching CLI args:
 - `TRANSCRIBE_JOB_TTL_SECONDS` / `--job-ttl-seconds`
 - `TRANSCRIBE_DEVICE` / `--device`
 - `TRANSCRIBE_COMPUTE_TYPE` / `--compute-type`
+- `TRANSCRIBE_WARM_VRAM` / `--warm-vram` / `--no-warm-vram`
 
 API requests must include:
 
@@ -330,6 +341,7 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 - If you pass `--translate-to-english`, WhisperX writes English subtitle text directly.
 - If the detected language is Spanish and `--translate-to-english` is not set, the launcher falls back to the existing post-translation step.
 - CUDA runs perform best-effort GPU cleanup after WhisperX and Spanish post-translation paths, including failure paths.
+- Warm VRAM mode is opt-in. When disabled, the launcher clears warm model caches and flushes CUDA memory after each WhisperX run. When enabled, compatible ASR, alignment, and diarization models can stay loaded for faster repeated watch/server jobs. Warm model use is serialized inside the process to avoid concurrent reuse of cached model instances.
 - When diarization is enabled, short speaker blips are smoothed by default.
 - Use `--no-speaker-labels` when you do not want the generated `.srt` or `*_llm.txt` to report who spoke. It keeps diarization timing and speaker-change splits while hiding labels like `SPEAKER_00:`.
 - Low-confidence words are rendered as `—` in `.srt`, `*_llm.txt`, and worker `transcript.txt` output.
@@ -357,6 +369,8 @@ transcriber --watch --watch-dir "C:\Users\Kenpo\OneDrive\recordings" --settle-se
 --model            Override model name
 --device           Default: cuda
 --compute-type     float16 | float32 | int8 (default: float16)
+--warm-vram / --no-warm-vram
+                   Keep compatible WhisperX models loaded between jobs (default: off)
 --watch            Continuously watch a folder for new media files
 --watch-dir        Folder to watch (default: %USERPROFILE%\OneDrive\recordings)
 --poll-interval    Seconds between folder scans in watch mode

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import functools
 import gc
+import hashlib
 import importlib
 import inspect
 import math
@@ -13,6 +14,7 @@ import socket
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import subprocess
 from dataclasses import dataclass
@@ -101,6 +103,11 @@ LOW_CONFIDENCE_PLACEHOLDER = "—"
 
 Reporter = Callable[[str], None]
 
+_WARM_ASR_MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
+_WARM_ALIGN_MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
+_WARM_DIARIZATION_MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
+_WARM_MODEL_CACHE_LOCK = threading.RLock()
+
 
 @dataclass
 class LegacyOptions:
@@ -148,6 +155,7 @@ class RunConfig:
     glossary: dict[str, str]
     glossary_path: str | None
     asr_prompt: str | None
+    warm_vram: bool
     dry_run: bool
 
 
@@ -517,6 +525,104 @@ def flush_gpu_memory(device: str | None = None) -> None:
         if callable(cleanup):
             with contextlib.suppress(Exception):
                 cleanup()
+
+
+def clear_warm_model_caches() -> None:
+    with _WARM_MODEL_CACHE_LOCK:
+        _WARM_ASR_MODEL_CACHE.clear()
+        _WARM_ALIGN_MODEL_CACHE.clear()
+        _WARM_DIARIZATION_MODEL_CACHE.clear()
+
+
+def cleanup_after_transcription_run(cfg: RunConfig) -> None:
+    if cfg.warm_vram:
+        return
+    clear_warm_model_caches()
+    flush_gpu_memory(cfg.device)
+
+
+def load_whisperx_asr_model(
+    whisperx_module: Any,
+    cfg: RunConfig,
+    whisper_task: str,
+    whisper_language: str | None,
+) -> Any:
+    asr_options = {"beam_size": cfg.beam_size, "patience": cfg.patience}
+    load_model_kwargs: dict[str, Any] = {
+        "device": cfg.device,
+        "compute_type": cfg.compute_type,
+        "task": whisper_task,
+        "asr_options": asr_options,
+        "vad_method": "silero",
+    }
+    if whisper_language:
+        load_model_kwargs["language"] = whisper_language
+
+    if not cfg.warm_vram:
+        return call_with_supported_kwargs(whisperx_module.load_model, cfg.model, **load_model_kwargs)
+
+    cache_key = (
+        cfg.model,
+        cfg.device,
+        cfg.compute_type,
+        whisper_task,
+        whisper_language or "",
+        cfg.beam_size,
+        cfg.patience,
+    )
+    with _WARM_MODEL_CACHE_LOCK:
+        model = _WARM_ASR_MODEL_CACHE.get(cache_key)
+        if model is None:
+            model = call_with_supported_kwargs(whisperx_module.load_model, cfg.model, **load_model_kwargs)
+            _WARM_ASR_MODEL_CACHE[cache_key] = model
+        return model
+
+
+def load_whisperx_align_model(whisperx_module: Any, cfg: RunConfig, language_code: str) -> tuple[Any, Any]:
+    if not cfg.warm_vram:
+        return call_with_supported_kwargs(
+            whisperx_module.load_align_model,
+            language_code=language_code,
+            device=cfg.device,
+        )
+
+    cache_key = (language_code, cfg.device)
+    with _WARM_MODEL_CACHE_LOCK:
+        cached = _WARM_ALIGN_MODEL_CACHE.get(cache_key)
+        if cached is None:
+            cached = call_with_supported_kwargs(
+                whisperx_module.load_align_model,
+                language_code=language_code,
+                device=cfg.device,
+            )
+            _WARM_ALIGN_MODEL_CACHE[cache_key] = cached
+        return cached
+
+
+def hf_token_cache_digest(hf_token: str | None) -> str:
+    return hashlib.sha256((hf_token or "").encode("utf-8")).hexdigest()
+
+
+def load_whisperx_diarization_model(whisperx_module: Any, cfg: RunConfig, hf_token: str | None) -> Any:
+    diarization_pipeline = resolve_whisperx_symbol(whisperx_module, "DiarizationPipeline")
+    if not cfg.warm_vram:
+        return call_with_supported_kwargs(
+            diarization_pipeline,
+            use_auth_token=hf_token or "",
+            device=cfg.device,
+        )
+
+    cache_key = (cfg.device, hf_token_cache_digest(hf_token))
+    with _WARM_MODEL_CACHE_LOCK:
+        cached = _WARM_DIARIZATION_MODEL_CACHE.get(cache_key)
+        if cached is None:
+            cached = call_with_supported_kwargs(
+                diarization_pipeline,
+                use_auth_token=hf_token or "",
+                device=cfg.device,
+            )
+            _WARM_DIARIZATION_MODEL_CACHE[cache_key] = cached
+        return cached
 
 
 def segment_is_low_confidence(
@@ -968,7 +1074,8 @@ def build_srt_cues_from_result(result: dict[str, Any], cfg: RunConfig | None = N
 def write_direct_srt_from_result(result: dict[str, Any], srt_path: Path, cfg: RunConfig | None = None) -> None:
     cues = build_srt_cues_from_result(result, cfg)
     if not cues:
-        raise RuntimeError("WhisperX returned no subtitle cues.")
+        srt_path.write_text("", encoding="utf-8")
+        return
     srt_path.write_text(render_srt_cues(cues), encoding="utf-8")
 
 
@@ -1330,21 +1437,36 @@ def translate_srt_to_english(
     if len(translated_blocks) != len(cues):
         raise RuntimeError("Translation produced an unexpected cue count.")
 
-    translated_cues: list[SRTCue] = []
-    for cue, translated_block, meta in zip(cues, translated_blocks, block_meta):
-        prefix, placeholders, original = meta
+    resolved_texts: list[str | None] = []
+    fallback_requests: list[tuple[int, str, dict[str, str]]] = []
+    for idx, (translated_block, meta) in enumerate(zip(translated_blocks, block_meta)):
+        _, placeholders, original = meta
         translated_text = replace_glossary_placeholders(translated_block, placeholders)
         extracted = extract_between_markers(translated_text, TRANSLATION_MARKER_START, TRANSLATION_MARKER_END)
         if not extracted:
-            fallback = translate_spanish_texts(
-                [original],
-                device=device,
-                batch_size=1,
-                num_beams=num_beams,
-                max_new_tokens=max_new_tokens,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-            )[0]
-            extracted = replace_glossary_placeholders(fallback, placeholders)
+            fallback_requests.append((idx, original, placeholders))
+            resolved_texts.append(None)
+            continue
+        resolved_texts.append(extracted)
+
+    if fallback_requests:
+        fallback_blocks = translate_spanish_texts(
+            [original for _, original, _ in fallback_requests],
+            device=device,
+            batch_size=batch_size,
+            num_beams=num_beams,
+            max_new_tokens=max_new_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+        )
+        if len(fallback_blocks) != len(fallback_requests):
+            raise RuntimeError("Fallback translation produced an unexpected cue count.")
+        for (idx, _, placeholders), fallback in zip(fallback_requests, fallback_blocks):
+            resolved_texts[idx] = replace_glossary_placeholders(fallback, placeholders)
+
+    translated_cues: list[SRTCue] = []
+    for cue, meta, extracted in zip(cues, block_meta, resolved_texts):
+        prefix, _placeholders, original = meta
+        extracted = extracted or original
         translated_text = normalize_subtitle_whitespace(extracted)
         if prefix:
             translated_text = f"{prefix}{translated_text}".strip()
@@ -1359,42 +1481,61 @@ def translate_srt_to_english(
     srt_path.write_text(render_srt_cues(rewrapped or translated_cues), encoding="utf-8")
 
 
-def build_llm_file(srt_path: Path, llm_path: Path) -> None:
-    if not srt_path.exists():
-        return
+LLM_TRANSCRIPT_PREFACE = (
+    "You are given an automatic transcript.\n"
+    "Refine it into a cleaner transcript in the same language.\n"
+    "Preserve speaker labels if present.\n"
+    "Do not translate, summarize, or rewrite more than necessary.\n"
+    "Fix obvious punctuation, capitalization, spacing, and clear recognition mistakes.\n"
+    "Keep the meaning and cadence close to the source.\n"
+    "Use square brackets for brief editorial notes such as [inaudible], [crosstalk], or [name unclear].\n"
+    "If a word or short phrase is low confidence, leave the em dash placeholder as-is.\n"
+    "If you are not confident enough to refine a passage cleanly, keep it cautious instead of guessing.\n"
+    "Output only the refined transcript.\n\n"
+    "TRANSCRIPT:\n"
+)
 
+
+def llm_text_lines_from_srt_lines(lines: Iterable[str]) -> list[str]:
     text_lines = []
-    for line in srt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    for line in lines:
         s = line.strip()
         if not s or s.isdigit() or ("-->" in s and "," in s):
             continue
         text_lines.append(render_low_confidence_markup(s, "llm"))
+    return text_lines
 
-    preface = (
-        "You are given an automatic transcript.\n"
-        "Refine it into a cleaner transcript in the same language.\n"
-        "Preserve speaker labels if present.\n"
-        "Do not translate, summarize, or rewrite more than necessary.\n"
-        "Fix obvious punctuation, capitalization, spacing, and clear recognition mistakes.\n"
-        "Keep the meaning and cadence close to the source.\n"
-        "Use square brackets for brief editorial notes such as [inaudible], [crosstalk], or [name unclear].\n"
-        "If a word or short phrase is low confidence, leave the em dash placeholder as-is.\n"
-        "If you are not confident enough to refine a passage cleanly, keep it cautious instead of guessing.\n"
-        "Output only the refined transcript.\n\n"
-        "TRANSCRIPT:\n"
-    )
-    llm_path.write_text(preface + "\n".join(text_lines), encoding="utf-8")
+
+def build_llm_file(srt_path: Path, llm_path: Path) -> None:
+    if not srt_path.exists():
+        return
+
+    text_lines = llm_text_lines_from_srt_lines(srt_path.read_text(encoding="utf-8", errors="ignore").splitlines())
+    llm_path.write_text(LLM_TRANSCRIPT_PREFACE + "\n".join(text_lines), encoding="utf-8")
 
 
 def finalize_srt_file(srt_path: Path) -> None:
     if not srt_path.exists():
         return
 
-    text = srt_path.read_text(encoding="utf-8", errors="ignore")
-    updated_lines: list[str] = []
-    for line in text.splitlines():
-        updated_lines.append(render_low_confidence_markup(line, "srt"))
+    updated_lines = [
+        render_low_confidence_markup(line, "srt")
+        for line in srt_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    ]
     srt_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def finalize_transcript_outputs(srt_path: Path, llm_path: Path) -> None:
+    if not srt_path.exists():
+        return
+
+    raw_lines = srt_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    finalized_lines = [render_low_confidence_markup(line, "srt") for line in raw_lines]
+    llm_path.write_text(
+        LLM_TRANSCRIPT_PREFACE + "\n".join(llm_text_lines_from_srt_lines(finalized_lines)),
+        encoding="utf-8",
+    )
+    srt_path.write_text("\n".join(finalized_lines).rstrip() + "\n", encoding="utf-8")
 
 
 def build_lock_payload(input_path: Path) -> str:
@@ -1642,6 +1783,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default="float16",
         choices=("float16", "float32", "int8"),
         help="Computation dtype (default: float16).",
+    )
+    parser.add_argument(
+        "--warm-vram",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep compatible WhisperX models loaded between jobs for faster repeated runs (default: off).",
     )
     parser.add_argument("--watch", action="store_true", help="Continuously watch a folder and transcribe new media files.")
     parser.add_argument(
@@ -1978,6 +2125,7 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
         glossary=glossary,
         glossary_path=glossary_path,
         asr_prompt=asr_prompt,
+        warm_vram=bool(args.warm_vram),
         dry_run=bool(args.dry_run),
     )
 
@@ -2122,6 +2270,11 @@ def should_fallback_without_diarization(log_path: Path) -> bool:
     return any(pattern in text for pattern in DIARIZATION_FALLBACK_PATTERNS)
 
 
+def diarization_error_allows_fallback(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(pattern in text for pattern in DIARIZATION_FALLBACK_PATTERNS)
+
+
 def parse_detected_language_from_log(log_path: Path) -> str | None:
     text = read_text_tail(log_path)
     matches = re.findall(r"Detected language:\s*([A-Za-z-]+)\s*\(", text)
@@ -2137,23 +2290,26 @@ def run_whisperx_direct(
     hf_token: str | None,
     diarize: bool,
 ) -> str | None:
+    if cfg.warm_vram:
+        with _WARM_MODEL_CACHE_LOCK:
+            return _run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
+    return _run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
+
+
+def _run_whisperx_direct(
+    cfg: RunConfig,
+    input_path: Path,
+    srt_path: Path,
+    hf_token: str | None,
+    diarize: bool,
+) -> str | None:
     import whisperx
 
     whisper_language = None if cfg.language == "auto" else cfg.language
     whisper_task = "translate" if cfg.translate_to_english else "transcribe"
 
     print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...")
-    asr_options = {"beam_size": cfg.beam_size, "patience": cfg.patience}
-    load_model_kwargs: dict[str, Any] = {
-        "device": cfg.device,
-        "compute_type": cfg.compute_type,
-        "task": whisper_task,
-        "asr_options": asr_options,
-        "vad_method": "silero",
-    }
-    if whisper_language:
-        load_model_kwargs["language"] = whisper_language
-    model = call_with_supported_kwargs(whisperx.load_model, cfg.model, **load_model_kwargs)
+    model = load_whisperx_asr_model(whisperx, cfg, whisper_task, whisper_language)
 
     print(f"[transcriber] Loading audio: {input_path}")
     audio = whisperx.load_audio(str(input_path))
@@ -2188,11 +2344,7 @@ def run_whisperx_direct(
     print(f"[transcriber] Aligning words for language={align_language}...")
     try:
         language_code = align_language
-        align_model, metadata = call_with_supported_kwargs(
-            whisperx.load_align_model,
-            language_code=language_code,
-            device=cfg.device,
-        )
+        align_model, metadata = load_whisperx_align_model(whisperx, cfg, language_code)
         result = call_with_supported_kwargs(
             whisperx.align,
             result.get("segments", []),
@@ -2209,16 +2361,16 @@ def run_whisperx_direct(
 
     if diarize:
         print("[transcriber] Running diarization...")
-        diarization_pipeline = resolve_whisperx_symbol(whisperx, "DiarizationPipeline")
-        with allow_trusted_checkpoint_loads():
-            diarize_model = call_with_supported_kwargs(
-                diarization_pipeline,
-                use_auth_token=hf_token or "",
-                device=cfg.device,
-            )
-            diarize_segments = call_with_supported_kwargs(diarize_model, audio)
-        assign_word_speakers = resolve_whisperx_symbol(whisperx, "assign_word_speakers")
-        result = assign_word_speakers(diarize_segments, result)
+        try:
+            with allow_trusted_checkpoint_loads():
+                diarize_model = load_whisperx_diarization_model(whisperx, cfg, hf_token)
+                diarize_segments = call_with_supported_kwargs(diarize_model, audio)
+            assign_word_speakers = resolve_whisperx_symbol(whisperx, "assign_word_speakers")
+            result = assign_word_speakers(diarize_segments, result)
+        except Exception as exc:
+            if not diarization_error_allows_fallback(exc):
+                raise
+            print(f"[transcriber] Diarization unavailable or blocked; continuing without diarization: {exc}")
 
     apply_confidence_cleanup(result, cfg)
 
@@ -2255,7 +2407,7 @@ def run_whisperx_direct_logged(
                     detected_language = None
         return return_code, detected_language
     finally:
-        flush_gpu_memory(cfg.device)
+        cleanup_after_transcription_run(cfg)
 
 
 def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report: Reporter = print) -> None:
@@ -2366,6 +2518,8 @@ def transcribe_file(
                     append=attempt > 0,
                 )
                 if rc == 0:
+                    if current_diarize and should_fallback_without_diarization(outputs.log_path):
+                        fallback_no_diarize = True
                     break
 
                 if current_diarize and should_fallback_without_diarization(outputs.log_path):
@@ -2407,8 +2561,7 @@ def transcribe_file(
                     report("Keeping the original transcript text.")
                     report("")
             try:
-                build_llm_file(outputs.srt_path, outputs.llm_path)
-                finalize_srt_file(outputs.srt_path)
+                finalize_transcript_outputs(outputs.srt_path, outputs.llm_path)
             except Exception:
                 pass
 
