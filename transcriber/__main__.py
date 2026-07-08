@@ -10,6 +10,7 @@ import inspect
 import math
 import os
 import re
+import shutil
 import socket
 import sys
 import tempfile
@@ -54,6 +55,7 @@ DEFAULT_STALE_LOCK_SECONDS = 12 * 60 * 60
 AUDIO_PREPROCESS_TIMEOUT_SECONDS = 30 * 60
 SUBPROCESS_ERROR_DETAIL_LIMIT = 500
 LOG_TAIL_READ_CHARS = 256 * 1024
+FFMPEG_PATH_ENV_VAR = "TRANSCRIBE_FFMPEG"
 
 SUBTITLE_MAX_LINES = 2
 SUBTITLE_MAX_CHARS_PER_LINE = 42
@@ -1612,9 +1614,71 @@ def configure_temp_dir(base_dir: Path) -> Path:
     )
 
 
-def build_audio_preprocess_command(input_path: Path, output_path: Path) -> list[str]:
+def ffmpeg_candidate_paths() -> list[Path]:
+    candidates: list[Path] = []
+    explicit_path = (os.environ.get(FFMPEG_PATH_ENV_VAR) or "").strip().strip('"')
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+
+    path_match = shutil.which("ffmpeg")
+    if path_match:
+        candidates.append(Path(path_match))
+
+    chocolatey_root = Path(os.environ.get("ChocolateyInstall", r"C:\ProgramData\chocolatey"))
+    candidates.extend(
+        [
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            chocolatey_root / "bin" / "ffmpeg.exe",
+            Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin" / "ffmpeg.exe",
+        ]
+    )
+    return candidates
+
+
+def resolve_ffmpeg_executable() -> str | None:
+    seen: set[str] = set()
+    for candidate in ffmpeg_candidate_paths():
+        key = os.path.normcase(str(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def ensure_ffmpeg_available_for_child_processes() -> str:
+    ffmpeg_path = resolve_ffmpeg_executable()
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "ffmpeg executable not found. Install ffmpeg, set TRANSCRIBE_FFMPEG, "
+            r"or put ffmpeg on PATH, for example C:\ffmpeg\bin\ffmpeg.exe."
+        )
+    if Path(ffmpeg_path).stem.lower() != "ffmpeg":
+        raise RuntimeError(
+            "Resolved ffmpeg executable must be named ffmpeg because WhisperX loads audio "
+            'by launching "ffmpeg" by name. Set TRANSCRIBE_FFMPEG to a standard ffmpeg '
+            "executable or put ffmpeg on PATH."
+        )
+
+    ffmpeg_dir = str(Path(ffmpeg_path).expanduser().resolve().parent)
+    current_path = os.environ.get("PATH", "")
+    normalized_ffmpeg_dir = os.path.normcase(os.path.normpath(ffmpeg_dir))
+    normalized_path_parts = {
+        os.path.normcase(os.path.normpath(path_part.strip().strip('"')))
+        for path_part in current_path.split(os.pathsep)
+        if path_part.strip()
+    }
+
+    if normalized_ffmpeg_dir not in normalized_path_parts:
+        os.environ["PATH"] = ffmpeg_dir if not current_path else f"{ffmpeg_dir}{os.pathsep}{current_path}"
+
+    return ffmpeg_path
+
+
+def build_audio_preprocess_command(input_path: Path, output_path: Path, ffmpeg_path: str = "ffmpeg") -> list[str]:
     return [
-        "ffmpeg",
+        ffmpeg_path,
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -1653,7 +1717,11 @@ def format_subprocess_error_detail(value: object, limit: int = SUBPROCESS_ERROR_
 
 def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Reporter = print) -> Path:
     output_path = temp_dir / f"{input_path.stem}.preprocessed.wav"
-    command = build_audio_preprocess_command(input_path, output_path)
+    ffmpeg_path = resolve_ffmpeg_executable()
+    if ffmpeg_path is None:
+        report("[transcriber] ffmpeg not found on PATH or common install paths; using the original input audio.")
+        return input_path
+    command = build_audio_preprocess_command(input_path, output_path, ffmpeg_path)
 
     try:
         subprocess.run(
@@ -1665,7 +1733,7 @@ def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Repo
             timeout=AUDIO_PREPROCESS_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
-        report("[transcriber] ffmpeg not found; using the original input audio.")
+        report(f"[transcriber] ffmpeg not found at {ffmpeg_path}; using the original input audio.")
         return input_path
     except subprocess.TimeoutExpired:
         report(
@@ -2308,6 +2376,8 @@ def _run_whisperx_direct(
     whisper_language = None if cfg.language == "auto" else cfg.language
     whisper_task = "translate" if cfg.translate_to_english else "transcribe"
 
+    ensure_ffmpeg_available_for_child_processes()
+
     print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...")
     model = load_whisperx_asr_model(whisperx, cfg, whisper_task, whisper_language)
 
@@ -2481,6 +2551,14 @@ def transcribe_file(
     if cfg.dry_run:
         describe_dry_run_plan(cfg, input_path, outputs, report)
         return 0
+
+    try:
+        ensure_ffmpeg_available_for_child_processes()
+    except RuntimeError as exc:
+        report("")
+        report(str(exc))
+        report("")
+        return 1
 
     if not acquire_lock(input_path, outputs.lock_path, stale_lock_seconds, report):
         return 0

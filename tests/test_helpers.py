@@ -168,8 +168,108 @@ class HelperTests(unittest.TestCase):
         self.assertIn("highpass=f=60,lowpass=f=8000", command)
         self.assertEqual(command[-1], "out.wav")
 
+    def test_audio_preprocess_command_accepts_resolved_ffmpeg_path(self) -> None:
+        command = build_audio_preprocess_command(Path("in.mp4"), Path("out.wav"), r"C:\ffmpeg\bin\ffmpeg.exe")
+
+        self.assertEqual(command[0], r"C:\ffmpeg\bin\ffmpeg.exe")
+
+    def test_resolve_ffmpeg_executable_uses_existing_candidate(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            ffmpeg_path = Path(tmpdir) / "ffmpeg.exe"
+            ffmpeg_path.write_text("", encoding="utf-8")
+
+            with patch(
+                "transcriber.__main__.ffmpeg_candidate_paths",
+                return_value=[Path(tmpdir) / "missing.exe", ffmpeg_path],
+            ):
+                self.assertEqual(transcriber_main.resolve_ffmpeg_executable(), str(ffmpeg_path))
+
+    @patch("transcriber.__main__.shutil.which", return_value=None)
+    def test_ffmpeg_candidate_paths_strips_quoted_env_path(self, which: MagicMock) -> None:
+        with patch.dict(
+            transcriber_main.os.environ,
+            {transcriber_main.FFMPEG_PATH_ENV_VAR: r'"C:\ffmpeg\bin\ffmpeg.exe"'},
+        ):
+            self.assertEqual(transcriber_main.ffmpeg_candidate_paths()[0], Path(r"C:\ffmpeg\bin\ffmpeg.exe"))
+
+    @patch("transcriber.__main__.resolve_ffmpeg_executable")
+    def test_ensure_ffmpeg_available_for_child_processes_prepends_resolved_parent(
+        self, resolve_ffmpeg: MagicMock
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            ffmpeg_path = Path(tmpdir) / "bin" / "ffmpeg.exe"
+            ffmpeg_path.parent.mkdir()
+            ffmpeg_path.write_text("", encoding="utf-8")
+            original_path = str(Path(tmpdir) / "other")
+            resolve_ffmpeg.return_value = str(ffmpeg_path)
+
+            with patch.dict(transcriber_main.os.environ, {"PATH": original_path}):
+                result = transcriber_main.ensure_ffmpeg_available_for_child_processes()
+                path_parts = transcriber_main.os.environ["PATH"].split(transcriber_main.os.pathsep)
+
+            self.assertEqual(result, str(ffmpeg_path))
+            self.assertEqual(path_parts[0], str(ffmpeg_path.parent.resolve()))
+            self.assertEqual(path_parts[1], original_path)
+
+    @patch("transcriber.__main__.resolve_ffmpeg_executable")
+    def test_ensure_ffmpeg_available_for_child_processes_is_idempotent(self, resolve_ffmpeg: MagicMock) -> None:
+        with TemporaryDirectory() as tmpdir:
+            ffmpeg_path = Path(tmpdir) / "bin" / "ffmpeg.exe"
+            ffmpeg_path.parent.mkdir()
+            ffmpeg_path.write_text("", encoding="utf-8")
+            ffmpeg_dir = str(ffmpeg_path.parent.resolve())
+            resolve_ffmpeg.return_value = str(ffmpeg_path)
+
+            with patch.dict(
+                transcriber_main.os.environ,
+                {"PATH": ffmpeg_dir + transcriber_main.os.pathsep + str(Path(tmpdir) / "other")},
+            ):
+                transcriber_main.ensure_ffmpeg_available_for_child_processes()
+                transcriber_main.ensure_ffmpeg_available_for_child_processes()
+                path_parts = transcriber_main.os.environ["PATH"].split(transcriber_main.os.pathsep)
+
+            normalized = [
+                transcriber_main.os.path.normcase(transcriber_main.os.path.normpath(part)) for part in path_parts
+            ]
+            normalized_ffmpeg_dir = transcriber_main.os.path.normcase(transcriber_main.os.path.normpath(ffmpeg_dir))
+            self.assertEqual(normalized.count(normalized_ffmpeg_dir), 1)
+
+    @patch("transcriber.__main__.resolve_ffmpeg_executable", return_value=None)
+    def test_ensure_ffmpeg_available_for_child_processes_requires_ffmpeg(self, resolve_ffmpeg: MagicMock) -> None:
+        with self.assertRaisesRegex(RuntimeError, "ffmpeg.*TRANSCRIBE_FFMPEG"):
+            transcriber_main.ensure_ffmpeg_available_for_child_processes()
+
+    @patch("transcriber.__main__.resolve_ffmpeg_executable")
+    def test_ensure_ffmpeg_available_for_child_processes_requires_ffmpeg_basename(
+        self, resolve_ffmpeg: MagicMock
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            renamed_path = Path(tmpdir) / "custom-decoder.exe"
+            renamed_path.write_text("", encoding="utf-8")
+            resolve_ffmpeg.return_value = str(renamed_path)
+
+            with self.assertRaisesRegex(RuntimeError, "named ffmpeg"):
+                transcriber_main.ensure_ffmpeg_available_for_child_processes()
+
     @patch("transcriber.__main__.subprocess.run")
-    def test_audio_preprocess_uses_timeout(self, run: MagicMock) -> None:
+    @patch("transcriber.__main__.resolve_ffmpeg_executable", return_value=None)
+    def test_audio_preprocess_skips_subprocess_when_ffmpeg_unresolved(
+        self,
+        resolve_ffmpeg: MagicMock,
+        run: MagicMock,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            reports: list[str] = []
+
+            result = preprocess_audio_for_whisperx(Path("in.mp4"), Path(tmpdir), report=reports.append)
+
+        self.assertEqual(result, Path("in.mp4"))
+        run.assert_not_called()
+        self.assertTrue(any("ffmpeg not found" in line for line in reports))
+
+    @patch("transcriber.__main__.resolve_ffmpeg_executable", return_value="ffmpeg")
+    @patch("transcriber.__main__.subprocess.run")
+    def test_audio_preprocess_uses_timeout(self, run: MagicMock, resolve_ffmpeg: MagicMock) -> None:
         run.side_effect = FileNotFoundError()
         with TemporaryDirectory() as tmpdir:
             reports: list[str] = []
@@ -177,11 +277,12 @@ class HelperTests(unittest.TestCase):
             result = preprocess_audio_for_whisperx(Path("in.mp4"), Path(tmpdir), report=reports.append)
 
             self.assertEqual(result, Path("in.mp4"))
-            self.assertIn("timeout", run.call_args.kwargs)
-            self.assertGreater(run.call_args.kwargs["timeout"], 0)
+        self.assertIn("timeout", run.call_args.kwargs)
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
 
+    @patch("transcriber.__main__.resolve_ffmpeg_executable", return_value="ffmpeg")
     @patch("transcriber.__main__.subprocess.run")
-    def test_audio_preprocess_truncates_long_stderr(self, run: MagicMock) -> None:
+    def test_audio_preprocess_truncates_long_stderr(self, run: MagicMock, resolve_ffmpeg: MagicMock) -> None:
         run.side_effect = subprocess.CalledProcessError(
             1,
             ["ffmpeg"],
@@ -278,6 +379,35 @@ class HelperTests(unittest.TestCase):
             self.assertFalse(outputs.llm_path.exists())
             self.assertFalse(outputs.lock_path.exists())
             self.assertTrue(any("Input is not a file" in line for line in reports))
+            run_logged.assert_not_called()
+
+    @patch("transcriber.__main__.run_whisperx_direct_logged")
+    @patch("transcriber.__main__.preprocess_audio_for_whisperx")
+    @patch(
+        "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
+        side_effect=RuntimeError("ffmpeg executable not found. Install ffmpeg, set TRANSCRIBE_FFMPEG."),
+    )
+    def test_transcribe_file_reports_missing_ffmpeg_before_audio_work(
+        self,
+        ensure_ffmpeg: MagicMock,
+        preprocess_audio: MagicMock,
+        run_logged: MagicMock,
+    ) -> None:
+        cfg = make_cfg(diarize=False)
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.wav"
+            source.write_bytes(b"audio")
+            outputs = output_paths_for_input(source, cfg, create_dirs=False)
+            reports: list[str] = []
+
+            rc = transcribe_file(cfg, source, report=reports.append)
+
+            report_text = "\n".join(reports)
+            self.assertEqual(rc, 1)
+            self.assertIn("TRANSCRIBE_FFMPEG", report_text)
+            self.assertNotIn("using the original input audio", report_text)
+            self.assertFalse(outputs.lock_path.exists())
+            preprocess_audio.assert_not_called()
             run_logged.assert_not_called()
 
     @patch("transcriber.__main__.flush_gpu_memory")
@@ -468,7 +598,11 @@ class HelperTests(unittest.TestCase):
             align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
         )
 
-        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx}),
+            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+        ):
             cfg = make_cfg(language="en", diarize=False, warm_vram=True)
             try:
                 for idx in range(2):
@@ -485,6 +619,74 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(fake_whisperx.load_model.call_count, 1)
         self.assertEqual(fake_whisperx.load_align_model.call_count, 1)
         self.assertEqual(model.transcribe.call_count, 2)
+
+    @patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes")
+    def test_run_whisperx_direct_prepares_ffmpeg_before_model_load(self, ensure_ffmpeg: MagicMock) -> None:
+        events: list[str] = []
+        model = MagicMock()
+        model.transcribe.return_value = {
+            "language": "en",
+            "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}],
+        }
+
+        def prepare_ffmpeg() -> str:
+            events.append("ensure_ffmpeg")
+            return "ffmpeg"
+
+        def load_model(*args: object, **kwargs: object) -> MagicMock:
+            events.append("load_model")
+            return model
+
+        def load_audio(*args: object, **kwargs: object) -> object:
+            events.append("load_audio")
+            return object()
+
+        ensure_ffmpeg.side_effect = prepare_ffmpeg
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(side_effect=load_model),
+            load_audio=MagicMock(side_effect=load_audio),
+            load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
+            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+        )
+
+        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+            transcriber_main.run_whisperx_direct(
+                make_cfg(language="en", diarize=False),
+                Path("input.wav"),
+                Path(tmpdir) / "output.srt",
+                hf_token=None,
+                diarize=False,
+            )
+
+        self.assertLess(events.index("ensure_ffmpeg"), events.index("load_model"))
+        self.assertLess(events.index("ensure_ffmpeg"), events.index("load_audio"))
+
+    @patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes")
+    def test_run_whisperx_direct_fails_before_model_load_when_ffmpeg_missing(
+        self, ensure_ffmpeg: MagicMock
+    ) -> None:
+        ensure_ffmpeg.side_effect = RuntimeError("ffmpeg executable not found. Set TRANSCRIBE_FFMPEG.")
+        fake_whisperx = SimpleNamespace(
+            __name__="whisperx",
+            load_model=MagicMock(),
+            load_audio=MagicMock(),
+            load_align_model=MagicMock(),
+            align=MagicMock(),
+        )
+
+        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+            with self.assertRaisesRegex(RuntimeError, "TRANSCRIBE_FFMPEG"):
+                transcriber_main.run_whisperx_direct(
+                    make_cfg(language="en", diarize=False),
+                    Path("input.wav"),
+                    Path(tmpdir) / "output.srt",
+                    hf_token=None,
+                    diarize=False,
+                )
+
+        fake_whisperx.load_model.assert_not_called()
+        fake_whisperx.load_audio.assert_not_called()
 
     def test_warm_vram_keeps_direct_run_inside_cache_lock(self) -> None:
         class RecordingLock:
@@ -523,6 +725,7 @@ class HelperTests(unittest.TestCase):
             TemporaryDirectory() as tmpdir,
             patch.dict(sys.modules, {"whisperx": fake_whisperx}),
             patch("transcriber.__main__._WARM_MODEL_CACHE_LOCK", lock),
+            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
         ):
             try:
                 transcriber_main.run_whisperx_direct(
@@ -564,7 +767,11 @@ class HelperTests(unittest.TestCase):
             ),
         ]
 
-        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx}),
+            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+        ):
             cfg = make_cfg(language="en", diarize=False, warm_vram=False)
             for idx in range(2):
                 transcriber_main.run_whisperx_direct(
@@ -597,7 +804,11 @@ class HelperTests(unittest.TestCase):
         )
         fake_torch = SimpleNamespace(load=MagicMock())
 
-        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}):
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}),
+            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+        ):
             cfg = make_cfg(language="en", diarize=True, warm_vram=True)
             try:
                 for idx in range(2):
@@ -633,7 +844,11 @@ class HelperTests(unittest.TestCase):
         )
         fake_torch = SimpleNamespace(load=MagicMock())
 
-        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}):
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}),
+            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+        ):
             cfg = make_cfg(language="en", diarize=True, warm_vram=False)
             for idx in range(2):
                 transcriber_main.run_whisperx_direct(
@@ -670,7 +885,11 @@ class HelperTests(unittest.TestCase):
         )
         fake_torch = SimpleNamespace(load=MagicMock())
 
-        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}):
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}),
+            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+        ):
             source = Path(tmpdir) / "meeting.wav"
             source.write_bytes(b"audio")
             reports: list[str] = []

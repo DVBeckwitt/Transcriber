@@ -18,6 +18,14 @@ It generates:
 
 ## Change status
 
+### 2026-07-08
+
+- Bug/error handling: ffmpeg discovery now fails early with one actionable launcher message when ffmpeg is missing, instead of reporting a recoverable preprocessing fallback and then failing later in WhisperX audio loading.
+- Runtime behavior: the resolved ffmpeg directory is added to the process `PATH` before WhisperX loads audio, because WhisperX launches `ffmpeg` by name internally.
+- Configuration: `TRANSCRIBE_FFMPEG` must point to a standard executable named `ffmpeg` or `ffmpeg.exe`; renamed decoder binaries are rejected with a clear error because WhisperX cannot launch them by custom filename.
+- Migration/deprecation: no migration for PATH, `C:\ffmpeg\bin\ffmpeg.exe`, Chocolatey, or Scoop installs. If `TRANSCRIBE_FFMPEG` points to a renamed executable, rename it or point the variable at a standard ffmpeg executable.
+- Status: fixed and verified with targeted ffmpeg/transcribe tests, full unit tests, `python -m compileall -q transcriber tests`, `git diff --check`, a staged secret scan, and a runtime `whisperx.load_audio()` check against the original `.mov`.
+
 ### 2026-07-07
 
 - Performance: added default-off warm VRAM mode with `--warm-vram` / `--no-warm-vram` and worker `TRANSCRIBE_WARM_VRAM` support for repeated jobs.
@@ -61,7 +69,7 @@ It generates:
 
 - Python 3.10+
 - A working WhisperX install in your virtual environment
-- `ffmpeg` available on PATH
+- `ffmpeg` available on PATH, set with `TRANSCRIBE_FFMPEG`, or installed in a common Windows location such as `C:\ffmpeg\bin\ffmpeg.exe`. If you use `TRANSCRIBE_FFMPEG`, the executable must be named `ffmpeg` or `ffmpeg.exe` because WhisperX launches it by name during audio loading.
 - Optional but recommended: NVIDIA GPU + CUDA-compatible PyTorch for speed
 - Hugging Face token if you want speaker diarization
 
