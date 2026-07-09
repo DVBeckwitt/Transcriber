@@ -345,6 +345,22 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(outputs.lock_path.parent, source.parent)
             self.assertEqual(outputs.log_path.parent, project_dir() / "logs")
 
+    def test_output_paths_fall_back_when_project_log_dir_is_unusable(self) -> None:
+        cfg = make_cfg()
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "meeting.mp4"
+            source.write_bytes(b"data")
+            preferred_log_dir = project_dir() / "logs"
+
+            def usable(path: Path) -> bool:
+                return path != preferred_log_dir
+
+            with patch("transcriber.__main__.ensure_log_dir_usable", side_effect=usable):
+                outputs = output_paths_for_input(source, cfg, create_dirs=True)
+
+            self.assertEqual(outputs.log_path.parent, source.parent)
+            self.assertEqual(outputs.log_path.name, "meeting_whisperx.log")
+
     @patch("transcriber.__main__.run_whisperx_direct_logged")
     def test_transcribe_file_rejects_unsupported_input_before_work(self, run_logged: MagicMock) -> None:
         cfg = make_cfg(diarize=False)

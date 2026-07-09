@@ -134,6 +134,88 @@ class ServerTests(unittest.TestCase):
             )
             self.assert_error(too_large, 413, "UPLOAD_TOO_LARGE")
 
+    def test_accepts_weba_upload_extension(self) -> None:
+        seen_sources: list[Path] = []
+
+        def runner(cfg: RunConfig, source_path: Path, report=print) -> int:
+            seen_sources.append(source_path)
+            outputs = output_paths_for_input(source_path, cfg, create_dirs=True)
+            outputs.srt_path.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello.\n",
+                encoding="utf-8",
+            )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self.make_client(tmpdir, runner=runner)
+            response = client.post(
+                "/api/transcriptions",
+                data={"language": "auto"},
+                files={"file": ("clip.weba", b"audio", "audio/webm")},
+                headers=auth_headers(),
+            )
+            self.assertEqual(response.status_code, 202)
+
+            self.wait_for_terminal_status(client, response.json()["jobId"])
+
+        self.assertEqual(len(seen_sources), 1)
+        self.assertEqual(seen_sources[0].suffix, ".weba")
+
+    def test_uses_webm_suffix_for_webm_mime_without_supported_filename_suffix(self) -> None:
+        seen_sources: list[Path] = []
+
+        def runner(cfg: RunConfig, source_path: Path, report=print) -> int:
+            seen_sources.append(source_path)
+            outputs = output_paths_for_input(source_path, cfg, create_dirs=True)
+            outputs.srt_path.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello.\n",
+                encoding="utf-8",
+            )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self.make_client(tmpdir, runner=runner)
+            response = client.post(
+                "/api/transcriptions",
+                data={"language": "auto"},
+                files={"file": ("blob", b"audio", "audio/webm")},
+                headers=auth_headers(),
+            )
+            self.assertEqual(response.status_code, 202)
+
+            self.wait_for_terminal_status(client, response.json()["jobId"])
+
+        self.assertEqual(len(seen_sources), 1)
+        self.assertEqual(seen_sources[0].suffix, ".webm")
+
+    def test_accepts_supported_webm_mime_types_without_supported_extension(self) -> None:
+        seen_sources: list[Path] = []
+
+        def runner(cfg: RunConfig, source_path: Path, report=print) -> int:
+            seen_sources.append(source_path)
+            outputs = output_paths_for_input(source_path, cfg, create_dirs=True)
+            outputs.srt_path.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello.\n",
+                encoding="utf-8",
+            )
+            return 0
+
+        webm_mime_types = ("audio/webm", "video/webm", "audio/x-webm", "video/x-webm")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self.make_client(tmpdir, runner=runner)
+            for content_type in webm_mime_types:
+                with self.subTest(content_type=content_type):
+                    response = client.post(
+                        "/api/transcriptions",
+                        data={"language": "auto"},
+                        files={"file": ("clip.txt", b"audio", content_type)},
+                        headers=auth_headers(),
+                    )
+                    self.assertEqual(response.status_code, 202)
+                    self.wait_for_terminal_status(client, response.json()["jobId"])
+
+        self.assertEqual([source.suffix for source in seen_sources], [".webm"] * len(webm_mime_types))
+
     def test_maps_server_request_to_quality_no_speaker_labels_config(self) -> None:
         seen: list[RunConfig] = []
 

@@ -312,6 +312,7 @@ Also confirm Hugging Face token setup if diarization is enabled.
 Likely causes:
 
 - Unsupported extension
+- Unsupported WebM MIME type when the filename has no supported suffix
 - `language` is not `auto`, `en`, or `es`
 - Upload exceeds `TRANSCRIBE_MAX_UPLOAD_BYTES`
 - Missing multipart `file` field

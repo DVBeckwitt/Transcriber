@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 MEDIA_FILTER = (
     "Audio/Video",
-    "*.wav *.mp3 *.m4a *.flac *.aac *.ogg *.opus *.wma *.mp4 *.mov *.mkv *.webm",
+    "*.wav *.mp3 *.m4a *.flac *.aac *.ogg *.opus *.wma *.mp4 *.mov *.mkv *.webm *.weba",
 )
 MEDIA_EXTENSIONS = {
     ".wav",
@@ -41,6 +41,7 @@ MEDIA_EXTENSIONS = {
     ".mov",
     ".mkv",
     ".webm",
+    ".weba",
 }
 
 LOG_DIR_NAME = "logs"
@@ -2200,10 +2201,9 @@ def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfi
 
 def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool = False) -> OutputPaths:
     output_dir = input_path.parent
-    log_dir = project_dir() / LOG_DIR_NAME
+    log_dir = log_dir_for_output(output_dir, create_dirs=create_dirs)
     if create_dirs:
         output_dir.mkdir(parents=True, exist_ok=True)
-        log_dir.mkdir(parents=True, exist_ok=True)
     base = input_path.stem
     return OutputPaths(
         output_dir=output_dir,
@@ -2212,6 +2212,42 @@ def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool =
         log_path=log_dir / f"{base}_whisperx.log",
         lock_path=output_dir / f"{base}{LOCK_SUFFIX}",
     )
+
+
+def log_dir_for_output(output_dir: Path, *, create_dirs: bool) -> Path:
+    preferred = project_dir() / LOG_DIR_NAME
+    if not create_dirs or ensure_log_dir_usable(preferred):
+        return preferred
+    if ensure_log_dir_usable(output_dir):
+        return output_dir
+
+    temp_log_dir = Path(tempfile.gettempdir()) / "transcriber-logs"
+    if ensure_log_dir_usable(temp_log_dir):
+        return temp_log_dir
+    return preferred
+
+
+def ensure_log_dir_usable(log_dir: Path) -> bool:
+    probe_path: Path | None = None
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=log_dir,
+            prefix=".transcriber-log-probe-",
+            suffix=".tmp",
+            delete=False,
+        ) as probe:
+            probe_path = Path(probe.name)
+            probe.write("")
+        probe_path.unlink()
+        return True
+    except OSError:
+        if probe_path is not None:
+            with contextlib.suppress(OSError):
+                probe_path.unlink()
+        return False
 
 
 def is_stale_lock(lock_path: Path, stale_lock_seconds: float) -> bool:

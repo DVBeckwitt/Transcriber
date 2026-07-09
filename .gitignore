@@ -8,6 +8,7 @@ hf_token.txt
 *.key
 .tmp_transcriber_temp/
 .transcriber_server_jobs/
+.codex-remote-attachments/
 logs/
 *.log
 __pycache__/

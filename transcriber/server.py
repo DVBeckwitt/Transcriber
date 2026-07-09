@@ -41,6 +41,7 @@ JOB_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_FAILURE_REPORT_LINES = 20
 MAX_FAILURE_LOG_CHARS = 16 * 1024
 MAX_FAILURE_LOG_LINES = 80
+WEBM_MIME_TYPES = {"audio/webm", "video/webm", "audio/x-webm", "video/x-webm"}
 SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(token|password|secret|api[_-]?key)(\b\s*[:=]\s*)([^\s,;]+)"
 )
@@ -348,6 +349,19 @@ async def parse_multipart_form(request: Any, max_upload_bytes: int) -> Any:
         raise ApiError(400, "INVALID_MULTIPART", "Invalid multipart form data.") from exc
 
 
+def upload_media_extension(upload: Any) -> str:
+    extension = Path(upload.filename or "").suffix.lower()
+    if extension in MEDIA_EXTENSIONS:
+        return extension
+
+    content_type = str(getattr(upload, "content_type", "") or "").split(";", 1)[0].strip().lower()
+    if content_type in WEBM_MIME_TYPES:
+        return ".webm"
+
+    supported = ", ".join(sorted(MEDIA_EXTENSIONS))
+    raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", f"Unsupported media file extension. Supported: {supported}.")
+
+
 def build_job_config(source_path: Path, language: str, server_config: ServerConfig) -> RunConfig:
     args = parse_transcriber_args(
         [
@@ -595,11 +609,7 @@ def create_app(config: ServerConfig, transcribe_runner: TranscribeRunner = trans
             if language not in LANGUAGES:
                 raise ApiError(422, "INVALID_LANGUAGE", "Language must be one of: auto, en, es.")
 
-            extension = Path(upload.filename or "").suffix.lower()
-            if extension not in MEDIA_EXTENSIONS:
-                supported = ", ".join(sorted(MEDIA_EXTENSIONS))
-                raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", f"Unsupported media file extension. Supported: {supported}.")
-
+            extension = upload_media_extension(upload)
             record = store.create(language, extension)
             try:
                 await save_upload(upload, record.source_path, config.max_upload_bytes)

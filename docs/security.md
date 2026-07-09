@@ -7,7 +7,7 @@ This project is a local transcription launcher plus an optional LAN worker API. 
 | Boundary | Risk | Control |
 | --- | --- | --- |
 | Homepage proxy to worker API | Unauthorized uploads or transcript reads | Shared bearer token in `X-Transcribe-Proxy-Token` on every request |
-| Multipart uploads | Disk exhaustion, unsupported inputs, malformed forms | Upload size limit, language validation, supported extension allowlist |
+| Multipart uploads | Disk exhaustion, unsupported inputs, malformed forms | Upload size limit, language validation, supported extension allowlist plus narrow WebM MIME fallback |
 | Worker filesystem | Transcript/source media leakage | Per-job directories, source deletion after success/failure, TTL cleanup |
 | WhisperX/pyannote models | Third-party checkpoint execution/trust | Diarization token and model terms documented as trusted-model boundary |
 | Client-facing errors | Internal path or stack trace disclosure | Consistent JSON errors with generic messages |
@@ -22,7 +22,7 @@ This project is a local transcription launcher plus an optional LAN worker API. 
 - No CORS middleware is added; the homepage proxy should provide same-origin access.
 - File uploads are limited by configurable byte count, defaulting to 10 GB.
 - Upload filenames are not used for storage paths; the server stores each upload with the UUID job ID as its stem inside the UUID job directory.
-- Only extensions already supported by the CLI are accepted.
+- Uploads are accepted by supported CLI extension. WebM uploads with a supported WebM MIME type are stored as `.webm` when the filename suffix is missing or unsupported.
 - Supported languages are limited to `auto`, `en`, and `es`.
 - Errors use `{ "error": { "code": "...", "message": "...", "details": { ... } } }`; `details` is optional.
 - Client errors do not include raw stack traces, local paths, process IDs, or full WhisperX logs.
