@@ -352,6 +352,40 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(lines, ["line one", "line two"])
         read_tail.assert_called_once_with(log_path, max_chars=server_module.MAX_FAILURE_LOG_CHARS)
 
+    def test_native_transcription_crash_is_recorded_as_failed_job(self) -> None:
+        class CrashedProcess:
+            returncode = 3221225477
+
+            def wait(self) -> int:
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir)
+            store = server_module.JobStore(work_dir, 24 * 60 * 60)
+            record = store.create("en", ".wav")
+            record.source_path.write_bytes(b"audio")
+            config = ServerConfig(
+                proxy_token=TOKEN,
+                work_dir=work_dir,
+                device="cpu",
+                compute_type="float32",
+            )
+
+            with patch.object(server_module.subprocess, "Popen", return_value=CrashedProcess()):
+                server_module.run_transcription_job(
+                    record.job_id,
+                    store,
+                    config,
+                    server_module.transcribe_file,
+                )
+
+            failed = store.get(record.job_id)
+            self.assertIsNotNone(failed)
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.error["code"], "TRANSCRIPTION_FAILED")
+            self.assertIn("3221225477", failed.error["message"])
+            self.assertFalse(record.source_path.exists())
+
     def test_cleanup_removes_stale_untracked_job_directories_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = Path(tmpdir)

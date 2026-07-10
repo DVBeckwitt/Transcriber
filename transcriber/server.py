@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -473,6 +474,55 @@ def failure_details(
     return details
 
 
+def transcription_subprocess_command(
+    source_path: Path,
+    language: str,
+    server_config: ServerConfig,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "transcriber",
+        "--input",
+        str(source_path),
+        "--lang",
+        language,
+        "--mode",
+        "quality",
+        "--no-speaker-labels",
+        "--device",
+        server_config.device,
+        "--compute-type",
+        server_config.compute_type,
+        "--warm-vram" if server_config.warm_vram else "--no-warm-vram",
+    ]
+
+
+def run_transcription_subprocess(
+    record: JobRecord,
+    server_config: ServerConfig,
+    reports: list[str],
+) -> int:
+    process_log = record.work_dir / "transcriber-process.log"
+    with process_log.open("w", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            transcription_subprocess_command(record.source_path, record.language, server_config),
+            cwd=project_dir(),
+            env=os.environ.copy(),
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+        )
+        return_code = process.wait()
+
+    process_lines = [
+        line
+        for line in read_text_tail(process_log, max_chars=MAX_FAILURE_LOG_CHARS).splitlines()
+        if line.strip()
+    ]
+    reports.extend(process_lines[-MAX_FAILURE_LOG_LINES:])
+    return return_code
+
+
 def run_transcription_job(
     job_id: str,
     store: JobStore,
@@ -489,8 +539,14 @@ def run_transcription_job(
     try:
         cfg = build_job_config(record.source_path, record.language, server_config)
         outputs = output_paths_for_input(record.source_path, cfg, create_dirs=True)
-        rc = transcribe_runner(cfg, record.source_path, report=reports.append)
+        isolated = transcribe_runner is transcribe_file
+        if isolated:
+            rc = run_transcription_subprocess(record, server_config, reports)
+        else:
+            rc = transcribe_runner(cfg, record.source_path, report=reports.append)
         if rc != 0:
+            if isolated:
+                raise RuntimeError(f"transcription subprocess failed with exit code {rc}.")
             raise RuntimeError("transcription failed")
         if not outputs.srt_path.exists():
             raise RuntimeError("transcript was not created")
