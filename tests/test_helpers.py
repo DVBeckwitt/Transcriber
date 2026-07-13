@@ -10,22 +10,20 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import transcriber.__main__ as transcriber_main
-
 from transcriber.__main__ import (
-    build_audio_preprocess_command,
-    build_asr_prompt,
-    build_config,
     RunConfig,
     SRTCue,
     TimedToken,
     apply_confidence_cleanup,
+    build_asr_prompt,
+    build_audio_preprocess_command,
+    build_config,
     build_llm_file,
     build_srt_cues_from_result,
     build_translation_prompt,
     flush_gpu_memory,
-    load_translation_glossary,
     is_watchable_media,
-    translate_spanish_texts,
+    load_translation_glossary,
     output_paths_for_input,
     parse_args,
     parse_detected_language_from_log,
@@ -39,13 +37,14 @@ from transcriber.__main__ import (
     should_fallback_without_diarization,
     smooth_timed_tokens,
     transcribe_file,
+    translate_spanish_texts,
     translation_context_for_cue,
     write_direct_srt_from_result,
 )
 
 
 class FakeTensor:
-    def to(self, device: object) -> "FakeTensor":
+    def to(self, device: object) -> FakeTensor:
         return self
 
 
@@ -129,9 +128,13 @@ class HelperTests(unittest.TestCase):
 
     def test_warm_vram_defaults_off_and_can_be_enabled(self) -> None:
         self.assertFalse(build_config(parse_args([]), interactive=False).warm_vram)
-        self.assertTrue(build_config(parse_args(["--warm-vram"]), interactive=False).warm_vram)
+        self.assertTrue(
+            build_config(parse_args(["--warm-vram"]), interactive=False).warm_vram
+        )
         self.assertFalse(
-            build_config(parse_args(["--warm-vram", "--no-warm-vram"]), interactive=False).warm_vram
+            build_config(
+                parse_args(["--warm-vram", "--no-warm-vram"]), interactive=False
+            ).warm_vram
         )
 
     def test_translate_flag_enables_direct_whisperx_output(self) -> None:
@@ -143,7 +146,9 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(cfg.include_speaker_labels)
 
     def test_no_speaker_labels_flag_disables_rendered_labels_only(self) -> None:
-        cfg = build_config(parse_args(["--no-speaker-labels", "--diarize"]), interactive=False)
+        cfg = build_config(
+            parse_args(["--no-speaker-labels", "--diarize"]), interactive=False
+        )
         self.assertFalse(cfg.include_speaker_labels)
         self.assertTrue(cfg.diarize)
 
@@ -169,7 +174,9 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(command[-1], "out.wav")
 
     def test_audio_preprocess_command_accepts_resolved_ffmpeg_path(self) -> None:
-        command = build_audio_preprocess_command(Path("in.mp4"), Path("out.wav"), r"C:\ffmpeg\bin\ffmpeg.exe")
+        command = build_audio_preprocess_command(
+            Path("in.mp4"), Path("out.wav"), r"C:\ffmpeg\bin\ffmpeg.exe"
+        )
 
         self.assertEqual(command[0], r"C:\ffmpeg\bin\ffmpeg.exe")
 
@@ -182,15 +189,22 @@ class HelperTests(unittest.TestCase):
                 "transcriber.__main__.ffmpeg_candidate_paths",
                 return_value=[Path(tmpdir) / "missing.exe", ffmpeg_path],
             ):
-                self.assertEqual(transcriber_main.resolve_ffmpeg_executable(), str(ffmpeg_path))
+                self.assertEqual(
+                    transcriber_main.resolve_ffmpeg_executable(), str(ffmpeg_path)
+                )
 
     @patch("transcriber.__main__.shutil.which", return_value=None)
-    def test_ffmpeg_candidate_paths_strips_quoted_env_path(self, which: MagicMock) -> None:
+    def test_ffmpeg_candidate_paths_strips_quoted_env_path(
+        self, which: MagicMock
+    ) -> None:
         with patch.dict(
             transcriber_main.os.environ,
             {transcriber_main.FFMPEG_PATH_ENV_VAR: r'"C:\ffmpeg\bin\ffmpeg.exe"'},
         ):
-            self.assertEqual(transcriber_main.ffmpeg_candidate_paths()[0], Path(r"C:\ffmpeg\bin\ffmpeg.exe"))
+            self.assertEqual(
+                transcriber_main.ffmpeg_candidate_paths()[0],
+                Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            )
 
     @patch("transcriber.__main__.resolve_ffmpeg_executable")
     def test_ensure_ffmpeg_available_for_child_processes_prepends_resolved_parent(
@@ -205,14 +219,18 @@ class HelperTests(unittest.TestCase):
 
             with patch.dict(transcriber_main.os.environ, {"PATH": original_path}):
                 result = transcriber_main.ensure_ffmpeg_available_for_child_processes()
-                path_parts = transcriber_main.os.environ["PATH"].split(transcriber_main.os.pathsep)
+                path_parts = transcriber_main.os.environ["PATH"].split(
+                    transcriber_main.os.pathsep
+                )
 
             self.assertEqual(result, str(ffmpeg_path))
             self.assertEqual(path_parts[0], str(ffmpeg_path.parent.resolve()))
             self.assertEqual(path_parts[1], original_path)
 
     @patch("transcriber.__main__.resolve_ffmpeg_executable")
-    def test_ensure_ffmpeg_available_for_child_processes_is_idempotent(self, resolve_ffmpeg: MagicMock) -> None:
+    def test_ensure_ffmpeg_available_for_child_processes_is_idempotent(
+        self, resolve_ffmpeg: MagicMock
+    ) -> None:
         with TemporaryDirectory() as tmpdir:
             ffmpeg_path = Path(tmpdir) / "bin" / "ffmpeg.exe"
             ffmpeg_path.parent.mkdir()
@@ -222,20 +240,33 @@ class HelperTests(unittest.TestCase):
 
             with patch.dict(
                 transcriber_main.os.environ,
-                {"PATH": ffmpeg_dir + transcriber_main.os.pathsep + str(Path(tmpdir) / "other")},
+                {
+                    "PATH": ffmpeg_dir
+                    + transcriber_main.os.pathsep
+                    + str(Path(tmpdir) / "other")
+                },
             ):
                 transcriber_main.ensure_ffmpeg_available_for_child_processes()
                 transcriber_main.ensure_ffmpeg_available_for_child_processes()
-                path_parts = transcriber_main.os.environ["PATH"].split(transcriber_main.os.pathsep)
+                path_parts = transcriber_main.os.environ["PATH"].split(
+                    transcriber_main.os.pathsep
+                )
 
             normalized = [
-                transcriber_main.os.path.normcase(transcriber_main.os.path.normpath(part)) for part in path_parts
+                transcriber_main.os.path.normcase(
+                    transcriber_main.os.path.normpath(part)
+                )
+                for part in path_parts
             ]
-            normalized_ffmpeg_dir = transcriber_main.os.path.normcase(transcriber_main.os.path.normpath(ffmpeg_dir))
+            normalized_ffmpeg_dir = transcriber_main.os.path.normcase(
+                transcriber_main.os.path.normpath(ffmpeg_dir)
+            )
             self.assertEqual(normalized.count(normalized_ffmpeg_dir), 1)
 
     @patch("transcriber.__main__.resolve_ffmpeg_executable", return_value=None)
-    def test_ensure_ffmpeg_available_for_child_processes_requires_ffmpeg(self, resolve_ffmpeg: MagicMock) -> None:
+    def test_ensure_ffmpeg_available_for_child_processes_requires_ffmpeg(
+        self, resolve_ffmpeg: MagicMock
+    ) -> None:
         with self.assertRaisesRegex(RuntimeError, "ffmpeg.*TRANSCRIBE_FFMPEG"):
             transcriber_main.ensure_ffmpeg_available_for_child_processes()
 
@@ -261,7 +292,9 @@ class HelperTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             reports: list[str] = []
 
-            result = preprocess_audio_for_whisperx(Path("in.mp4"), Path(tmpdir), report=reports.append)
+            result = preprocess_audio_for_whisperx(
+                Path("in.mp4"), Path(tmpdir), report=reports.append
+            )
 
         self.assertEqual(result, Path("in.mp4"))
         run.assert_not_called()
@@ -269,12 +302,16 @@ class HelperTests(unittest.TestCase):
 
     @patch("transcriber.__main__.resolve_ffmpeg_executable", return_value="ffmpeg")
     @patch("transcriber.__main__.subprocess.run")
-    def test_audio_preprocess_uses_timeout(self, run: MagicMock, resolve_ffmpeg: MagicMock) -> None:
+    def test_audio_preprocess_uses_timeout(
+        self, run: MagicMock, resolve_ffmpeg: MagicMock
+    ) -> None:
         run.side_effect = FileNotFoundError()
         with TemporaryDirectory() as tmpdir:
             reports: list[str] = []
 
-            result = preprocess_audio_for_whisperx(Path("in.mp4"), Path(tmpdir), report=reports.append)
+            result = preprocess_audio_for_whisperx(
+                Path("in.mp4"), Path(tmpdir), report=reports.append
+            )
 
             self.assertEqual(result, Path("in.mp4"))
         self.assertIn("timeout", run.call_args.kwargs)
@@ -282,7 +319,9 @@ class HelperTests(unittest.TestCase):
 
     @patch("transcriber.__main__.resolve_ffmpeg_executable", return_value="ffmpeg")
     @patch("transcriber.__main__.subprocess.run")
-    def test_audio_preprocess_truncates_long_stderr(self, run: MagicMock, resolve_ffmpeg: MagicMock) -> None:
+    def test_audio_preprocess_truncates_long_stderr(
+        self, run: MagicMock, resolve_ffmpeg: MagicMock
+    ) -> None:
         run.side_effect = subprocess.CalledProcessError(
             1,
             ["ffmpeg"],
@@ -291,7 +330,9 @@ class HelperTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             reports: list[str] = []
 
-            result = preprocess_audio_for_whisperx(Path("in.mp4"), Path(tmpdir), report=reports.append)
+            result = preprocess_audio_for_whisperx(
+                Path("in.mp4"), Path(tmpdir), report=reports.append
+            )
 
             self.assertEqual(result, Path("in.mp4"))
             self.assertTrue(any("[truncated]" in line for line in reports))
@@ -355,14 +396,18 @@ class HelperTests(unittest.TestCase):
             def usable(path: Path) -> bool:
                 return path != preferred_log_dir
 
-            with patch("transcriber.__main__.ensure_log_dir_usable", side_effect=usable):
+            with patch(
+                "transcriber.__main__.ensure_log_dir_usable", side_effect=usable
+            ):
                 outputs = output_paths_for_input(source, cfg, create_dirs=True)
 
             self.assertEqual(outputs.log_path.parent, source.parent)
             self.assertEqual(outputs.log_path.name, "meeting_whisperx.log")
 
     @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_rejects_unsupported_input_before_work(self, run_logged: MagicMock) -> None:
+    def test_transcribe_file_rejects_unsupported_input_before_work(
+        self, run_logged: MagicMock
+    ) -> None:
         cfg = make_cfg(diarize=False)
         with TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "notes.txt"
@@ -380,7 +425,9 @@ class HelperTests(unittest.TestCase):
             run_logged.assert_not_called()
 
     @patch("transcriber.__main__.run_whisperx_direct_logged")
-    def test_transcribe_file_rejects_directory_before_work(self, run_logged: MagicMock) -> None:
+    def test_transcribe_file_rejects_directory_before_work(
+        self, run_logged: MagicMock
+    ) -> None:
         cfg = make_cfg(diarize=False)
         with TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "recordings.mp4"
@@ -401,7 +448,9 @@ class HelperTests(unittest.TestCase):
     @patch("transcriber.__main__.preprocess_audio_for_whisperx")
     @patch(
         "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
-        side_effect=RuntimeError("ffmpeg executable not found. Install ffmpeg, set TRANSCRIBE_FFMPEG."),
+        side_effect=RuntimeError(
+            "ffmpeg executable not found. Install ffmpeg, set TRANSCRIBE_FFMPEG."
+        ),
     )
     def test_transcribe_file_reports_missing_ffmpeg_before_audio_work(
         self,
@@ -471,8 +520,12 @@ class HelperTests(unittest.TestCase):
         flush_gpu.assert_called_once_with("cuda")
 
     def test_glossary_parsing_and_prompt(self) -> None:
-        glossary = parse_glossary_entries(["OpenAI => OpenAI", "esfuerzo|effort", "termino"])
-        prompt = build_translation_prompt(model_name="model", context_window=1, glossary=glossary)
+        glossary = parse_glossary_entries(
+            ["OpenAI => OpenAI", "esfuerzo|effort", "termino"]
+        )
+        prompt = build_translation_prompt(
+            model_name="model", context_window=1, glossary=glossary
+        )
 
         self.assertEqual(glossary["OpenAI"], "OpenAI")
         self.assertEqual(glossary["esfuerzo"], "effort")
@@ -483,9 +536,13 @@ class HelperTests(unittest.TestCase):
     def test_asr_prompt_includes_glossary_and_file_terms(self) -> None:
         with TemporaryDirectory() as tmpdir:
             prompt_file = Path(tmpdir) / "asr.txt"
-            prompt_file.write_text("Project Falcon\n# comment\nAcmeOS\n", encoding="utf-8")
+            prompt_file.write_text(
+                "Project Falcon\n# comment\nAcmeOS\n", encoding="utf-8"
+            )
 
-            glossary = parse_glossary_entries(["OpenAI => OpenAI", "WhisperX => WhisperX"])
+            glossary = parse_glossary_entries(
+                ["OpenAI => OpenAI", "WhisperX => WhisperX"]
+            )
             prompt = build_asr_prompt(
                 glossary=glossary,
                 prompt_text="Use exact spellings.",
@@ -562,12 +619,16 @@ class HelperTests(unittest.TestCase):
             flush_gpu_memory("cuda")
 
     @patch("transcriber.__main__.flush_gpu_memory")
-    def test_cold_cleanup_clears_warm_model_caches_and_flushes_gpu(self, flush_gpu: MagicMock) -> None:
+    def test_cold_cleanup_clears_warm_model_caches_and_flushes_gpu(
+        self, flush_gpu: MagicMock
+    ) -> None:
         transcriber_main._WARM_ASR_MODEL_CACHE[("asr",)] = object()
         transcriber_main._WARM_ALIGN_MODEL_CACHE[("align",)] = object()
         transcriber_main._WARM_DIARIZATION_MODEL_CACHE[("diarize",)] = object()
 
-        transcriber_main.cleanup_after_transcription_run(make_cfg(device="cuda", warm_vram=False))
+        transcriber_main.cleanup_after_transcription_run(
+            make_cfg(device="cuda", warm_vram=False)
+        )
 
         self.assertEqual(transcriber_main._WARM_ASR_MODEL_CACHE, {})
         self.assertEqual(transcriber_main._WARM_ALIGN_MODEL_CACHE, {})
@@ -575,7 +636,9 @@ class HelperTests(unittest.TestCase):
         flush_gpu.assert_called_once_with("cuda")
 
     @patch("transcriber.__main__.flush_gpu_memory")
-    def test_warm_cleanup_preserves_model_caches_and_skips_gpu_flush(self, flush_gpu: MagicMock) -> None:
+    def test_warm_cleanup_preserves_model_caches_and_skips_gpu_flush(
+        self, flush_gpu: MagicMock
+    ) -> None:
         asr_model = object()
         align_model = object()
         diarize_model = object()
@@ -584,11 +647,18 @@ class HelperTests(unittest.TestCase):
         transcriber_main._WARM_DIARIZATION_MODEL_CACHE[("diarize",)] = diarize_model
 
         try:
-            transcriber_main.cleanup_after_transcription_run(make_cfg(device="cuda", warm_vram=True))
+            transcriber_main.cleanup_after_transcription_run(
+                make_cfg(device="cuda", warm_vram=True)
+            )
 
             self.assertIs(transcriber_main._WARM_ASR_MODEL_CACHE[("asr",)], asr_model)
-            self.assertIs(transcriber_main._WARM_ALIGN_MODEL_CACHE[("align",)], align_model)
-            self.assertIs(transcriber_main._WARM_DIARIZATION_MODEL_CACHE[("diarize",)], diarize_model)
+            self.assertIs(
+                transcriber_main._WARM_ALIGN_MODEL_CACHE[("align",)], align_model
+            )
+            self.assertIs(
+                transcriber_main._WARM_DIARIZATION_MODEL_CACHE[("diarize",)],
+                diarize_model,
+            )
             flush_gpu.assert_not_called()
         finally:
             transcriber_main.clear_warm_model_caches()
@@ -611,13 +681,21 @@ class HelperTests(unittest.TestCase):
             load_model=MagicMock(return_value=model),
             load_audio=MagicMock(return_value=object()),
             load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
-            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            align=MagicMock(
+                side_effect=lambda segments, *args, **kwargs: {
+                    "language": "en",
+                    "segments": segments,
+                }
+            ),
         )
 
         with (
             TemporaryDirectory() as tmpdir,
             patch.dict(sys.modules, {"whisperx": fake_whisperx}),
-            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+            patch(
+                "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
+                return_value="ffmpeg",
+            ),
         ):
             cfg = make_cfg(language="en", diarize=False, warm_vram=True)
             try:
@@ -637,7 +715,9 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(model.transcribe.call_count, 2)
 
     @patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes")
-    def test_run_whisperx_direct_prepares_ffmpeg_before_model_load(self, ensure_ffmpeg: MagicMock) -> None:
+    def test_run_whisperx_direct_prepares_ffmpeg_before_model_load(
+        self, ensure_ffmpeg: MagicMock
+    ) -> None:
         events: list[str] = []
         model = MagicMock()
         model.transcribe.return_value = {
@@ -663,10 +743,18 @@ class HelperTests(unittest.TestCase):
             load_model=MagicMock(side_effect=load_model),
             load_audio=MagicMock(side_effect=load_audio),
             load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
-            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            align=MagicMock(
+                side_effect=lambda segments, *args, **kwargs: {
+                    "language": "en",
+                    "segments": segments,
+                }
+            ),
         )
 
-        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx}),
+        ):
             transcriber_main.run_whisperx_direct(
                 make_cfg(language="en", diarize=False),
                 Path("input.wav"),
@@ -682,7 +770,9 @@ class HelperTests(unittest.TestCase):
     def test_run_whisperx_direct_fails_before_model_load_when_ffmpeg_missing(
         self, ensure_ffmpeg: MagicMock
     ) -> None:
-        ensure_ffmpeg.side_effect = RuntimeError("ffmpeg executable not found. Set TRANSCRIBE_FFMPEG.")
+        ensure_ffmpeg.side_effect = RuntimeError(
+            "ffmpeg executable not found. Set TRANSCRIBE_FFMPEG."
+        )
         fake_whisperx = SimpleNamespace(
             __name__="whisperx",
             load_model=MagicMock(),
@@ -691,7 +781,10 @@ class HelperTests(unittest.TestCase):
             align=MagicMock(),
         )
 
-        with TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"whisperx": fake_whisperx}):
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch.dict(sys.modules, {"whisperx": fake_whisperx}),
+        ):
             with self.assertRaisesRegex(RuntimeError, "TRANSCRIBE_FFMPEG"):
                 transcriber_main.run_whisperx_direct(
                     make_cfg(language="en", diarize=False),
@@ -710,12 +803,14 @@ class HelperTests(unittest.TestCase):
                 self.depth = 0
                 self.enter_count = 0
 
-            def __enter__(self) -> "RecordingLock":
+            def __enter__(self) -> RecordingLock:
                 self.depth += 1
                 self.enter_count += 1
                 return self
 
-            def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            def __exit__(
+                self, exc_type: object, exc: object, traceback: object
+            ) -> None:
                 self.depth -= 1
 
         lock = RecordingLock()
@@ -734,14 +829,22 @@ class HelperTests(unittest.TestCase):
             load_model=MagicMock(return_value=model),
             load_audio=MagicMock(return_value=object()),
             load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
-            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            align=MagicMock(
+                side_effect=lambda segments, *args, **kwargs: {
+                    "language": "en",
+                    "segments": segments,
+                }
+            ),
         )
 
         with (
             TemporaryDirectory() as tmpdir,
             patch.dict(sys.modules, {"whisperx": fake_whisperx}),
             patch("transcriber.__main__._WARM_MODEL_CACHE_LOCK", lock),
-            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+            patch(
+                "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
+                return_value="ffmpeg",
+            ),
         ):
             try:
                 transcriber_main.run_whisperx_direct(
@@ -762,14 +865,21 @@ class HelperTests(unittest.TestCase):
             load_model=MagicMock(),
             load_audio=MagicMock(return_value=object()),
             load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
-            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            align=MagicMock(
+                side_effect=lambda segments, *args, **kwargs: {
+                    "language": "en",
+                    "segments": segments,
+                }
+            ),
         )
         fake_whisperx.load_model.side_effect = [
             MagicMock(
                 transcribe=MagicMock(
                     return_value={
                         "language": "en",
-                        "segments": [{"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}],
+                        "segments": [
+                            {"words": [{"word": "Hello", "start": 0.0, "end": 0.5}]}
+                        ],
                     }
                 )
             ),
@@ -777,7 +887,9 @@ class HelperTests(unittest.TestCase):
                 transcribe=MagicMock(
                     return_value={
                         "language": "en",
-                        "segments": [{"words": [{"word": "Again", "start": 0.0, "end": 0.5}]}],
+                        "segments": [
+                            {"words": [{"word": "Again", "start": 0.0, "end": 0.5}]}
+                        ],
                     }
                 )
             ),
@@ -786,7 +898,10 @@ class HelperTests(unittest.TestCase):
         with (
             TemporaryDirectory() as tmpdir,
             patch.dict(sys.modules, {"whisperx": fake_whisperx}),
-            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+            patch(
+                "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
+                return_value="ffmpeg",
+            ),
         ):
             cfg = make_cfg(language="en", diarize=False, warm_vram=False)
             for idx in range(2):
@@ -801,7 +916,9 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(fake_whisperx.load_model.call_count, 2)
         self.assertEqual(fake_whisperx.load_align_model.call_count, 2)
 
-    def test_warm_vram_reuses_diarization_pipeline_without_raw_token_cache_key(self) -> None:
+    def test_warm_vram_reuses_diarization_pipeline_without_raw_token_cache_key(
+        self,
+    ) -> None:
         model = MagicMock()
         model.transcribe.return_value = {
             "language": "en",
@@ -814,16 +931,26 @@ class HelperTests(unittest.TestCase):
             load_model=MagicMock(return_value=model),
             load_audio=MagicMock(return_value=object()),
             load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
-            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            align=MagicMock(
+                side_effect=lambda segments, *args, **kwargs: {
+                    "language": "en",
+                    "segments": segments,
+                }
+            ),
             DiarizationPipeline=MagicMock(return_value=diarize_model),
-            assign_word_speakers=MagicMock(side_effect=lambda diarize_segments, result: result),
+            assign_word_speakers=MagicMock(
+                side_effect=lambda diarize_segments, result: result
+            ),
         )
         fake_torch = SimpleNamespace(load=MagicMock())
 
         with (
             TemporaryDirectory() as tmpdir,
             patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}),
-            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+            patch(
+                "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
+                return_value="ffmpeg",
+            ),
         ):
             cfg = make_cfg(language="en", diarize=True, warm_vram=True)
             try:
@@ -854,16 +981,31 @@ class HelperTests(unittest.TestCase):
             load_model=MagicMock(return_value=model),
             load_audio=MagicMock(return_value=object()),
             load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
-            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
-            DiarizationPipeline=MagicMock(side_effect=[MagicMock(return_value="one"), MagicMock(return_value="two")]),
-            assign_word_speakers=MagicMock(side_effect=lambda diarize_segments, result: result),
+            align=MagicMock(
+                side_effect=lambda segments, *args, **kwargs: {
+                    "language": "en",
+                    "segments": segments,
+                }
+            ),
+            DiarizationPipeline=MagicMock(
+                side_effect=[
+                    MagicMock(return_value="one"),
+                    MagicMock(return_value="two"),
+                ]
+            ),
+            assign_word_speakers=MagicMock(
+                side_effect=lambda diarize_segments, result: result
+            ),
         )
         fake_torch = SimpleNamespace(load=MagicMock())
 
         with (
             TemporaryDirectory() as tmpdir,
             patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}),
-            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+            patch(
+                "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
+                return_value="ffmpeg",
+            ),
         ):
             cfg = make_cfg(language="en", diarize=True, warm_vram=False)
             for idx in range(2):
@@ -878,7 +1020,10 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(fake_whisperx.DiarizationPipeline.call_count, 2)
 
     @patch("transcriber.__main__.load_hf_token", return_value="hf_token")
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx", side_effect=lambda path, temp_dir, report=print: path)
+    @patch(
+        "transcriber.__main__.preprocess_audio_for_whisperx",
+        side_effect=lambda path, temp_dir, report=print: path,
+    )
     def test_known_diarization_failure_does_not_rerun_transcription(
         self,
         preprocess_audio: MagicMock,
@@ -894,9 +1039,16 @@ class HelperTests(unittest.TestCase):
             load_model=MagicMock(return_value=model),
             load_audio=MagicMock(return_value=object()),
             load_align_model=MagicMock(return_value=(object(), {"language": "en"})),
-            align=MagicMock(side_effect=lambda segments, *args, **kwargs: {"language": "en", "segments": segments}),
+            align=MagicMock(
+                side_effect=lambda segments, *args, **kwargs: {
+                    "language": "en",
+                    "segments": segments,
+                }
+            ),
             DiarizationPipeline=MagicMock(
-                side_effect=RuntimeError("Could not download 'pyannote/speaker-diarization-3.1' pipeline.")
+                side_effect=RuntimeError(
+                    "Could not download 'pyannote/speaker-diarization-3.1' pipeline."
+                )
             ),
         )
         fake_torch = SimpleNamespace(load=MagicMock())
@@ -904,20 +1056,27 @@ class HelperTests(unittest.TestCase):
         with (
             TemporaryDirectory() as tmpdir,
             patch.dict(sys.modules, {"whisperx": fake_whisperx, "torch": fake_torch}),
-            patch("transcriber.__main__.ensure_ffmpeg_available_for_child_processes", return_value="ffmpeg"),
+            patch(
+                "transcriber.__main__.ensure_ffmpeg_available_for_child_processes",
+                return_value="ffmpeg",
+            ),
         ):
             source = Path(tmpdir) / "meeting.wav"
             source.write_bytes(b"audio")
             reports: list[str] = []
 
-            rc = transcribe_file(make_cfg(language="en", diarize=True), source, report=reports.append)
+            rc = transcribe_file(
+                make_cfg(language="en", diarize=True), source, report=reports.append
+            )
 
             srt_path = source.with_suffix(".srt")
             self.assertEqual(rc, 0)
             self.assertTrue(srt_path.exists())
             self.assertIn("Hello", srt_path.read_text(encoding="utf-8"))
             self.assertEqual(model.transcribe.call_count, 1)
-            self.assertTrue(any("completed without speaker diarization" in line for line in reports))
+            self.assertTrue(
+                any("completed without speaker diarization" in line for line in reports)
+            )
 
     def test_translation_context_includes_neighbors(self) -> None:
         cues = [
@@ -956,10 +1115,14 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(kwargs["early_stopping"])
 
     @patch("transcriber.__main__.translate_spanish_texts")
-    def test_translation_marker_fallbacks_are_batched(self, translate_texts: MagicMock) -> None:
+    def test_translation_marker_fallbacks_are_batched(
+        self, translate_texts: MagicMock
+    ) -> None:
         calls: list[list[str]] = []
 
-        def fake_translate(texts: list[str], *args: object, **kwargs: object) -> list[str]:
+        def fake_translate(
+            texts: list[str], *args: object, **kwargs: object
+        ) -> list[str]:
             calls.append(list(texts))
             if len(calls) == 1:
                 return ["missing markers", "also missing markers"]
@@ -1003,7 +1166,11 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(result, ["Hello there"])
         self.assertEqual(
             events,
-            [("model.to", "cuda-device"), ("model.to", "cpu-device"), ("flush", "cuda")],
+            [
+                ("model.to", "cuda-device"),
+                ("model.to", "cpu-device"),
+                ("flush", "cuda"),
+            ],
         )
 
     @patch("transcriber.__main__.flush_gpu_memory")
@@ -1022,7 +1189,11 @@ class HelperTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            [("model.to", "cuda-device"), ("model.to", "cpu-device"), ("flush", "cuda")],
+            [
+                ("model.to", "cuda-device"),
+                ("model.to", "cpu-device"),
+                ("flush", "cuda"),
+            ],
         )
 
     @patch("transcriber.__main__.flush_gpu_memory")
@@ -1047,7 +1218,11 @@ class HelperTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            [("model.to", "cuda-device"), ("model.to", "cpu-device"), ("flush", "cuda")],
+            [
+                ("model.to", "cuda-device"),
+                ("model.to", "cpu-device"),
+                ("flush", "cuda"),
+            ],
         )
 
     def test_confidence_cleanup_marks_low_confidence(self) -> None:
@@ -1089,10 +1264,30 @@ class HelperTests(unittest.TestCase):
             "segments": [
                 {
                     "words": [
-                        {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "SPEAKER_00"},
-                        {"word": "there.", "start": 0.5, "end": 1.0, "speaker": "SPEAKER_00"},
-                        {"word": "Come", "start": 1.0, "end": 1.5, "speaker": "SPEAKER_01"},
-                        {"word": "in.", "start": 1.5, "end": 2.0, "speaker": "SPEAKER_01"},
+                        {
+                            "word": "Hello",
+                            "start": 0.0,
+                            "end": 0.5,
+                            "speaker": "SPEAKER_00",
+                        },
+                        {
+                            "word": "there.",
+                            "start": 0.5,
+                            "end": 1.0,
+                            "speaker": "SPEAKER_00",
+                        },
+                        {
+                            "word": "Come",
+                            "start": 1.0,
+                            "end": 1.5,
+                            "speaker": "SPEAKER_01",
+                        },
+                        {
+                            "word": "in.",
+                            "start": 1.5,
+                            "end": 2.0,
+                            "speaker": "SPEAKER_01",
+                        },
                     ]
                 }
             ]
@@ -1100,17 +1295,40 @@ class HelperTests(unittest.TestCase):
 
         cues = build_srt_cues_from_result(result, make_cfg(diarize_smoothing=False))
 
-        self.assertEqual([cue.text for cue in cues], ["SPEAKER_00: Hello there.", "SPEAKER_01: Come in."])
+        self.assertEqual(
+            [cue.text for cue in cues],
+            ["SPEAKER_00: Hello there.", "SPEAKER_01: Come in."],
+        )
 
     def test_timed_srt_hides_speaker_labels_without_losing_speaker_splits(self) -> None:
         result = {
             "segments": [
                 {
                     "words": [
-                        {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "SPEAKER_00"},
-                        {"word": "there.", "start": 0.5, "end": 1.0, "speaker": "SPEAKER_00"},
-                        {"word": "Come", "start": 1.0, "end": 1.5, "speaker": "SPEAKER_01"},
-                        {"word": "in.", "start": 1.5, "end": 2.0, "speaker": "SPEAKER_01"},
+                        {
+                            "word": "Hello",
+                            "start": 0.0,
+                            "end": 0.5,
+                            "speaker": "SPEAKER_00",
+                        },
+                        {
+                            "word": "there.",
+                            "start": 0.5,
+                            "end": 1.0,
+                            "speaker": "SPEAKER_00",
+                        },
+                        {
+                            "word": "Come",
+                            "start": 1.0,
+                            "end": 1.5,
+                            "speaker": "SPEAKER_01",
+                        },
+                        {
+                            "word": "in.",
+                            "start": 1.5,
+                            "end": 2.0,
+                            "speaker": "SPEAKER_01",
+                        },
                     ]
                 }
             ]
@@ -1135,7 +1353,9 @@ class HelperTests(unittest.TestCase):
             ]
         }
 
-        cues = build_srt_cues_from_result(result, make_cfg(include_speaker_labels=False))
+        cues = build_srt_cues_from_result(
+            result, make_cfg(include_speaker_labels=False)
+        )
 
         self.assertEqual([cue.text for cue in cues], ["Hello there."])
 
@@ -1144,8 +1364,18 @@ class HelperTests(unittest.TestCase):
             "segments": [
                 {
                     "words": [
-                        {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "SPEAKER_00"},
-                        {"word": "there.", "start": 0.5, "end": 1.0, "speaker": "SPEAKER_00"},
+                        {
+                            "word": "Hello",
+                            "start": 0.0,
+                            "end": 0.5,
+                            "speaker": "SPEAKER_00",
+                        },
+                        {
+                            "word": "there.",
+                            "start": 0.5,
+                            "end": 1.0,
+                            "speaker": "SPEAKER_00",
+                        },
                     ]
                 }
             ]
@@ -1154,10 +1384,14 @@ class HelperTests(unittest.TestCase):
             srt_path = Path(tmpdir) / "movie.srt"
             llm_path = Path(tmpdir) / "movie_llm.txt"
 
-            write_direct_srt_from_result(result, srt_path, make_cfg(include_speaker_labels=False))
+            write_direct_srt_from_result(
+                result, srt_path, make_cfg(include_speaker_labels=False)
+            )
             build_llm_file(srt_path, llm_path)
 
-            transcript_body = llm_path.read_text(encoding="utf-8").split("TRANSCRIPT:\n", 1)[1]
+            transcript_body = llm_path.read_text(encoding="utf-8").split(
+                "TRANSCRIPT:\n", 1
+            )[1]
             self.assertEqual(transcript_body, "Hello there.")
             self.assertNotIn("SPEAKER_", transcript_body)
 
@@ -1180,10 +1414,15 @@ class HelperTests(unittest.TestCase):
             transcriber_main.finalize_transcript_outputs(srt_path, llm_path)
 
             self.assertNotIn("__LOWCONF", srt_path.read_text(encoding="utf-8"))
-            transcript_body = llm_path.read_text(encoding="utf-8").split("TRANSCRIPT:\n", 1)[1]
+            transcript_body = llm_path.read_text(encoding="utf-8").split(
+                "TRANSCRIPT:\n", 1
+            )[1]
             self.assertEqual(transcript_body, "Hello.\n—")
 
-    @patch("transcriber.__main__.preprocess_audio_for_whisperx", side_effect=lambda path, temp_dir, report=print: path)
+    @patch(
+        "transcriber.__main__.preprocess_audio_for_whisperx",
+        side_effect=lambda path, temp_dir, report=print: path,
+    )
     @patch("transcriber.__main__.run_whisperx_direct_logged")
     def test_transcribe_file_uses_combined_transcript_finalizer(
         self,
@@ -1199,16 +1438,25 @@ class HelperTests(unittest.TestCase):
             log_path: Path,
             append: bool = False,
         ) -> tuple[int, str | None]:
-            srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello.\n", encoding="utf-8")
+            srt_path.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello.\n", encoding="utf-8"
+            )
             return 0, "en"
 
         run_logged.side_effect = run_and_write_srt
 
-        with TemporaryDirectory() as tmpdir, patch("transcriber.__main__.finalize_transcript_outputs") as finalize:
+        with (
+            TemporaryDirectory() as tmpdir,
+            patch("transcriber.__main__.finalize_transcript_outputs") as finalize,
+        ):
             source = Path(tmpdir) / "meeting.wav"
             source.write_bytes(b"audio")
 
-            rc = transcribe_file(make_cfg(language="en", diarize=False), source, report=lambda _message: None)
+            rc = transcribe_file(
+                make_cfg(language="en", diarize=False),
+                source,
+                report=lambda _message: None,
+            )
 
         self.assertEqual(rc, 0)
         finalize.assert_called_once()
@@ -1224,13 +1472,22 @@ class HelperTests(unittest.TestCase):
     def test_speaker_smoothing_merges_short_blips(self) -> None:
         tokens = [
             TimedToken(text="Hello", start_ms=0, end_ms=300, speaker="SPEAKER_00"),
-            TimedToken(text="yes", start_ms=300, end_ms=500, speaker="SPEAKER_01", confidence=0.2),
+            TimedToken(
+                text="yes",
+                start_ms=300,
+                end_ms=500,
+                speaker="SPEAKER_01",
+                confidence=0.2,
+            ),
             TimedToken(text="there", start_ms=500, end_ms=1100, speaker="SPEAKER_00"),
         ]
 
         smoothed = smooth_timed_tokens(tokens)
 
-        self.assertEqual([token.speaker for token in smoothed], ["SPEAKER_00", "SPEAKER_00", "SPEAKER_00"])
+        self.assertEqual(
+            [token.speaker for token in smoothed],
+            ["SPEAKER_00", "SPEAKER_00", "SPEAKER_00"],
+        )
 
 
 if __name__ == "__main__":
