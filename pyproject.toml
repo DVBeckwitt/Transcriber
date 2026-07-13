@@ -1,6 +1,6 @@
 [project]
 name = "transcriber-local"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local WhisperX transcription launcher"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,12 @@ server = [
     "uvicorn[standard]>=0.30",
     "python-multipart>=0.0.9",
 ]
+dev = [
+    "black>=24.0",
+    "build>=1.2",
+    "pytest>=8.0",
+    "ruff>=0.7",
+]
 
 [project.scripts]
 transcriber = "transcriber.__main__:main"
@@ -23,7 +29,20 @@ transcriber-server = "transcriber.server:main"
 [tool.setuptools.packages.find]
 include = ["transcriber*"]
 
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "C4", "C90"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
-

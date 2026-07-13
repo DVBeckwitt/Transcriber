@@ -7,7 +7,7 @@ This project is a local transcription launcher plus an optional LAN worker API. 
 | Boundary | Risk | Control |
 | --- | --- | --- |
 | Homepage proxy to worker API | Unauthorized uploads or transcript reads | Shared bearer token in `X-Transcribe-Proxy-Token` on every request |
-| Multipart uploads | Disk exhaustion, unsupported inputs, malformed forms | Upload size limit, language validation, supported extension allowlist plus narrow WebM MIME fallback |
+| Multipart uploads | Disk exhaustion, unsupported inputs, malformed forms | Upload and active-job limits, language validation, extension allowlist plus narrow WebM MIME fallback |
 | Worker filesystem | Transcript/source media leakage | Per-job directories, source deletion after success/failure, TTL cleanup |
 | WhisperX/pyannote models | Third-party checkpoint execution/trust | Diarization token and model terms documented as trusted-model boundary |
 | Client-facing errors | Internal path or stack trace disclosure | Consistent JSON errors with generic messages |
@@ -21,6 +21,7 @@ This project is a local transcription launcher plus an optional LAN worker API. 
 - Token comparison uses constant-time comparison.
 - No CORS middleware is added; the homepage proxy should provide same-origin access.
 - File uploads are limited by configurable byte count, defaulting to 10 GB.
+- Queued plus running jobs are capped by `TRANSCRIBE_MAX_PENDING_JOBS`; excess requests receive HTTP 429 before job storage.
 - Upload filenames are not used for storage paths; the server stores each upload with the UUID job ID as its stem inside the UUID job directory.
 - Uploads are accepted by supported CLI extension. WebM uploads with a supported WebM MIME type are stored as `.webm` when the filename suffix is missing or unsupported.
 - Supported languages are limited to `auto`, `en`, and `es`.
@@ -28,6 +29,7 @@ This project is a local transcription launcher plus an optional LAN worker API. 
 - Client errors do not include raw stack traces, local paths, process IDs, or full WhisperX logs.
 - Uploaded source media is deleted in a `finally` block after each job.
 - Completed artifacts are retained only until the configured TTL.
+- Job status metadata is atomically persisted. Completed and failed jobs remain queryable after restart; interrupted jobs become failed and their source upload is removed.
 - Stale UUID-shaped job directories older than the TTL are cleaned after restarts.
 - The Windows launcher checks for a token and required Python modules before starting.
 
@@ -68,9 +70,9 @@ The worker speaks plain HTTP on the LAN. If the LAN is not trusted, put the work
 
 - The bearer token is sufficient to upload files and retrieve transcripts. Anyone with the token and network access can use the worker.
 - Local administrators can inspect process environments and worker job artifacts.
-- Large uploads still consume disk and CPU/GPU resources. Keep `TRANSCRIBE_MAX_WORKERS` low and set `TRANSCRIBE_MAX_UPLOAD_BYTES` to the smallest practical value.
+- Large uploads still consume network and temporary multipart resources before admission completes. Keep worker, pending-job, and upload limits low.
 - WhisperX and diarization dependencies load third-party model artifacts. Treat those dependencies and model sources as trusted code.
-- Job state is in memory. Restarting the worker drops status knowledge for existing jobs, though old job directories are still cleaned by TTL.
+- Warm VRAM mode runs native ML code inside the API process. A native crash can terminate the worker, so cold subprocess mode remains the safer default.
 
 ## Security Review Checklist
 

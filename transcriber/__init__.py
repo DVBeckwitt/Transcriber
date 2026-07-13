@@ -1,2 +1,1 @@
 """WhisperX transcription launcher package."""
-

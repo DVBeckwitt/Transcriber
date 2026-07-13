@@ -37,14 +37,14 @@ Use the same virtual environment for WhisperX, PyTorch, and the worker server ex
 If WhisperX is already installed in `%USERPROFILE%\.venv`:
 
 ```powershell
-cd "C:\Users\Kenpo\Nextcloud\Git Projects\Transcriber"
+cd "<repo>"
 .\install_transcriber_server.ps1 -VenvPath "$env:USERPROFILE\.venv"
 ```
 
 If you want a separate worker venv:
 
 ```powershell
-cd "C:\Users\Kenpo\Nextcloud\Git Projects\Transcriber"
+cd "<repo>"
 .\install_transcriber_server.ps1
 ```
 
@@ -86,19 +86,20 @@ Useful optional values:
 | --- | --- | --- |
 | `TRANSCRIBE_MAX_UPLOAD_BYTES` | `10737418240` | Upload limit in bytes, default 10 GB |
 | `TRANSCRIBE_MAX_WORKERS` | `1` | Concurrent background transcription jobs |
+| `TRANSCRIBE_MAX_PENDING_JOBS` | `2 × max workers` | Maximum queued plus running jobs; excess uploads receive HTTP 429 |
 | `TRANSCRIBE_JOB_TTL_SECONDS` | `86400` | Completed job retention, default 24 hours |
 | `TRANSCRIBE_DEVICE` | `cuda` | WhisperX device, for example `cuda` or `cpu` |
 | `TRANSCRIBE_COMPUTE_TYPE` | `float16` | WhisperX compute type: `float16`, `float32`, or `int8` |
-| `TRANSCRIBE_WARM_VRAM` | `false` | Keep compatible WhisperX ASR, alignment, and diarization models loaded between jobs; warm model use is serialized in process |
+| `TRANSCRIBE_WARM_VRAM` | `false` | Reuse compatible models in process; requires `TRANSCRIBE_MAX_WORKERS=1` |
 
-Current scripts also accept equivalent CLI args such as `--host`, `--port`, `--work-dir`, `--warm-vram`, and `--no-warm-vram`.
+Equivalent CLI args include `--host`, `--port`, `--work-dir`, `--max-pending-jobs`, `--warm-vram`, and `--no-warm-vram`.
 
 ## Start The Worker
 
 Foreground start:
 
 ```powershell
-cd "C:\Users\Kenpo\Nextcloud\Git Projects\Transcriber"
+cd "<repo>"
 .\run_transcriber_server.bat --host 0.0.0.0 --port 8092
 ```
 
@@ -170,7 +171,9 @@ Success:
 {
   "status": "ok",
   "maxUploadBytes": 10737418240,
-  "maxWorkers": 1
+  "maxWorkers": 1,
+  "activeJobs": 0,
+  "maxPendingJobs": 2
 }
 ```
 
@@ -222,6 +225,8 @@ GET /api/transcriptions/{jobId}/transcript.srt
 
 Downloads are only available for `succeeded` jobs.
 
+When queued plus running jobs reach `TRANSCRIBE_MAX_PENDING_JOBS`, new uploads receive HTTP 429 with error code `SERVER_BUSY`.
+
 ## Error Format
 
 All client-facing errors use:
@@ -248,14 +253,17 @@ The worker intentionally avoids returning raw stack traces, local file paths, pr
 ## Runtime Behavior
 
 - Uploads are copied into per-job directories under `TRANSCRIBE_WORK_DIR`.
+- Run one server process per work directory; admission counters and state writes are not coordinated across processes.
 - The uploaded source file is deleted after success or failure.
 - Transcript artifacts stay in the job directory until TTL cleanup removes old jobs.
+- Job metadata is written atomically to each job directory. Completed and failed status URLs are restored after restart.
+- Jobs interrupted by a restart are restored as failed with error code `WORKER_RESTARTED`; their uploaded source is deleted.
 - Cleanup runs opportunistically when API requests arrive.
 - The server also removes stale UUID-shaped job directories older than the TTL after restarts.
 - Jobs invoke the existing CLI-equivalent internals with quality mode, selected language, configurable `device` and `compute_type`, and hidden rendered speaker labels.
 - CUDA jobs use the shared CLI cleanup path. By default, warm model caches are cleared and GPU cache flushing runs after transcription and Spanish post-translation attempts, including error paths.
-- Warm VRAM mode is opt-in with `TRANSCRIBE_WARM_VRAM=true` or `--warm-vram`. It can speed up repeated jobs by retaining compatible WhisperX models in process memory, at the cost of keeping VRAM allocated until the process exits or a cold run clears caches. Warm model use is serialized inside the worker process to avoid concurrent reuse of cached model instances.
-- The worker process keeps job state in memory. After a process restart, old status URLs are not restored, but stale directories are still cleaned by TTL.
+- Cold mode, the default, runs each transcription in a subprocess so native failures do not normally terminate the API process.
+- Warm VRAM mode runs transcription inside the API process so compatible models persist between jobs. It requires one worker and trades subprocess crash isolation for lower repeated-job startup cost.
 
 ## Validation Checklist
 
@@ -315,6 +323,7 @@ Likely causes:
 - Unsupported WebM MIME type when the filename has no supported suffix
 - `language` is not `auto`, `en`, or `es`
 - Upload exceeds `TRANSCRIBE_MAX_UPLOAD_BYTES`
+- The active queue has reached `TRANSCRIBE_MAX_PENDING_JOBS` (`SERVER_BUSY`)
 - Missing multipart `file` field
 
 ### No transcript download

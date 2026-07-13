@@ -1,33 +1,139 @@
+"""WhisperX model execution, transcription orchestration, and CLI entry point."""
+
 from __future__ import annotations
 
-import argparse
 import contextlib
-import functools
 import gc
 import hashlib
 import importlib
 import inspect
-import math
 import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
-import textwrap
 import threading
 import time
-import subprocess
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, TypeVar
 
-
-MEDIA_FILTER = (
-    "Audio/Video",
-    "*.wav *.mp3 *.m4a *.flac *.aac *.ogg *.opus *.wma *.mp4 *.mov *.mkv *.webm *.weba",
+from . import translation as _translation
+from .config import (  # noqa: F401 - compatibility re-exports
+    DEFAULT_POLL_INTERVAL,
+    DEFAULT_SETTLE_SECONDS,
+    DEFAULT_STALE_LOCK_SECONDS,
+    DEFAULT_WATCH_DIR,
+    LEGACY_ALIASES,
+    MEDIA_FILTER,
+    MODE_PRESETS,
+    SPANISH_TRANSLATION_MODEL,
+    TRANSLATION_BATCH_SIZE,
+    TRANSLATION_CONTEXT_WINDOW,
+    TRANSLATION_LENGTH_PENALTY,
+    TRANSLATION_MARKER_END,
+    TRANSLATION_MARKER_START,
+    TRANSLATION_MAX_NEW_TOKENS,
+    TRANSLATION_NO_REPEAT_NGRAM_SIZE,
+    TRANSLATION_NUM_BEAMS,
+    LegacyOptions,
+    ModePreset,
+    RunConfig,
+    build_asr_prompt,
+    build_config,
+    load_glossary_file,
+    load_text_lines_file,
+    looks_like_glossary_file,
+    parse_args,
+    parse_glossary_entries,
+    parse_legacy,
+    parse_temperature_schedule,
+    pick_media_file,
+    prompt_choice,
+    prompt_input_path,
+    prompt_language,
+    prompt_mode,
+    resolve_input_path,
 )
+from .subtitles import (  # noqa: F401 - compatibility re-exports
+    DEFAULT_HIGH_NO_SPEECH_PROB,
+    DEFAULT_LOW_CONFIDENCE_LOGPROB,
+    DEFAULT_LOW_CONFIDENCE_WORD_PROB,
+    DEFAULT_MIN_SPEAKER_TURN_MS,
+    DEFAULT_MIN_SPEAKER_TURN_TOKENS,
+    LEGACY_LOW_CONFIDENCE_MARKER,
+    LOW_CONFIDENCE_MARKER_NOISE_HINTS,
+    LOW_CONFIDENCE_MARKER_NOISE_WORDS,
+    LOW_CONFIDENCE_MARKER_RE,
+    LOW_CONFIDENCE_PLACEHOLDER,
+    SUBTITLE_MAX_CHARS_PER_LINE,
+    SUBTITLE_MAX_DURATION_SECONDS,
+    SUBTITLE_MAX_LINES,
+    SUBTITLE_PREFERRED_BREAK_CHARS,
+    SUBTITLE_TARGET_CPS,
+    SRTCue,
+    TimedToken,
+    apply_confidence_cleanup,
+    build_segment_fallback_cues,
+    build_srt_cues_from_result,
+    cue_candidate_is_valid,
+    extract_timed_tokens,
+    finalize_timed_cue,
+    format_cue_text,
+    format_token_text,
+    ms_to_timestamp,
+    normalize_speaker_label,
+    normalize_subtitle_whitespace,
+    parse_srt_cues,
+    probability_value,
+    reading_speed_cps,
+    render_low_confidence_markup,
+    render_srt_cues,
+    seconds_to_ms,
+    segment_is_low_confidence,
+    segment_to_timed_tokens,
+    should_soft_break,
+    smooth_timed_tokens,
+    speaker_prefix,
+    split_cue_for_subtitles,
+    split_speaker_prefix,
+    split_text_into_chunks,
+    strip_low_confidence_marker_noise,
+    timestamp_to_ms,
+    token_low_confidence_marker,
+    word_is_low_confidence,
+    wrap_subtitle_lines,
+    wrap_subtitle_lines_exact,
+    write_direct_srt_from_result,
+)
+from .translation import (  # noqa: F401 - compatibility re-exports
+    TranslationCue,
+    _build_translation_cues,
+    _render_translated_cues,
+    _resolve_translation_texts,
+    _translate_with_settings,
+    _translation_glossary,
+    apply_glossary_placeholders,
+    build_translation_prompt,
+    chunked_text,
+    extract_between_markers,
+    load_spanish_to_english_translator,
+    load_translation_glossary,
+    log_translation_prompt,
+    replace_glossary_placeholders,
+    translation_context_for_cue,
+)
+from .utils import (  # noqa: F401 - compatibility re-exports
+    LOG_TAIL_READ_CHARS,
+    project_dir,
+    read_text_tail,
+    utc_now_iso,
+)
+
 MEDIA_EXTENSIONS = {
     ".wav",
     ".mp3",
@@ -46,65 +152,16 @@ MEDIA_EXTENSIONS = {
 
 LOG_DIR_NAME = "logs"
 WATCHER_LOG_NAME = "transcriber-watcher.log"
-DEFAULT_POLL_INTERVAL = 2.0
-DEFAULT_SETTLE_SECONDS = 5.0
-DEFAULT_WATCH_DIR = Path.home() / "OneDrive" / "recordings"
 WATCH_RETRY_COOLDOWN_SECONDS = 300.0
 FALLBACK_TEMP_DIR_NAME = ".tmp_transcriber_temp"
 LOCK_SUFFIX = ".transcribing.lock"
-DEFAULT_STALE_LOCK_SECONDS = 12 * 60 * 60
 AUDIO_PREPROCESS_TIMEOUT_SECONDS = 30 * 60
 SUBPROCESS_ERROR_DETAIL_LIMIT = 500
-LOG_TAIL_READ_CHARS = 256 * 1024
 FFMPEG_PATH_ENV_VAR = "TRANSCRIBE_FFMPEG"
 
-SUBTITLE_MAX_LINES = 2
-SUBTITLE_MAX_CHARS_PER_LINE = 42
-SUBTITLE_MAX_DURATION_SECONDS = 6.0
-SUBTITLE_TARGET_CPS = 17.0
-SUBTITLE_PREFERRED_BREAK_CHARS = ".?!,:;"
-
-SPANISH_TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-es-en"
-TRANSLATION_CONTEXT_WINDOW = 2
-TRANSLATION_NUM_BEAMS = 4
-TRANSLATION_LENGTH_PENALTY = 1.0
-TRANSLATION_NO_REPEAT_NGRAM_SIZE = 3
-TRANSLATION_MARKER_START = "__CUR_START__"
-TRANSLATION_MARKER_END = "__CUR_END__"
-LEGACY_LOW_CONFIDENCE_MARKER = "UNC" + "ERTAIN"
-LOW_CONFIDENCE_MARKER_RE = re.compile(
-    rf"__(?:LOWCONF|{LEGACY_LOW_CONFIDENCE_MARKER})(?:_(\d+))?__(.*?)__(?:LOWCONF|{LEGACY_LOW_CONFIDENCE_MARKER})_END__",
-    re.DOTALL,
-)
-LOW_CONFIDENCE_MARKER_NOISE_HINTS = (
-    "unc" + "ert",
-    "cerain",
-    "ciert",
-    "certain",
-    "lowconf",
-    "end",
-)
-LOW_CONFIDENCE_MARKER_NOISE_WORDS = {
-    "unc" + "ertain",
-    "uncerain",
-    "unc" + "ertaint",
-    "uncierta",
-    "certain",
-    "certaint",
-    "cierta",
-    "ccertain",
-    "end",
-    "un",
-}
-
-DEFAULT_MIN_SPEAKER_TURN_MS = 900
-DEFAULT_MIN_SPEAKER_TURN_TOKENS = 2
-DEFAULT_LOW_CONFIDENCE_LOGPROB = -1.0
-DEFAULT_HIGH_NO_SPEECH_PROB = 0.6
-DEFAULT_LOW_CONFIDENCE_WORD_PROB = 0.10
-LOW_CONFIDENCE_PLACEHOLDER = "—"
 
 Reporter = Callable[[str], None]
+ModelT = TypeVar("ModelT")
 
 _WARM_ASR_MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
 _WARM_ALIGN_MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
@@ -113,57 +170,9 @@ _WARM_MODEL_CACHE_LOCK = threading.RLock()
 
 
 @dataclass
-class LegacyOptions:
-    language: str | None = None
-    language_locked: bool = False
-    mode: str | None = None
-    mode_locked: bool = False
-    model: str | None = None
-    model_locked: bool = False
-
-
-@dataclass
-class RunConfig:
-    language: str
-    translate_to_english: bool
-    mode: str
-    model: str
-    batch_size: int
-    beam_size: int
-    patience: float
-    temperature: float
-    temperature_schedule: tuple[float, ...]
-    best_of: int | None
-    compression_ratio_threshold: float | None
-    logprob_threshold: float | None
-    no_speech_threshold: float | None
-    condition_on_previous_text: bool
-    diarize: bool
-    diarize_smoothing: bool
-    min_speaker_turn_ms: int
-    min_speaker_turn_tokens: int
-    include_speaker_labels: bool
-    confidence_cleanup: bool
-    confidence_cleanup_mode: str
-    low_confidence_logprob: float
-    high_no_speech_prob: float
-    low_confidence_word_prob: float
-    device: str
-    compute_type: str
-    translation_context_window: int
-    translation_batch_size: int
-    translation_num_beams: int
-    translation_max_new_tokens: int
-    translation_no_repeat_ngram_size: int
-    glossary: dict[str, str]
-    glossary_path: str | None
-    asr_prompt: str | None
-    warm_vram: bool
-    dry_run: bool
-
-
-@dataclass
 class OutputPaths:
+    """Filesystem locations produced for one input recording."""
+
     output_dir: Path
     srt_path: Path
     llm_path: Path
@@ -172,29 +181,35 @@ class OutputPaths:
 
 
 @dataclass
-class SRTCue:
-    index: int
-    start_ms: int
-    end_ms: int
-    text: str
-
-
-@dataclass
-class TimedToken:
-    text: str
-    start_ms: int
-    end_ms: int
-    speaker: str = ""
-    low_confidence: bool = False
-    confidence: float | None = None
-
-
-@dataclass
 class PendingWatchFile:
     size: int
     mtime_ns: int
     stable_since: float
     last_attempt_at: float | None = None
+
+    def update_signature(self, size: int, mtime_ns: int, now: float) -> bool:
+        if self.size == size and self.mtime_ns == mtime_ns:
+            return False
+        self.size = size
+        self.mtime_ns = mtime_ns
+        self.stable_since = now
+        self.last_attempt_at = None
+        return True
+
+    def is_ready(self, now: float, settle_seconds: float) -> bool:
+        if now - self.stable_since < settle_seconds:
+            return False
+        return (
+            self.last_attempt_at is None
+            or now - self.last_attempt_at >= WATCH_RETRY_COOLDOWN_SECONDS
+        )
+
+
+@dataclass(frozen=True)
+class TranscriptionAttemptResult:
+    return_code: int
+    detected_language: str | None
+    fell_back_from_diarization: bool
 
 
 DIARIZATION_FALLBACK_PATTERNS = (
@@ -209,274 +224,30 @@ DIARIZATION_FALLBACK_PATTERNS = (
 )
 
 
-def project_dir() -> Path:
-    return Path(__file__).resolve().parents[1]
+# Reporting and model lifecycle
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def report_lines(report: Reporter, *lines: str) -> None:
+    for line in lines:
+        report(line)
 
 
-def timestamp_to_ms(value: str) -> int:
-    hours, minutes, rest = value.split(":")
-    seconds, millis = rest.split(",")
-    return (((int(hours) * 60) + int(minutes)) * 60 + int(seconds)) * 1000 + int(millis)
+def report_block(report: Reporter, *lines: str) -> None:
+    report_lines(report, "", *lines, "")
 
 
-def ms_to_timestamp(total_ms: int) -> str:
-    total_ms = max(0, int(total_ms))
-    hours, remainder = divmod(total_ms, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    seconds, millis = divmod(remainder, 1_000)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
-
-
-def normalize_subtitle_whitespace(text: str) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"\s+([,.;:?!])", r"\1", text)
-    text = re.sub(r'([("])\s+', r"\1", text)
-    text = re.sub(r'\s+([)")])', r"\1", text)
-    return text
-
-
-def split_speaker_prefix(text: str) -> tuple[str, str]:
-    match = re.match(r"^([A-Z][A-Z0-9_ ]{1,31}:\s+)(.+)$", text.strip())
-    if not match:
-        return "", normalize_subtitle_whitespace(text)
-    return match.group(1), normalize_subtitle_whitespace(match.group(2))
-
-
-def normalize_speaker_label(label: str | None) -> str:
-    if not label:
-        return ""
-    return normalize_subtitle_whitespace(str(label)).rstrip(":")
-
-
-def speaker_prefix(label: str | None) -> str:
-    cleaned = normalize_speaker_label(label)
-    return f"{cleaned}: " if cleaned else ""
-
-
-def parse_srt_cues(srt_text: str) -> list[SRTCue]:
-    blocks = re.split(r"\n\s*\n", srt_text.strip())
-    cues: list[SRTCue] = []
-    for block in blocks:
-        lines = [line.rstrip() for line in block.splitlines() if line.strip()]
-        if len(lines) < 2:
-            continue
-        line_index = 0
-        if lines[0].strip().isdigit():
-            line_index = 1
-        if line_index >= len(lines) or "-->" not in lines[line_index]:
-            continue
-        start_raw, end_raw = [part.strip() for part in lines[line_index].split("-->", 1)]
-        text = " ".join(line.strip() for line in lines[line_index + 1 :] if line.strip())
-        if not text:
-            continue
-        cues.append(
-            SRTCue(
-                index=len(cues) + 1,
-                start_ms=timestamp_to_ms(start_raw),
-                end_ms=timestamp_to_ms(end_raw),
-                text=text,
-            )
-        )
-    return cues
-
-
-def render_srt_cues(cues: Sequence[SRTCue]) -> str:
-    rendered: list[str] = []
-    for idx, cue in enumerate(cues, start=1):
-        rendered.append(str(idx))
-        rendered.append(f"{ms_to_timestamp(cue.start_ms)} --> {ms_to_timestamp(cue.end_ms)}")
-        rendered.append(cue.text)
-        rendered.append("")
-    return "\n".join(rendered).rstrip() + "\n"
-
-
-def wrap_subtitle_lines(
-    text: str,
-    max_chars_per_line: int = SUBTITLE_MAX_CHARS_PER_LINE,
-    max_lines: int = SUBTITLE_MAX_LINES,
-) -> str:
-    normalized = normalize_subtitle_whitespace(text)
-    if not normalized:
-        return normalized
-
-    wrapped = textwrap.wrap(
-        normalized,
-        width=max_chars_per_line,
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
-    if len(wrapped) <= max_lines:
-        return "\n".join(wrapped)
-
-    wrapped = textwrap.wrap(
-        normalized,
-        width=max_chars_per_line,
-        break_long_words=True,
-        break_on_hyphens=False,
-    )
-    if len(wrapped) <= max_lines:
-        return "\n".join(wrapped)
-
-    kept = wrapped[: max_lines - 1]
-    remainder = normalize_subtitle_whitespace(" ".join(wrapped[max_lines - 1 :]))
-    kept.append(remainder)
-    return "\n".join(kept)
-
-
-def wrap_subtitle_lines_exact(
-    text: str,
-    max_chars_per_line: int = SUBTITLE_MAX_CHARS_PER_LINE,
-    max_lines: int = SUBTITLE_MAX_LINES,
-) -> list[str]:
-    normalized = normalize_subtitle_whitespace(text)
-    if not normalized:
-        return []
-
-    for break_long_words in (False, True):
-        wrapped = textwrap.wrap(
-            normalized,
-            width=max_chars_per_line,
-            break_long_words=break_long_words,
-            break_on_hyphens=False,
-        )
-        if wrapped and len(wrapped) <= max_lines and max(len(line) for line in wrapped) <= max_chars_per_line:
-            return wrapped
-    return []
-
-
-def split_text_into_chunks(text: str, soft_limit: int, hard_limit: int) -> list[str]:
-    normalized = normalize_subtitle_whitespace(text)
-    if not normalized:
-        return []
-
-    words = normalized.split()
-    if not words:
-        return []
-
-    chunks: list[str] = []
-    current: list[str] = []
-
-    def flush_current() -> None:
-        if current:
-            chunks.append(" ".join(current))
-            current.clear()
-
-    for idx, word in enumerate(words):
-        tentative_words = [*current, word]
-        tentative = " ".join(tentative_words)
-
-        if current and len(tentative) > hard_limit:
-            flush_current()
-            current.append(word)
-            continue
-
-        current.append(word)
-        current_text = " ".join(current)
-        next_word = words[idx + 1] if idx + 1 < len(words) else ""
-        next_tentative = (current_text + " " + next_word).strip() if next_word else current_text
-
-        if len(current_text) >= soft_limit and word.endswith(tuple(SUBTITLE_PREFERRED_BREAK_CHARS)):
-            flush_current()
-            continue
-
-        if next_word and len(next_tentative) > hard_limit:
-            flush_current()
-
-    flush_current()
-
-    merged: list[str] = []
-    for chunk in chunks:
-        if merged and len(chunk) < max(12, soft_limit // 3) and len(merged[-1]) + 1 + len(chunk) <= hard_limit:
-            merged[-1] = f"{merged[-1]} {chunk}"
-        else:
-            merged.append(chunk)
-
-    while len(merged) > 1 and len(merged[-1]) < max(12, hard_limit // 5):
-        combined = f"{merged[-2]} {merged[-1]}"
-        if len(combined) > hard_limit:
-            break
-        merged[-2] = combined
-        merged.pop()
-    return merged
-
-
-def split_cue_for_subtitles(cue: SRTCue) -> list[SRTCue]:
-    cleaned_text = normalize_subtitle_whitespace(cue.text)
-    if not cleaned_text:
-        return []
-
-    prefix, content = split_speaker_prefix(cleaned_text)
-    base_hard_limit = SUBTITLE_MAX_LINES * SUBTITLE_MAX_CHARS_PER_LINE
-    hard_limit = max(SUBTITLE_MAX_CHARS_PER_LINE, base_hard_limit - len(prefix))
-    duration_ms = max(1, cue.end_ms - cue.start_ms)
-    duration_seconds = duration_ms / 1000.0
-    char_count = max(1, len(content))
-
-    segment_count = max(
-        1,
-        math.ceil(duration_seconds / SUBTITLE_MAX_DURATION_SECONDS),
-        math.ceil(char_count / hard_limit),
-        math.ceil(char_count / (SUBTITLE_MAX_DURATION_SECONDS * SUBTITLE_TARGET_CPS)),
-    )
-    soft_limit = max(SUBTITLE_MAX_CHARS_PER_LINE, math.ceil(char_count / segment_count))
-    chunks = split_text_into_chunks(content, soft_limit=min(soft_limit, hard_limit), hard_limit=hard_limit)
-
-    if not chunks:
-        return []
-
-    weighted_lengths = [max(1, len(chunk)) for chunk in chunks]
-    total_weight = sum(weighted_lengths)
-    split_points = [cue.start_ms]
-    running = 0
-    for weight in weighted_lengths[:-1]:
-        running += weight
-        split_points.append(cue.start_ms + round(duration_ms * running / total_weight))
-    split_points.append(cue.end_ms)
-
-    new_cues: list[SRTCue] = []
-    for idx, chunk in enumerate(chunks):
-        start_ms = split_points[idx]
-        end_ms = split_points[idx + 1]
-        wrapped_text = wrap_subtitle_lines(prefix + chunk)
-        new_cues.append(SRTCue(index=idx + 1, start_ms=start_ms, end_ms=end_ms, text=wrapped_text))
-    return new_cues
-
-
-def seconds_to_ms(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return max(0, int(round(float(value) * 1000.0)))
-    except (TypeError, ValueError):
-        return None
-
-
-def probability_value(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        prob = float(value)
-    except (TypeError, ValueError):
-        return None
-    if prob < 0.0:
-        return 0.0
-    if prob > 1.0:
-        return 1.0
-    return prob
-
-
-def call_with_supported_kwargs(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+def call_with_supported_kwargs(
+    func: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
     try:
         signature = inspect.signature(func)
     except (TypeError, ValueError):
         return func(*args, **kwargs)
 
     parameters = signature.parameters
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    ):
         return func(*args, **kwargs)
 
     filtered = {key: value for key, value in kwargs.items() if key in parameters}
@@ -489,7 +260,9 @@ def resolve_whisperx_symbol(whisperx_module: Any, symbol_name: str) -> Any:
 
     for module_name in ("diarize",):
         with contextlib.suppress(Exception):
-            module = importlib.import_module(f"{whisperx_module.__name__}.{module_name}")
+            module = importlib.import_module(
+                f"{whisperx_module.__name__}.{module_name}"
+            )
             if hasattr(module, symbol_name):
                 return getattr(module, symbol_name)
 
@@ -544,25 +317,39 @@ def cleanup_after_transcription_run(cfg: RunConfig) -> None:
     flush_gpu_memory(cfg.device)
 
 
+def load_cached_model(
+    cache: dict[tuple[Any, ...], ModelT],
+    key: tuple[Any, ...],
+    loader: Callable[[], ModelT],
+    *,
+    warm: bool,
+) -> ModelT:
+    if not warm:
+        return loader()
+
+    with _WARM_MODEL_CACHE_LOCK:
+        cached = cache.get(key)
+        if cached is None:
+            cached = loader()
+            cache[key] = cached
+        return cached
+
+
 def load_whisperx_asr_model(
     whisperx_module: Any,
     cfg: RunConfig,
     whisper_task: str,
     whisper_language: str | None,
 ) -> Any:
-    asr_options = {"beam_size": cfg.beam_size, "patience": cfg.patience}
-    load_model_kwargs: dict[str, Any] = {
+    load_kwargs: dict[str, Any] = {
         "device": cfg.device,
         "compute_type": cfg.compute_type,
         "task": whisper_task,
-        "asr_options": asr_options,
+        "asr_options": {"beam_size": cfg.beam_size, "patience": cfg.patience},
         "vad_method": "silero",
     }
     if whisper_language:
-        load_model_kwargs["language"] = whisper_language
-
-    if not cfg.warm_vram:
-        return call_with_supported_kwargs(whisperx_module.load_model, cfg.model, **load_model_kwargs)
+        load_kwargs["language"] = whisper_language
 
     cache_key = (
         cfg.model,
@@ -573,744 +360,53 @@ def load_whisperx_asr_model(
         cfg.beam_size,
         cfg.patience,
     )
-    with _WARM_MODEL_CACHE_LOCK:
-        model = _WARM_ASR_MODEL_CACHE.get(cache_key)
-        if model is None:
-            model = call_with_supported_kwargs(whisperx_module.load_model, cfg.model, **load_model_kwargs)
-            _WARM_ASR_MODEL_CACHE[cache_key] = model
-        return model
+    return load_cached_model(
+        _WARM_ASR_MODEL_CACHE,
+        cache_key,
+        lambda: call_with_supported_kwargs(
+            whisperx_module.load_model, cfg.model, **load_kwargs
+        ),
+        warm=cfg.warm_vram,
+    )
 
 
-def load_whisperx_align_model(whisperx_module: Any, cfg: RunConfig, language_code: str) -> tuple[Any, Any]:
-    if not cfg.warm_vram:
-        return call_with_supported_kwargs(
+def load_whisperx_align_model(
+    whisperx_module: Any, cfg: RunConfig, language_code: str
+) -> tuple[Any, Any]:
+    return load_cached_model(
+        _WARM_ALIGN_MODEL_CACHE,
+        (language_code, cfg.device),
+        lambda: call_with_supported_kwargs(
             whisperx_module.load_align_model,
             language_code=language_code,
             device=cfg.device,
-        )
-
-    cache_key = (language_code, cfg.device)
-    with _WARM_MODEL_CACHE_LOCK:
-        cached = _WARM_ALIGN_MODEL_CACHE.get(cache_key)
-        if cached is None:
-            cached = call_with_supported_kwargs(
-                whisperx_module.load_align_model,
-                language_code=language_code,
-                device=cfg.device,
-            )
-            _WARM_ALIGN_MODEL_CACHE[cache_key] = cached
-        return cached
+        ),
+        warm=cfg.warm_vram,
+    )
 
 
 def hf_token_cache_digest(hf_token: str | None) -> str:
+    """Create a stable cache key without retaining the raw access token."""
     return hashlib.sha256((hf_token or "").encode("utf-8")).hexdigest()
 
 
-def load_whisperx_diarization_model(whisperx_module: Any, cfg: RunConfig, hf_token: str | None) -> Any:
-    diarization_pipeline = resolve_whisperx_symbol(whisperx_module, "DiarizationPipeline")
-    if not cfg.warm_vram:
-        return call_with_supported_kwargs(
-            diarization_pipeline,
+def load_whisperx_diarization_model(
+    whisperx_module: Any, cfg: RunConfig, hf_token: str | None
+) -> Any:
+    pipeline = resolve_whisperx_symbol(whisperx_module, "DiarizationPipeline")
+    return load_cached_model(
+        _WARM_DIARIZATION_MODEL_CACHE,
+        (cfg.device, hf_token_cache_digest(hf_token)),
+        lambda: call_with_supported_kwargs(
+            pipeline,
             use_auth_token=hf_token or "",
             device=cfg.device,
-        )
-
-    cache_key = (cfg.device, hf_token_cache_digest(hf_token))
-    with _WARM_MODEL_CACHE_LOCK:
-        cached = _WARM_DIARIZATION_MODEL_CACHE.get(cache_key)
-        if cached is None:
-            cached = call_with_supported_kwargs(
-                diarization_pipeline,
-                use_auth_token=hf_token or "",
-                device=cfg.device,
-            )
-            _WARM_DIARIZATION_MODEL_CACHE[cache_key] = cached
-        return cached
-
-
-def segment_is_low_confidence(
-    segment: dict[str, Any],
-    *,
-    low_logprob: float,
-    high_no_speech: float,
-) -> bool:
-    avg_logprob = segment.get("avg_logprob")
-    if isinstance(avg_logprob, (int, float)) and avg_logprob < low_logprob:
-        return True
-    no_speech_prob = segment.get("no_speech_prob")
-    if isinstance(no_speech_prob, (int, float)) and no_speech_prob > high_no_speech:
-        return True
-    return False
-
-
-def word_is_low_confidence(word: dict[str, Any], *, low_prob: float) -> bool:
-    for key in ("probability", "confidence", "score"):
-        value = word.get(key)
-        if isinstance(value, (int, float)) and value < low_prob:
-            return True
-    return False
-
-
-def apply_confidence_cleanup(result: dict[str, Any], cfg: RunConfig) -> None:
-    if not cfg.confidence_cleanup:
-        return
-
-    segments = result.get("segments", [])
-    if not isinstance(segments, list):
-        return
-
-    for segment in segments:
-        if not isinstance(segment, dict):
-            continue
-        seg_text = str(segment.get("text") or "")
-        seg_low = segment_is_low_confidence(
-            segment,
-            low_logprob=cfg.low_confidence_logprob,
-            high_no_speech=cfg.high_no_speech_prob,
-        )
-        if seg_low:
-            segment["_low_confidence"] = True
-
-        words = segment.get("words") or []
-        if isinstance(words, list):
-            for word in words:
-                if not isinstance(word, dict):
-                    continue
-                word_low = word_is_low_confidence(word, low_prob=cfg.low_confidence_word_prob) or seg_low
-                if not word_low:
-                    continue
-                word["_low_confidence"] = True
-
-        if seg_low:
-            segment["_low_confidence"] = True
-
-
-def segment_to_timed_tokens(segment: dict[str, Any]) -> list[TimedToken]:
-    seg_speaker = normalize_speaker_label(segment.get("speaker"))
-    seg_low_confidence = bool(segment.get("_low_confidence"))
-    words = segment.get("words") or []
-    timed_words: list[TimedToken] = []
-
-    for raw_word in words:
-        if not isinstance(raw_word, dict):
-            continue
-        word_text = normalize_subtitle_whitespace(str(raw_word.get("word") or ""))
-        start_ms = seconds_to_ms(raw_word.get("start"))
-        end_ms = seconds_to_ms(raw_word.get("end"))
-        if not word_text or start_ms is None or end_ms is None:
-            continue
-        end_ms = max(end_ms, start_ms + 1)
-        word_speaker = normalize_speaker_label(raw_word.get("speaker") or seg_speaker)
-        timed_words.append(
-            TimedToken(
-                text=word_text,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                speaker=word_speaker,
-                low_confidence=bool(raw_word.get("_low_confidence")) or seg_low_confidence,
-                confidence=probability_value(raw_word.get("probability") or raw_word.get("score")),
-            )
-        )
-
-    if timed_words:
-        return timed_words
-
-    seg_text = normalize_subtitle_whitespace(str(segment.get("text") or ""))
-    seg_start_ms = seconds_to_ms(segment.get("start"))
-    seg_end_ms = seconds_to_ms(segment.get("end"))
-    if not seg_text or seg_start_ms is None or seg_end_ms is None or seg_end_ms <= seg_start_ms:
-        return []
-
-    raw_words = seg_text.split()
-    if not raw_words:
-        return []
-
-    total_weight = sum(max(1, len(word)) for word in raw_words)
-    duration_ms = seg_end_ms - seg_start_ms
-    cursor_ms = seg_start_ms
-    distributed: list[TimedToken] = []
-    running_weight = 0
-    for idx, word in enumerate(raw_words):
-        running_weight += max(1, len(word))
-        if idx == len(raw_words) - 1:
-            next_ms = seg_end_ms
-        else:
-            next_ms = seg_start_ms + round(duration_ms * running_weight / total_weight)
-        next_ms = max(next_ms, cursor_ms + 1)
-        distributed.append(
-            TimedToken(
-                text=word,
-                start_ms=cursor_ms,
-                end_ms=next_ms,
-                speaker=seg_speaker,
-                low_confidence=seg_low_confidence,
-                confidence=probability_value(segment.get("probability") or segment.get("score")),
-            )
-        )
-        cursor_ms = next_ms
-    return distributed
-
-
-def token_low_confidence_marker(token: TimedToken) -> str:
-    if token.confidence is None:
-        return f"__LOWCONF__{token.text}__LOWCONF_END__"
-    percent = max(0, min(100, int(round(float(token.confidence) * 100.0))))
-    return f"__LOWCONF_{percent}__{token.text}__LOWCONF_END__"
-
-
-def format_token_text(token: TimedToken, style: str = "plain") -> str:
-    if not token.text:
-        return ""
-    if style == "marker" and token.low_confidence:
-        return token_low_confidence_marker(token)
-    return token.text
-
-
-def format_cue_text(prefix: str, tokens: Sequence[TimedToken], style: str = "plain") -> str:
-    body = normalize_subtitle_whitespace(
-        " ".join(format_token_text(token, style=style) for token in tokens if token.text)
-    )
-    return normalize_subtitle_whitespace(f"{prefix}{body}") if prefix else body
-
-
-def render_low_confidence_markup(text: str, style: str) -> str:
-    if not text:
-        return text
-
-    def replace(match: re.Match[str]) -> str:
-        return LOW_CONFIDENCE_PLACEHOLDER
-
-    updated = LOW_CONFIDENCE_MARKER_RE.sub(replace, text)
-    if style == "srt":
-        updated = strip_low_confidence_marker_noise(updated)
-        return normalize_subtitle_whitespace(updated)
-    return updated
-
-
-def strip_low_confidence_marker_noise(text: str) -> str:
-    if not text:
-        return text
-
-    def clean_token(token: str) -> str:
-        low = token.lower()
-        if not ("__" in token or ("_" in token and any(hint in low for hint in LOW_CONFIDENCE_MARKER_NOISE_HINTS))):
-            return token
-
-        parts = re.split(r"_+", token)
-        kept: list[str] = []
-        for part in parts:
-            cleaned = re.sub(r"[^a-z]+", "", part.lower())
-            if not cleaned:
-                continue
-            if cleaned.isdigit() or cleaned in LOW_CONFIDENCE_MARKER_NOISE_WORDS:
-                continue
-            kept.append(part)
-        return " ".join(kept)
-
-    cleaned = " ".join(filter(None, (clean_token(token) for token in text.split())))
-    return normalize_subtitle_whitespace(cleaned)
-
-
-def smooth_timed_tokens(
-    tokens: Sequence[TimedToken],
-    min_run_duration_ms: int = DEFAULT_MIN_SPEAKER_TURN_MS,
-    min_run_words: int = DEFAULT_MIN_SPEAKER_TURN_TOKENS,
-    low_confidence_threshold: float = DEFAULT_LOW_CONFIDENCE_WORD_PROB,
-) -> list[TimedToken]:
-    if not tokens:
-        return []
-
-    smoothed = [
-        TimedToken(
-            text=token.text,
-            start_ms=token.start_ms,
-            end_ms=token.end_ms,
-            speaker=token.speaker,
-            low_confidence=token.low_confidence,
-            confidence=token.confidence,
-        )
-        for token in tokens
-    ]
-
-    runs: list[dict[str, Any]] = []
-    current_run: list[TimedToken] = []
-    current_speaker = ""
-
-    def flush_run() -> None:
-        nonlocal current_run, current_speaker
-        if not current_run:
-            return
-        start_ms = current_run[0].start_ms
-        end_ms = current_run[-1].end_ms
-        confidences = [token.confidence for token in current_run if token.confidence is not None]
-        avg_confidence = sum(confidences) / len(confidences) if confidences else None
-        has_low_confidence = any(token.low_confidence for token in current_run)
-        runs.append(
-            {
-                "speaker": current_speaker,
-                "tokens": current_run[:],
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-                "duration_ms": max(1, end_ms - start_ms),
-                "word_count": len(current_run),
-                "avg_confidence": avg_confidence,
-                "has_low_confidence": has_low_confidence,
-            }
-        )
-        current_run = []
-        current_speaker = ""
-
-    for token in smoothed:
-        token_speaker = token.speaker
-        if not current_run:
-            current_run = [token]
-            current_speaker = token_speaker
-            continue
-        if token_speaker != current_speaker:
-            flush_run()
-            current_run = [token]
-            current_speaker = token_speaker
-            continue
-        current_run.append(token)
-    flush_run()
-
-    if len(runs) < 3:
-        return smoothed
-
-    for idx in range(1, len(runs) - 1):
-        run = runs[idx]
-        speaker = str(run["speaker"] or "")
-        prev_run = runs[idx - 1]
-        next_run = runs[idx + 1]
-        is_short = int(run["duration_ms"]) < min_run_duration_ms or int(run["word_count"]) <= min_run_words
-        low_confidence = (
-            run["avg_confidence"] is not None and float(run["avg_confidence"]) < low_confidence_threshold
-        )
-        low_confidence = low_confidence or bool(run.get("has_low_confidence"))
-        if not speaker or not (is_short or low_confidence):
-            continue
-
-        prev_speaker = str(prev_run["speaker"] or "")
-        next_speaker = str(next_run["speaker"] or "")
-        if prev_speaker and prev_speaker == next_speaker:
-            replacement = prev_speaker
-        elif prev_speaker and next_speaker:
-            prev_score = int(prev_run["duration_ms"]) + int(prev_run["word_count"]) * 250
-            next_score = int(next_run["duration_ms"]) + int(next_run["word_count"]) * 250
-            replacement = prev_speaker if prev_score >= next_score else next_speaker
-        else:
-            replacement = prev_speaker or next_speaker
-
-        if not replacement or replacement == speaker:
-            continue
-        for token in run["tokens"]:
-            token.speaker = replacement
-
-    smoothed_tokens: list[TimedToken] = []
-    for run in runs:
-        smoothed_tokens.extend(run["tokens"])
-    return smoothed_tokens
-
-
-def extract_timed_tokens(result: dict[str, Any], cfg: RunConfig | None = None) -> list[TimedToken]:
-    tokens: list[TimedToken] = []
-    for raw_segment in result.get("segments", []):
-        if not isinstance(raw_segment, dict):
-            continue
-        tokens.extend(segment_to_timed_tokens(raw_segment))
-
-    if not tokens:
-        return []
-
-    tokens.sort(key=lambda token: (token.start_ms, token.end_ms))
-    previous_start = 0
-    for token in tokens:
-        token.start_ms = max(token.start_ms, previous_start)
-        token.end_ms = max(token.end_ms, token.start_ms + 1)
-        previous_start = token.start_ms
-
-    if cfg is not None and not cfg.diarize_smoothing:
-        return tokens
-
-    min_run_ms = cfg.min_speaker_turn_ms if cfg is not None else DEFAULT_MIN_SPEAKER_TURN_MS
-    min_run_tokens = cfg.min_speaker_turn_tokens if cfg is not None else DEFAULT_MIN_SPEAKER_TURN_TOKENS
-    low_confidence_threshold = cfg.low_confidence_word_prob if cfg is not None else DEFAULT_LOW_CONFIDENCE_WORD_PROB
-    low_confidence_threshold = max(0.0, min(1.0, float(low_confidence_threshold)))
-    return smooth_timed_tokens(
-        tokens,
-        min_run_duration_ms=max(0, int(min_run_ms)),
-        min_run_words=max(0, int(min_run_tokens)),
-        low_confidence_threshold=low_confidence_threshold,
+        ),
+        warm=cfg.warm_vram,
     )
 
 
-def reading_speed_cps(text: str, duration_ms: int) -> float:
-    if duration_ms <= 0:
-        return float("inf")
-    return len(text.replace("\n", " ")) / (duration_ms / 1000.0)
-
-
-def cue_candidate_is_valid(tokens: Sequence[TimedToken], prefix: str) -> bool:
-    if not tokens:
-        return False
-
-    start_ms = tokens[0].start_ms
-    end_ms = max(tokens[-1].end_ms, start_ms + 1)
-    duration_ms = end_ms - start_ms
-    if duration_ms > int(round(SUBTITLE_MAX_DURATION_SECONDS * 1000.0)):
-        return False
-
-    display_text = format_cue_text(prefix, tokens)
-    wrapped = wrap_subtitle_lines_exact(display_text)
-    return bool(wrapped)
-
-
-def should_soft_break(tokens: Sequence[TimedToken], prefix: str) -> bool:
-    if not tokens:
-        return False
-
-    display_text = format_cue_text(prefix, tokens)
-    duration_ms = max(1, tokens[-1].end_ms - tokens[0].start_ms)
-    last_text = tokens[-1].text.strip()
-    punctuation_break = last_text.endswith(tuple(SUBTITLE_PREFERRED_BREAK_CHARS))
-    enough_text = len(display_text) >= max(26, SUBTITLE_MAX_CHARS_PER_LINE)
-    enough_time = duration_ms >= 2200
-    near_limit = duration_ms >= 4200 or reading_speed_cps(display_text, duration_ms) >= SUBTITLE_TARGET_CPS * 0.95
-    return punctuation_break and (enough_text or enough_time or near_limit)
-
-
-def finalize_timed_cue(index: int, prefix: str, tokens: Sequence[TimedToken]) -> SRTCue:
-    if not tokens:
-        raise ValueError("Cannot finalize an empty subtitle cue.")
-
-    text = format_cue_text(prefix, tokens, style="marker")
-    wrapped = wrap_subtitle_lines_exact(text)
-    if not wrapped:
-        wrapped_text = wrap_subtitle_lines(text)
-    else:
-        wrapped_text = "\n".join(wrapped)
-
-    start_ms = tokens[0].start_ms
-    end_ms = max(tokens[-1].end_ms, start_ms + 1)
-    return SRTCue(index=index, start_ms=start_ms, end_ms=end_ms, text=wrapped_text)
-
-
-def build_segment_fallback_cues(result: dict[str, Any], include_speaker_labels: bool = True) -> list[SRTCue]:
-    cues: list[SRTCue] = []
-    for raw_segment in result.get("segments", []):
-        if not isinstance(raw_segment, dict):
-            continue
-        start_ms = seconds_to_ms(raw_segment.get("start"))
-        end_ms = seconds_to_ms(raw_segment.get("end"))
-        if start_ms is None or end_ms is None or end_ms <= start_ms:
-            continue
-        text = normalize_subtitle_whitespace(str(raw_segment.get("text") or ""))
-        if not text:
-            continue
-        prefix = speaker_prefix(raw_segment.get("speaker")) if include_speaker_labels else ""
-        cues.extend(split_cue_for_subtitles(SRTCue(index=0, start_ms=start_ms, end_ms=end_ms, text=f"{prefix}{text}")))
-
-    for idx, cue in enumerate(cues, start=1):
-        cue.index = idx
-    return cues
-
-
-def build_srt_cues_from_result(result: dict[str, Any], cfg: RunConfig | None = None) -> list[SRTCue]:
-    include_speaker_labels = True if cfg is None else cfg.include_speaker_labels
-    tokens = extract_timed_tokens(result, cfg)
-    if not tokens:
-        return build_segment_fallback_cues(result, include_speaker_labels=include_speaker_labels)
-
-    cues: list[SRTCue] = []
-    current_tokens: list[TimedToken] = []
-    current_speaker = ""
-
-    def current_prefix() -> str:
-        return speaker_prefix(current_speaker) if include_speaker_labels else ""
-
-    def flush_current() -> None:
-        nonlocal current_tokens, current_speaker
-        if not current_tokens:
-            return
-        cues.append(finalize_timed_cue(len(cues) + 1, current_prefix(), current_tokens))
-        current_tokens = []
-        current_speaker = ""
-
-    for token in tokens:
-        token_speaker = normalize_speaker_label(token.speaker)
-        if not current_tokens:
-            current_tokens = [token]
-            current_speaker = token_speaker
-            continue
-
-        if token_speaker and current_speaker and token_speaker != current_speaker:
-            flush_current()
-            current_tokens = [token]
-            current_speaker = token_speaker
-            continue
-
-        candidate_tokens = [*current_tokens, token]
-        prefix = current_prefix()
-        if cue_candidate_is_valid(candidate_tokens, prefix):
-            current_tokens = candidate_tokens
-            if should_soft_break(current_tokens, prefix):
-                flush_current()
-            continue
-
-        flush_current()
-        current_tokens = [token]
-        current_speaker = token_speaker
-
-        if not cue_candidate_is_valid(current_tokens, current_prefix()):
-            flush_current()
-
-    flush_current()
-
-    if not cues:
-        return build_segment_fallback_cues(result, include_speaker_labels=include_speaker_labels)
-
-    for idx, cue in enumerate(cues, start=1):
-        cue.index = idx
-    return cues
-
-
-def write_direct_srt_from_result(result: dict[str, Any], srt_path: Path, cfg: RunConfig | None = None) -> None:
-    cues = build_srt_cues_from_result(result, cfg)
-    if not cues:
-        srt_path.write_text("", encoding="utf-8")
-        return
-    srt_path.write_text(render_srt_cues(cues), encoding="utf-8")
-
-
-def parse_glossary_entries(raw_items: Sequence[str]) -> dict[str, str]:
-    glossary: dict[str, str] = {}
-    for raw in raw_items:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        line = line.strip().strip('"').strip("'")
-        if not line:
-            continue
-        sep = None
-        for candidate in ("=>", "->", "=", "|", "\t"):
-            if candidate in line:
-                sep = candidate
-                break
-        if sep is None:
-            source = line
-            target = line
-        else:
-            source, target = line.split(sep, 1)
-            source = source.strip().strip('"').strip("'")
-            target = target.strip().strip('"').strip("'")
-            if not target:
-                target = source
-        if source:
-            glossary[source] = target
-    return glossary
-
-
-def load_glossary_file(path: Path) -> list[str]:
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return []
-    return [line for line in text.splitlines()]
-
-
-def load_translation_glossary(glossary_spec: str | None) -> dict[str, str]:
-    if glossary_spec:
-        candidates = [Path(glossary_spec).expanduser()]
-    else:
-        candidates = [project_dir() / "transcriber_glossary.txt"]
-
-    for candidate in candidates:
-        if not candidate.exists():
-            if glossary_spec:
-                return {}
-            continue
-        try:
-            raw = candidate.read_text(encoding="utf-8-sig", errors="ignore")
-        except OSError:
-            if glossary_spec:
-                return {}
-            continue
-        return parse_glossary_entries(raw.splitlines())
-    return {}
-
-
-def load_text_lines_file(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    try:
-        raw = path.read_text(encoding="utf-8-sig", errors="ignore")
-    except OSError:
-        return []
-
-    lines: list[str] = []
-    for line in raw.splitlines():
-        cleaned = normalize_subtitle_whitespace(line)
-        if cleaned and not cleaned.startswith("#"):
-            lines.append(cleaned)
-    return lines
-
-
-def looks_like_glossary_file(value: str) -> bool:
-    if any(sep in value for sep in ("=>", "->", "=", "|", "\t")):
-        return False
-    candidate = Path(value).expanduser()
-    return candidate.exists()
-
-
-def apply_glossary_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[str, str]]:
-    if not glossary or not text:
-        return text, {}
-
-    placeholder_map: dict[str, str] = {}
-    terms = sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True)
-    updated = text
-    placeholder_index = 0
-    for source, target in terms:
-        if not source:
-            continue
-        escaped = re.escape(source)
-        if re.fullmatch(r"[A-Za-z0-9_]+", source):
-            pattern = rf"\b{escaped}\b"
-        else:
-            pattern = escaped
-        if not re.search(pattern, updated):
-            continue
-        placeholder = f"__GLOSSARY_{placeholder_index}__"
-        placeholder_index += 1
-        updated = re.sub(pattern, placeholder, updated)
-        placeholder_map[placeholder] = target
-    return updated, placeholder_map
-
-
-def replace_glossary_placeholders(text: str, placeholder_map: dict[str, str]) -> str:
-    updated = text
-    for placeholder, target in placeholder_map.items():
-        updated = updated.replace(placeholder, target)
-    return updated
-
-
-def extract_between_markers(text: str, start: str, end: str) -> str | None:
-    if start not in text or end not in text:
-        return None
-    _, after_start = text.split(start, 1)
-    middle, _ = after_start.split(end, 1)
-    return middle.strip()
-
-
-def translation_context_for_cue(cues: Sequence[SRTCue], index: int, window: int) -> list[tuple[int, str]]:
-    context: list[tuple[int, str]] = []
-    for offset in range(window, 0, -1):
-        prev_index = index - offset
-        if prev_index < 0:
-            continue
-        _, prev_text = split_speaker_prefix(cues[prev_index].text)
-        prev_text = normalize_subtitle_whitespace(prev_text)
-        if prev_text:
-            context.append((-offset, prev_text))
-    for offset in range(1, window + 1):
-        next_index = index + offset
-        if next_index >= len(cues):
-            break
-        _, next_text = split_speaker_prefix(cues[next_index].text)
-        next_text = normalize_subtitle_whitespace(next_text)
-        if next_text:
-            context.append((offset, next_text))
-    return context
-
-
-def build_translation_prompt(*, model_name: str, context_window: int, glossary: dict[str, str]) -> str:
-    lines = [
-        "Translate Spanish subtitle text to natural, accurate English.",
-        f"Model: {model_name}",
-        f"Context window: {context_window}",
-        f"Preserve markers: {TRANSLATION_MARKER_START} ... {TRANSLATION_MARKER_END}",
-        "Preserve speaker labels, names, numbers, and low-confidence markers exactly.",
-        "Use surrounding context only to disambiguate the current cue.",
-        "Prefer faithful meaning over literal phrasing.",
-    ]
-    if glossary:
-        lines.append("Glossary:")
-        for source, target in glossary.items():
-            if source == target:
-                lines.append(f"- preserve: {source}")
-            else:
-                lines.append(f"- {source} => {target}")
-    else:
-        lines.append("Glossary: (none)")
-    return "\n".join(lines)
-
-
-def log_translation_prompt(log_path: Path, prompt: str) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8", errors="ignore") as log:
-        log.write("\n[transcriber] Translation prompt:\n")
-        for line in prompt.splitlines():
-            log.write(f"[transcriber] {line}\n")
-
-
-def build_asr_prompt(
-    *,
-    glossary: dict[str, str],
-    prompt_text: str | None = None,
-    prompt_file: str | None = None,
-    max_glossary_terms: int = 32,
-) -> str | None:
-    lines: list[str] = []
-
-    if prompt_file:
-        lines.extend(load_text_lines_file(Path(prompt_file).expanduser()))
-
-    if prompt_text:
-        for line in prompt_text.splitlines():
-            cleaned = normalize_subtitle_whitespace(line)
-            if cleaned:
-                lines.append(cleaned)
-
-    if glossary:
-        lines.append("Use these names, product names, and jargon exactly as written:")
-        for source, target in sorted(glossary.items(), key=lambda item: len(item[0]), reverse=True)[:max_glossary_terms]:
-            if source == target:
-                lines.append(f"- {source}")
-            else:
-                lines.append(f"- {source} (preferred spelling: {target})")
-
-    prompt = "\n".join(line for line in lines if line.strip()).strip()
-    return prompt or None
-
-
-def parse_temperature_schedule(value: str | None) -> tuple[float, ...]:
-    if not value:
-        return ()
-
-    temperatures: list[float] = []
-    for raw in value.split(","):
-        item = raw.strip()
-        if not item:
-            continue
-        temperatures.append(float(item))
-
-    if not temperatures:
-        raise ValueError("Temperature schedule must contain at least one value.")
-    return tuple(temperatures)
-
-
-@functools.lru_cache(maxsize=1)
-def load_spanish_to_english_translator() -> tuple[Any, Any]:
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(SPANISH_TRANSLATION_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(SPANISH_TRANSLATION_MODEL)
-    return tokenizer, model
-
-
-def chunked_text(items: Sequence[str], size: int) -> Iterable[list[str]]:
-    for idx in range(0, len(items), size):
-        yield list(items[idx : idx + size])
+# Translation compatibility facade
 
 
 def translate_spanish_texts(
@@ -1321,63 +417,18 @@ def translate_spanish_texts(
     max_new_tokens: int = 256,
     no_repeat_ngram_size: int = TRANSLATION_NO_REPEAT_NGRAM_SIZE,
 ) -> list[str]:
-    if not texts:
-        return []
+    """Translate text while retaining the historical dependency patch points."""
 
-    tokenizer, model = load_spanish_to_english_translator()
-
-    try:
-        import torch
-    except Exception:
-        torch = None
-
-    use_cuda = False
-    target_device: Any = None
-    translated: list[str] = []
-    inputs: dict[str, Any] | None = None
-    outputs: Any = None
-    try:
-        use_cuda = bool(
-            torch is not None
-            and device.startswith("cuda")
-            and getattr(torch.cuda, "is_available", lambda: False)()
-        )
-        if torch is not None:
-            target_device = torch.device("cuda" if use_cuda else "cpu")
-            model.to(target_device)
-            model.eval()
-
-        for batch in chunked_text([text.strip() for text in texts], batch_size):
-            inputs = tokenizer(
-                batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            )
-            if target_device is not None:
-                inputs = {key: value.to(target_device) for key, value in inputs.items()}
-            with torch.no_grad() if torch is not None else contextlib.nullcontext():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    num_beams=num_beams,
-                    length_penalty=TRANSLATION_LENGTH_PENALTY,
-                    no_repeat_ngram_size=no_repeat_ngram_size,
-                    early_stopping=True,
-                )
-            decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            translated.extend(text.strip() for text in decoded)
-        return translated
-    finally:
-        inputs = None
-        outputs = None
-        if use_cuda and torch is not None:
-            with contextlib.suppress(Exception):
-                model.to(torch.device("cpu"))
-        model = None
-        tokenizer = None
-        flush_gpu_memory(device)
+    return _translation.translate_spanish_texts(
+        texts,
+        device=device,
+        batch_size=batch_size,
+        num_beams=num_beams,
+        max_new_tokens=max_new_tokens,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        load_translator=load_spanish_to_english_translator,
+        cleanup_gpu=flush_gpu_memory,
+    )
 
 
 def translate_srt_to_english(
@@ -1386,102 +437,30 @@ def translate_srt_to_english(
     glossary: dict[str, str] | None = None,
     glossary_spec: str | None = None,
     context_window: int = TRANSLATION_CONTEXT_WINDOW,
-    batch_size: int = 4,
+    batch_size: int = TRANSLATION_BATCH_SIZE,
     num_beams: int = TRANSLATION_NUM_BEAMS,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = TRANSLATION_MAX_NEW_TOKENS,
     no_repeat_ngram_size: int = TRANSLATION_NO_REPEAT_NGRAM_SIZE,
     log_path: Path | None = None,
 ) -> None:
-    if not srt_path.exists():
-        return
+    """Translate an SRT while retaining the historical translator patch point."""
 
-    srt_text = srt_path.read_text(encoding="utf-8", errors="ignore")
-    cues = parse_srt_cues(srt_text)
-    if not cues:
-        return
-
-    glossary = dict(glossary or {})
-    file_glossary = load_translation_glossary(glossary_spec)
-    if file_glossary:
-        merged = dict(file_glossary)
-        merged.update(glossary)
-        glossary = merged
-
-    if log_path is not None:
-        prompt = build_translation_prompt(
-            model_name=SPANISH_TRANSLATION_MODEL,
-            context_window=context_window,
-            glossary=glossary,
-        )
-        log_translation_prompt(log_path, prompt)
-
-    source_blocks: list[str] = []
-    block_meta: list[tuple[str, dict[str, str], str]] = []
-
-    for idx, cue in enumerate(cues):
-        prefix, current_text = split_speaker_prefix(cue.text)
-        current_text = normalize_subtitle_whitespace(current_text)
-        context_entries = translation_context_for_cue(cues, idx, context_window)
-        block_lines = [f"[context {offset:+d}] {line}" for offset, line in context_entries]
-        block_lines.append(f"{TRANSLATION_MARKER_START} {current_text} {TRANSLATION_MARKER_END}")
-        block_text = "\n".join(block_lines)
-        protected_text, placeholders = apply_glossary_placeholders(block_text, glossary)
-        source_blocks.append(protected_text)
-        block_meta.append((prefix, placeholders, current_text))
-
-    translated_blocks = translate_spanish_texts(
-        source_blocks,
-        device=device,
+    _translation.translate_srt_to_english(
+        srt_path,
+        device,
+        glossary=glossary,
+        glossary_spec=glossary_spec,
+        context_window=context_window,
         batch_size=batch_size,
         num_beams=num_beams,
         max_new_tokens=max_new_tokens,
         no_repeat_ngram_size=no_repeat_ngram_size,
+        log_path=log_path,
+        translate_texts=translate_spanish_texts,
     )
-    if len(translated_blocks) != len(cues):
-        raise RuntimeError("Translation produced an unexpected cue count.")
 
-    resolved_texts: list[str | None] = []
-    fallback_requests: list[tuple[int, str, dict[str, str]]] = []
-    for idx, (translated_block, meta) in enumerate(zip(translated_blocks, block_meta)):
-        _, placeholders, original = meta
-        translated_text = replace_glossary_placeholders(translated_block, placeholders)
-        extracted = extract_between_markers(translated_text, TRANSLATION_MARKER_START, TRANSLATION_MARKER_END)
-        if not extracted:
-            fallback_requests.append((idx, original, placeholders))
-            resolved_texts.append(None)
-            continue
-        resolved_texts.append(extracted)
 
-    if fallback_requests:
-        fallback_blocks = translate_spanish_texts(
-            [original for _, original, _ in fallback_requests],
-            device=device,
-            batch_size=batch_size,
-            num_beams=num_beams,
-            max_new_tokens=max_new_tokens,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-        )
-        if len(fallback_blocks) != len(fallback_requests):
-            raise RuntimeError("Fallback translation produced an unexpected cue count.")
-        for (idx, _, placeholders), fallback in zip(fallback_requests, fallback_blocks):
-            resolved_texts[idx] = replace_glossary_placeholders(fallback, placeholders)
-
-    translated_cues: list[SRTCue] = []
-    for cue, meta, extracted in zip(cues, block_meta, resolved_texts):
-        prefix, _placeholders, original = meta
-        extracted = extracted or original
-        translated_text = normalize_subtitle_whitespace(extracted)
-        if prefix:
-            translated_text = f"{prefix}{translated_text}".strip()
-        translated_cues.append(
-            SRTCue(index=cue.index, start_ms=cue.start_ms, end_ms=cue.end_ms, text=translated_text)
-        )
-
-    rewrapped: list[SRTCue] = []
-    for cue in translated_cues:
-        rewrapped.extend(split_cue_for_subtitles(cue))
-
-    srt_path.write_text(render_srt_cues(rewrapped or translated_cues), encoding="utf-8")
+# Transcript artifacts and filesystem preparation
 
 
 LLM_TRANSCRIPT_PREFACE = (
@@ -1513,19 +492,12 @@ def build_llm_file(srt_path: Path, llm_path: Path) -> None:
     if not srt_path.exists():
         return
 
-    text_lines = llm_text_lines_from_srt_lines(srt_path.read_text(encoding="utf-8", errors="ignore").splitlines())
-    llm_path.write_text(LLM_TRANSCRIPT_PREFACE + "\n".join(text_lines), encoding="utf-8")
-
-
-def finalize_srt_file(srt_path: Path) -> None:
-    if not srt_path.exists():
-        return
-
-    updated_lines = [
-        render_low_confidence_markup(line, "srt")
-        for line in srt_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    ]
-    srt_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+    text_lines = llm_text_lines_from_srt_lines(
+        srt_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    )
+    llm_path.write_text(
+        LLM_TRANSCRIPT_PREFACE + "\n".join(text_lines), encoding="utf-8"
+    )
 
 
 def finalize_transcript_outputs(srt_path: Path, llm_path: Path) -> None:
@@ -1535,7 +507,8 @@ def finalize_transcript_outputs(srt_path: Path, llm_path: Path) -> None:
     raw_lines = srt_path.read_text(encoding="utf-8", errors="ignore").splitlines()
     finalized_lines = [render_low_confidence_markup(line, "srt") for line in raw_lines]
     llm_path.write_text(
-        LLM_TRANSCRIPT_PREFACE + "\n".join(llm_text_lines_from_srt_lines(finalized_lines)),
+        LLM_TRANSCRIPT_PREFACE
+        + "\n".join(llm_text_lines_from_srt_lines(finalized_lines)),
         encoding="utf-8",
     )
     srt_path.write_text("\n".join(finalized_lines).rstrip() + "\n", encoding="utf-8")
@@ -1625,12 +598,20 @@ def ffmpeg_candidate_paths() -> list[Path]:
     if path_match:
         candidates.append(Path(path_match))
 
-    chocolatey_root = Path(os.environ.get("ChocolateyInstall", r"C:\ProgramData\chocolatey"))
+    chocolatey_root = Path(
+        os.environ.get("ChocolateyInstall", r"C:\ProgramData\chocolatey")
+    )
     candidates.extend(
         [
             Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
             chocolatey_root / "bin" / "ffmpeg.exe",
-            Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin" / "ffmpeg.exe",
+            Path.home()
+            / "scoop"
+            / "apps"
+            / "ffmpeg"
+            / "current"
+            / "bin"
+            / "ffmpeg.exe",
         ]
     )
     return candidates
@@ -1672,12 +653,18 @@ def ensure_ffmpeg_available_for_child_processes() -> str:
     }
 
     if normalized_ffmpeg_dir not in normalized_path_parts:
-        os.environ["PATH"] = ffmpeg_dir if not current_path else f"{ffmpeg_dir}{os.pathsep}{current_path}"
+        os.environ["PATH"] = (
+            ffmpeg_dir
+            if not current_path
+            else f"{ffmpeg_dir}{os.pathsep}{current_path}"
+        )
 
     return ffmpeg_path
 
 
-def build_audio_preprocess_command(input_path: Path, output_path: Path, ffmpeg_path: str = "ffmpeg") -> list[str]:
+def build_audio_preprocess_command(
+    input_path: Path, output_path: Path, ffmpeg_path: str = "ffmpeg"
+) -> list[str]:
     return [
         ffmpeg_path,
         "-y",
@@ -1703,7 +690,9 @@ def build_audio_preprocess_command(input_path: Path, output_path: Path, ffmpeg_p
     ]
 
 
-def format_subprocess_error_detail(value: object, limit: int = SUBPROCESS_ERROR_DETAIL_LIMIT) -> str:
+def format_subprocess_error_detail(
+    value: object, limit: int = SUBPROCESS_ERROR_DETAIL_LIMIT
+) -> str:
     if value is None:
         return ""
     if isinstance(value, bytes):
@@ -1716,11 +705,15 @@ def format_subprocess_error_detail(value: object, limit: int = SUBPROCESS_ERROR_
     return f"{text[:limit].rstrip()} ... [truncated]"
 
 
-def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Reporter = print) -> Path:
+def preprocess_audio_for_whisperx(
+    input_path: Path, temp_dir: Path, report: Reporter = print
+) -> Path:
     output_path = temp_dir / f"{input_path.stem}.preprocessed.wav"
     ffmpeg_path = resolve_ffmpeg_executable()
     if ffmpeg_path is None:
-        report("[transcriber] ffmpeg not found on PATH or common install paths; using the original input audio.")
+        report(
+            "[transcriber] ffmpeg not found on PATH or common install paths; using the original input audio."
+        )
         return input_path
     command = build_audio_preprocess_command(input_path, output_path, ffmpeg_path)
 
@@ -1728,13 +721,14 @@ def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Repo
         subprocess.run(
             command,
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=AUDIO_PREPROCESS_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
-        report(f"[transcriber] ffmpeg not found at {ffmpeg_path}; using the original input audio.")
+        report(
+            f"[transcriber] ffmpeg not found at {ffmpeg_path}; using the original input audio."
+        )
         return input_path
     except subprocess.TimeoutExpired:
         report(
@@ -1747,18 +741,24 @@ def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Repo
     except subprocess.CalledProcessError as exc:
         stderr = format_subprocess_error_detail(exc.stderr)
         detail = f": {stderr}" if stderr else ""
-        report(f"[transcriber] Audio preprocessing failed; using the original input audio{detail}")
+        report(
+            f"[transcriber] Audio preprocessing failed; using the original input audio{detail}"
+        )
         with contextlib.suppress(OSError):
             output_path.unlink()
         return input_path
     except Exception as exc:
-        report(f"[transcriber] Audio preprocessing failed; using the original input audio: {exc}")
+        report(
+            f"[transcriber] Audio preprocessing failed; using the original input audio: {exc}"
+        )
         with contextlib.suppress(OSError):
             output_path.unlink()
         return input_path
 
     if not output_path.exists() or output_path.stat().st_size == 0:
-        report("[transcriber] Audio preprocessing produced no output; using the original input audio.")
+        report(
+            "[transcriber] Audio preprocessing produced no output; using the original input audio."
+        )
         with contextlib.suppress(OSError):
             output_path.unlink()
         return input_path
@@ -1766,440 +766,9 @@ def preprocess_audio_for_whisperx(input_path: Path, temp_dir: Path, report: Repo
     return output_path
 
 
-def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WhisperX one-click transcriber (quality + fast modes).")
-    parser.add_argument("legacy", nargs="*", help="Legacy tokens: [language] [model] [mode]")
-    parser.add_argument("--input", "-i", help="Audio/video file path.")
-    parser.add_argument("--lang", choices=("auto", "en", "es"), help="Language: auto, en, or es.")
-    parser.add_argument(
-        "--glossary",
-        action="append",
-        default=[],
-        help="Glossary entry: 'source=target' or 'source' to preserve. Repeatable.",
-    )
-    parser.add_argument(
-        "--glossary-file",
-        help=(
-            "Glossary text file (one entry per line). Lines can use 'source => target', tab-separated pairs, or 'source | target'."
-        ),
-    )
-    parser.add_argument(
-        "--asr-prompt",
-        help="Optional text prompt to bias WhisperX toward names and jargon.",
-    )
-    parser.add_argument(
-        "--asr-prompt-file",
-        help="Text file with extra ASR prompt lines for names and jargon.",
-    )
-    parser.add_argument(
-        "--translate-to-english",
-        action="store_true",
-        help="Use WhisperX translate mode so English SRT output is written directly.",
-    )
-    parser.add_argument(
-        "--no-speaker-labels",
-        dest="include_speaker_labels",
-        action="store_false",
-        help="Hide diarization speaker labels in rendered transcript outputs.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        help="Single decoding temperature. Overrides the preset temperature schedule.",
-    )
-    parser.add_argument(
-        "--temperature-schedule",
-        help="Comma-separated fallback temperatures, e.g. 0.0,0.2,0.4. Overrides --temperature.",
-    )
-    parser.add_argument(
-        "--best-of",
-        type=int,
-        help="Sampling candidates when temperature is above 0.",
-    )
-    parser.add_argument(
-        "--compression-ratio-threshold",
-        type=float,
-        help="Fallback when output compression ratio exceeds this value.",
-    )
-    parser.add_argument(
-        "--logprob-threshold",
-        type=float,
-        help="Fallback when average log probability drops below this value.",
-    )
-    parser.add_argument(
-        "--no-speech-threshold",
-        type=float,
-        help="Fallback when no-speech probability exceeds this value.",
-    )
-    parser.add_argument(
-        "--condition-on-previous-text",
-        dest="condition_on_previous_text",
-        action="store_true",
-        default=None,
-        help="Condition each decode window on the previous text.",
-    )
-    parser.add_argument(
-        "--no-condition-on-previous-text",
-        dest="condition_on_previous_text",
-        action="store_false",
-        help="Decode each window without conditioning on previous text.",
-    )
-    parser.add_argument("--mode", choices=("quality", "fast"), help="Run mode preset: quality or fast.")
-    parser.add_argument("--model", help="Whisper model name, e.g. large-v3, medium.")
-    parser.add_argument("--device", default="cuda", help="Inference device (default: cuda).")
-    parser.add_argument(
-        "--compute-type",
-        default="float16",
-        choices=("float16", "float32", "int8"),
-        help="Computation dtype (default: float16).",
-    )
-    parser.add_argument(
-        "--warm-vram",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Keep compatible WhisperX models loaded between jobs for faster repeated runs (default: off).",
-    )
-    parser.add_argument("--watch", action="store_true", help="Continuously watch a folder and transcribe new media files.")
-    parser.add_argument(
-        "--watch-dir",
-        default=str(DEFAULT_WATCH_DIR),
-        help=f'Folder to watch when using --watch (default: "{DEFAULT_WATCH_DIR}").',
-    )
-    parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=DEFAULT_POLL_INTERVAL,
-        help=f"Seconds between watch scans (default: {DEFAULT_POLL_INTERVAL:g}).",
-    )
-    parser.add_argument(
-        "--settle-seconds",
-        type=float,
-        default=DEFAULT_SETTLE_SECONDS,
-        help=(
-            "How long a file must stay unchanged before watch mode starts transcription "
-            f"(default: {DEFAULT_SETTLE_SECONDS:g})."
-        ),
-    )
-    parser.add_argument(
-        "--stale-lock-seconds",
-        type=float,
-        default=DEFAULT_STALE_LOCK_SECONDS,
-        help=(
-            "Age after which a lock file is treated as stale and may be cleared before processing "
-            f"(default: {DEFAULT_STALE_LOCK_SECONDS:g})."
-        ),
-    )
-    parser.add_argument("--dry-run", action="store_true", help="Show planned actions without running WhisperX or writing outputs.")
-    diarize_group = parser.add_mutually_exclusive_group()
-    diarize_group.add_argument("--diarize", dest="force_diarize", action="store_true", help="Force diarization on.")
-    diarize_group.add_argument("--no-diarize", dest="force_no_diarize", action="store_true", help="Force diarization off.")
-    parser.add_argument("--no-diarize-smoothing", action="store_true", help="Disable speaker diarization smoothing.")
-    parser.add_argument(
-        "--min-speaker-turn-ms",
-        type=int,
-        default=DEFAULT_MIN_SPEAKER_TURN_MS,
-        help=f"Minimum speaker turn duration for smoothing (default: {DEFAULT_MIN_SPEAKER_TURN_MS}).",
-    )
-    parser.add_argument(
-        "--min-speaker-turn-tokens",
-        type=int,
-        default=DEFAULT_MIN_SPEAKER_TURN_TOKENS,
-        help=f"Minimum speaker turn token count for smoothing (default: {DEFAULT_MIN_SPEAKER_TURN_TOKENS}).",
-    )
-    parser.add_argument(
-        "--confidence-cleanup",
-        dest="confidence_cleanup",
-        action="store_true",
-        default=True,
-        help="Enable low-confidence transcript cleanup (default: on).",
-    )
-    parser.add_argument(
-        "--no-confidence-cleanup",
-        dest="confidence_cleanup",
-        action="store_false",
-        help="Disable low-confidence transcript cleanup.",
-    )
-    parser.add_argument(
-        "--confidence-cleanup-mode",
-        choices=("mark", "redact"),
-        default="mark",
-        help="How to handle low-confidence regions (default: mark).",
-    )
-    parser.add_argument(
-        "--low-confidence-logprob",
-        type=float,
-        default=DEFAULT_LOW_CONFIDENCE_LOGPROB,
-        help=f"Avg logprob threshold for low confidence (default: {DEFAULT_LOW_CONFIDENCE_LOGPROB}).",
-    )
-    parser.add_argument(
-        "--high-no-speech-prob",
-        type=float,
-        default=DEFAULT_HIGH_NO_SPEECH_PROB,
-        help=f"No-speech probability threshold (default: {DEFAULT_HIGH_NO_SPEECH_PROB}).",
-    )
-    parser.add_argument(
-        "--low-confidence-word-prob",
-        type=float,
-        default=DEFAULT_LOW_CONFIDENCE_WORD_PROB,
-        help=f"Word confidence threshold (default: {DEFAULT_LOW_CONFIDENCE_WORD_PROB}).",
-    )
-    return parser.parse_args(argv)
-
-
-def parse_legacy(tokens: Iterable[str]) -> LegacyOptions:
-    opt = LegacyOptions()
-    for token in tokens:
-        t = token.strip()
-        if not t:
-            continue
-        low = t.lower()
-        if low in {"e", "en"}:
-            opt.language = "en"
-            opt.language_locked = True
-            continue
-        if low in {"s", "es"}:
-            opt.language = "es"
-            opt.language_locked = True
-            continue
-        if low in {"t", "tr", "translate"}:
-            opt.language = "es"
-            opt.language_locked = True
-            continue
-        if low in {"f", "fast"}:
-            opt.mode = "fast"
-            opt.mode_locked = True
-            continue
-        if low in {"q", "quality"}:
-            opt.mode = "quality"
-            opt.mode_locked = True
-            continue
-        if not opt.model_locked:
-            opt.model = t
-            opt.model_locked = True
-    return opt
-
-
-def prompt_input_path() -> str | None:
-    if not sys.stdin.isatty():
-        return None
-    raw = input("Media file path (or Enter to cancel): ").strip()
-    return raw or None
-
-
-def prompt_language(current: str) -> str:
-    if not sys.stdin.isatty():
-        return current
-    choice = input("Language [Enter=Auto, e=English, s=Spanish]: ").strip().lower()
-    if choice in {"", "a", "auto"}:
-        return "auto"
-    if choice in {"s", "es"}:
-        return "es"
-    if choice in {"e", "en"}:
-        return "en"
-    return current
-
-
-def prompt_mode(current: str) -> str:
-    if not sys.stdin.isatty():
-        return current
-    choice = input("Run mode [Enter=quality, f=fast]: ").strip().lower()
-    if choice in {"f", "fast"}:
-        return "fast"
-    if choice in {"q", "quality", ""}:
-        return "quality"
-    return current
-
-
-def pick_media_file() -> str | None:
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception:
-        return None
-
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        path = filedialog.askopenfilename(
-            title="Select an audio/video file",
-            filetypes=[MEDIA_FILTER, ("All files", "*.*")],
-        )
-    finally:
-        root.destroy()
-    return path or None
-
-
-def resolve_input_path(arg_input: str | None) -> Path | None:
-    if arg_input:
-        p = Path(arg_input).expanduser()
-        return p if p.exists() else p
-
-    chosen = pick_media_file()
-    if chosen:
-        return Path(chosen)
-
-    manual = prompt_input_path()
-    if manual:
-        return Path(manual).expanduser()
-
-    return None
-
-
-def build_config(args: argparse.Namespace, interactive: bool = True) -> RunConfig:
-    legacy = parse_legacy(args.legacy)
-
-    language = args.lang or legacy.language or "auto"
-    language_locked = bool(args.lang) or legacy.language_locked
-
-    mode = args.mode or legacy.mode or "quality"
-    mode_locked = bool(args.mode) or legacy.mode_locked
-
-    model = args.model or legacy.model
-    model_locked = bool(args.model) or legacy.model_locked
-
-    if interactive and not language_locked:
-        language = prompt_language(language)
-    if interactive and not mode_locked:
-        mode = prompt_mode(mode)
-
-    if mode == "fast":
-        if not model_locked:
-            model = "medium"
-        batch_size = 16
-        beam_size = 2
-        patience = 1.0
-        temperature = 0.0
-        temperature_schedule = (0.0,)
-        best_of = 1
-        compression_ratio_threshold = 2.4
-        logprob_threshold = -1.0
-        no_speech_threshold = 0.6
-        condition_on_previous_text = False
-        diarize_default = False
-        translation_context_window = TRANSLATION_CONTEXT_WINDOW
-        translation_batch_size = 4
-        translation_num_beams = TRANSLATION_NUM_BEAMS
-        translation_max_new_tokens = 256
-        translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
-    else:
-        if not model_locked:
-            model = "large-v3"
-        batch_size = 8
-        beam_size = 8
-        patience = 1.2
-        temperature = 0.0
-        temperature_schedule = (0.0, 0.2, 0.4, 0.6, 0.8)
-        best_of = 5
-        compression_ratio_threshold = 2.4
-        logprob_threshold = -1.0
-        no_speech_threshold = 0.6
-        condition_on_previous_text = True
-        diarize_default = True
-        translation_context_window = TRANSLATION_CONTEXT_WINDOW
-        translation_batch_size = 4
-        translation_num_beams = TRANSLATION_NUM_BEAMS
-        translation_max_new_tokens = 256
-        translation_no_repeat_ngram_size = TRANSLATION_NO_REPEAT_NGRAM_SIZE
-
-    if args.temperature is not None:
-        temperature = float(args.temperature)
-        temperature_schedule = (temperature,)
-
-    try:
-        override_schedule = parse_temperature_schedule(args.temperature_schedule)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    if override_schedule:
-        temperature_schedule = override_schedule
-        temperature = override_schedule[0]
-
-    if args.best_of is not None:
-        best_of = max(1, int(args.best_of))
-    if args.compression_ratio_threshold is not None:
-        compression_ratio_threshold = float(args.compression_ratio_threshold)
-    if args.logprob_threshold is not None:
-        logprob_threshold = float(args.logprob_threshold)
-    if args.no_speech_threshold is not None:
-        no_speech_threshold = float(args.no_speech_threshold)
-    if args.condition_on_previous_text is not None:
-        condition_on_previous_text = bool(args.condition_on_previous_text)
-
-    if args.force_diarize:
-        diarize = True
-    elif args.force_no_diarize:
-        diarize = False
-    else:
-        diarize = diarize_default
-
-    diarize_smoothing = not args.no_diarize_smoothing
-
-    glossary_entries: list[str] = list(args.glossary or [])
-    glossary_files: list[Path] = []
-    if args.glossary_file:
-        glossary_files.append(Path(args.glossary_file).expanduser())
-    for entry in list(glossary_entries):
-        if looks_like_glossary_file(entry):
-            glossary_files.append(Path(entry).expanduser())
-            glossary_entries.remove(entry)
-
-    file_entries: list[str] = []
-    for glossary_file in glossary_files:
-        file_entries.extend(load_glossary_file(glossary_file))
-    glossary = parse_glossary_entries([*file_entries, *glossary_entries])
-    glossary_path = str(glossary_files[0]) if glossary_files else None
-    asr_prompt = build_asr_prompt(
-        glossary=glossary,
-        prompt_text=args.asr_prompt,
-        prompt_file=args.asr_prompt_file,
-    )
-
-    translate_to_english = bool(args.translate_to_english) or language == "es"
-
-    return RunConfig(
-        language=language,
-        translate_to_english=translate_to_english,
-        mode=mode,
-        model=model or "large-v3",
-        batch_size=batch_size,
-        beam_size=beam_size,
-        patience=patience,
-        temperature=temperature,
-        temperature_schedule=temperature_schedule,
-        best_of=best_of,
-        compression_ratio_threshold=compression_ratio_threshold,
-        logprob_threshold=logprob_threshold,
-        no_speech_threshold=no_speech_threshold,
-        condition_on_previous_text=condition_on_previous_text,
-        diarize=diarize,
-        diarize_smoothing=diarize_smoothing,
-        min_speaker_turn_ms=max(0, int(args.min_speaker_turn_ms)),
-        min_speaker_turn_tokens=max(0, int(args.min_speaker_turn_tokens)),
-        include_speaker_labels=bool(args.include_speaker_labels),
-        confidence_cleanup=bool(args.confidence_cleanup),
-        confidence_cleanup_mode=args.confidence_cleanup_mode,
-        low_confidence_logprob=float(args.low_confidence_logprob),
-        high_no_speech_prob=float(args.high_no_speech_prob),
-        low_confidence_word_prob=float(args.low_confidence_word_prob),
-        device=args.device,
-        compute_type=args.compute_type,
-        translation_context_window=translation_context_window,
-        translation_batch_size=translation_batch_size,
-        translation_num_beams=translation_num_beams,
-        translation_max_new_tokens=translation_max_new_tokens,
-        translation_no_repeat_ngram_size=translation_no_repeat_ngram_size,
-        glossary=glossary,
-        glossary_path=glossary_path,
-        asr_prompt=asr_prompt,
-        warm_vram=bool(args.warm_vram),
-        dry_run=bool(args.dry_run),
-    )
-
-
-def output_paths_for_input(input_path: Path, cfg: RunConfig, create_dirs: bool = False) -> OutputPaths:
+def output_paths_for_input(
+    input_path: Path, cfg: RunConfig, create_dirs: bool = False
+) -> OutputPaths:
     output_dir = input_path.parent
     log_dir = log_dir_for_output(output_dir, create_dirs=create_dirs)
     if create_dirs:
@@ -2354,19 +923,7 @@ def allow_trusted_checkpoint_loads() -> Iterable[None]:
         torch.load = original_load
 
 
-def read_text_tail(path: Path, max_chars: int = LOG_TAIL_READ_CHARS) -> str:
-    if max_chars <= 0:
-        return ""
-    max_bytes = max_chars * 4
-    try:
-        with path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - max_bytes))
-            data = fh.read()
-    except OSError:
-        return ""
-    return data.decode("utf-8", errors="ignore")[-max_chars:]
+# WhisperX execution
 
 
 def should_fallback_without_diarization(log_path: Path) -> bool:
@@ -2387,72 +944,65 @@ def parse_detected_language_from_log(log_path: Path) -> str | None:
     return matches[-1].strip().lower() or None
 
 
-def run_whisperx_direct(
-    cfg: RunConfig,
-    input_path: Path,
-    srt_path: Path,
-    hf_token: str | None,
-    diarize: bool,
-) -> str | None:
-    if cfg.warm_vram:
-        with _WARM_MODEL_CACHE_LOCK:
-            return _run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
-    return _run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
-
-
-def _run_whisperx_direct(
-    cfg: RunConfig,
-    input_path: Path,
-    srt_path: Path,
-    hf_token: str | None,
-    diarize: bool,
-) -> str | None:
-    import whisperx
-
-    whisper_language = None if cfg.language == "auto" else cfg.language
-    whisper_task = "translate" if cfg.translate_to_english else "transcribe"
-
-    ensure_ffmpeg_available_for_child_processes()
-
-    print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...")
-    model = load_whisperx_asr_model(whisperx, cfg, whisper_task, whisper_language)
-
-    print(f"[transcriber] Loading audio: {input_path}")
-    audio = whisperx.load_audio(str(input_path))
-
-    print("[transcriber] Transcribing audio...")
-    transcribe_kwargs: dict[str, Any] = {
+def _whisperx_transcribe_kwargs(
+    cfg: RunConfig, whisper_task: str, whisper_language: str | None
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
         "batch_size": cfg.batch_size,
         "task": whisper_task,
         "temperature": cfg.temperature_schedule or cfg.temperature,
         "print_progress": False,
         "condition_on_previous_text": cfg.condition_on_previous_text,
     }
-    if cfg.asr_prompt:
-        transcribe_kwargs["initial_prompt"] = cfg.asr_prompt
-    if cfg.best_of is not None:
-        transcribe_kwargs["best_of"] = cfg.best_of
-    if cfg.compression_ratio_threshold is not None:
-        transcribe_kwargs["compression_ratio_threshold"] = cfg.compression_ratio_threshold
-    if cfg.logprob_threshold is not None:
-        transcribe_kwargs["logprob_threshold"] = cfg.logprob_threshold
-    if cfg.no_speech_threshold is not None:
-        transcribe_kwargs["no_speech_threshold"] = cfg.no_speech_threshold
-    if whisper_language:
-        transcribe_kwargs["language"] = whisper_language
-    result = call_with_supported_kwargs(model.transcribe, audio, **transcribe_kwargs)
+    optional_values = {
+        "initial_prompt": cfg.asr_prompt,
+        "best_of": cfg.best_of,
+        "compression_ratio_threshold": cfg.compression_ratio_threshold,
+        "logprob_threshold": cfg.logprob_threshold,
+        "no_speech_threshold": cfg.no_speech_threshold,
+        "language": whisper_language,
+    }
+    kwargs.update(
+        {name: value for name, value in optional_values.items() if value is not None}
+    )
+    return kwargs
+
+
+def _transcribe_with_whisperx(
+    model: Any,
+    cfg: RunConfig,
+    audio: Any,
+    whisper_task: str,
+    whisper_language: str | None,
+) -> tuple[dict[str, Any], str | None]:
+    print("[transcriber] Transcribing audio...")
+    result = call_with_supported_kwargs(
+        model.transcribe,
+        audio,
+        **_whisperx_transcribe_kwargs(cfg, whisper_task, whisper_language),
+    )
     if not isinstance(result, dict):
-        raise RuntimeError(f"Unexpected WhisperX transcription result type: {type(result)!r}")
-
+        raise RuntimeError(
+            f"Unexpected WhisperX transcription result type: {type(result)!r}"
+        )
     detected_language = str(result.get("language") or "").strip().lower() or None
+    return result, detected_language
 
-    align_language = "en" if cfg.translate_to_english else (detected_language or whisper_language or "en")
-    print(f"[transcriber] Aligning words for language={align_language}...")
+
+def _align_whisperx_result(
+    whisperx_module: Any,
+    cfg: RunConfig,
+    audio: Any,
+    result: dict[str, Any],
+    language_code: str,
+) -> dict[str, Any]:
+    print(f"[transcriber] Aligning words for language={language_code}...")
     try:
-        language_code = align_language
-        align_model, metadata = load_whisperx_align_model(whisperx, cfg, language_code)
-        result = call_with_supported_kwargs(
-            whisperx.align,
+        align_model, metadata = load_whisperx_align_model(
+            whisperx_module, cfg, language_code
+        )
+        aligned = call_with_supported_kwargs(
+            whisperx_module.align,
             result.get("segments", []),
             align_model,
             metadata,
@@ -2460,30 +1010,84 @@ def _run_whisperx_direct(
             cfg.device,
             return_char_alignments=False,
         )
-        if not isinstance(result, dict):
-            raise RuntimeError(f"Unexpected WhisperX alignment result type: {type(result)!r}")
+        if not isinstance(aligned, dict):
+            raise RuntimeError(
+                f"Unexpected WhisperX alignment result type: {type(aligned)!r}"
+            )
+        return aligned
     except Exception as exc:
         print(f"[transcriber] Alignment failed; continuing without alignment: {exc}")
+        return result
 
-    if diarize:
-        print("[transcriber] Running diarization...")
-        try:
-            with allow_trusted_checkpoint_loads():
-                diarize_model = load_whisperx_diarization_model(whisperx, cfg, hf_token)
-                diarize_segments = call_with_supported_kwargs(diarize_model, audio)
-            assign_word_speakers = resolve_whisperx_symbol(whisperx, "assign_word_speakers")
-            result = assign_word_speakers(diarize_segments, result)
-        except Exception as exc:
-            if not diarization_error_allows_fallback(exc):
-                raise
-            print(f"[transcriber] Diarization unavailable or blocked; continuing without diarization: {exc}")
 
-    apply_confidence_cleanup(result, cfg)
+def _diarize_whisperx_result(
+    whisperx_module: Any,
+    cfg: RunConfig,
+    audio: Any,
+    result: dict[str, Any],
+    hf_token: str | None,
+) -> dict[str, Any]:
+    print("[transcriber] Running diarization...")
+    try:
+        with allow_trusted_checkpoint_loads():
+            diarization_model = load_whisperx_diarization_model(
+                whisperx_module, cfg, hf_token
+            )
+            diarization_segments = call_with_supported_kwargs(diarization_model, audio)
+        assign_word_speakers = resolve_whisperx_symbol(
+            whisperx_module, "assign_word_speakers"
+        )
+        return assign_word_speakers(diarization_segments, result)
+    except Exception as exc:
+        if not diarization_error_allows_fallback(exc):
+            raise
+        print(
+            "[transcriber] Diarization unavailable or blocked; "
+            f"continuing without diarization: {exc}"
+        )
+        return result
 
-    print("[transcriber] Writing subtitle-sized SRT from in-memory timings...")
-    write_direct_srt_from_result(result, srt_path, cfg)
 
-    return detected_language
+def run_whisperx_direct(
+    cfg: RunConfig,
+    input_path: Path,
+    srt_path: Path,
+    hf_token: str | None,
+    diarize: bool,
+) -> str | None:
+    lock = _WARM_MODEL_CACHE_LOCK if cfg.warm_vram else contextlib.nullcontext()
+    with lock:
+        import whisperx
+
+        whisper_language = None if cfg.language == "auto" else cfg.language
+        whisper_task = "translate" if cfg.translate_to_english else "transcribe"
+
+        ensure_ffmpeg_available_for_child_processes()
+        print(f"[transcriber] Loading model {cfg.model} on {cfg.device}...")
+        model = load_whisperx_asr_model(whisperx, cfg, whisper_task, whisper_language)
+        print(f"[transcriber] Loading audio: {input_path}")
+        audio = whisperx.load_audio(str(input_path))
+
+        result, detected_language = _transcribe_with_whisperx(
+            model, cfg, audio, whisper_task, whisper_language
+        )
+        align_language = (
+            "en"
+            if cfg.translate_to_english
+            else (detected_language or whisper_language or "en")
+        )
+        result = _align_whisperx_result(whisperx, cfg, audio, result, align_language)
+        if diarize:
+            result = _diarize_whisperx_result(whisperx, cfg, audio, result, hf_token)
+
+        apply_confidence_cleanup(result, cfg)
+        print("[transcriber] Writing subtitle-sized SRT from in-memory timings...")
+        write_direct_srt_from_result(result, srt_path, cfg)
+        return detected_language
+
+
+# Compatibility alias retained for callers that used the former private worker.
+_run_whisperx_direct = run_whisperx_direct
 
 
 def run_whisperx_direct_logged(
@@ -2501,7 +1105,9 @@ def run_whisperx_direct_logged(
         with log_path.open(mode, encoding="utf-8", errors="ignore") as log:
             with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
                 try:
-                    detected_language = run_whisperx_direct(cfg, input_path, srt_path, hf_token, diarize)
+                    detected_language = run_whisperx_direct(
+                        cfg, input_path, srt_path, hf_token, diarize
+                    )
                     if detected_language is None:
                         detected_language = parse_detected_language_from_log(log_path)
                     return_code = 0
@@ -2516,56 +1122,228 @@ def run_whisperx_direct_logged(
         cleanup_after_transcription_run(cfg)
 
 
-def print_summary(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report: Reporter = print) -> None:
-    report("")
-    report(f'Input:     "{input_path}"')
-    report(f'Output:    "{outputs.srt_path}"')
-    report(f'LLM:       "{outputs.llm_path}"')
-    report(f'Log:       "{outputs.log_path}"')
-    report(f'Lock:      "{outputs.lock_path}"')
-    report(f'OutDir:    "{outputs.output_dir}"')
-    report(f"Lang:      {cfg.language}")
+# Transcription orchestration
+
+
+def _translation_summary(cfg: RunConfig) -> str:
     if cfg.language == "auto":
-        if cfg.translate_to_english:
-            report("Translate: whisperx (direct English output)")
-        else:
-            report("Translate: auto (Spanish -> English when detected)")
-    else:
-        report(f"Translate: {'whisperx direct' if cfg.translate_to_english else 'off'}")
-    report(f"Mode:      {cfg.mode}")
-    report(f"Model:     {cfg.model}")
-    report(f'Diarize:   {"on" if cfg.diarize else "off"}')
-    report(f'Smooth:    {"on" if (cfg.diarize and cfg.diarize_smoothing) else "off"}')
-    report(
-        f"Cleanup:   {'on' if cfg.confidence_cleanup else 'off'}"
-        f"{' (' + cfg.confidence_cleanup_mode + ')' if cfg.confidence_cleanup else ''}"
-    )
-    if cfg.glossary_path:
-        report(f'Glossary:  "{cfg.glossary_path}"')
-    if cfg.asr_prompt:
-        report("ASRPrompt: on")
-    report(
-        "Decode:    "
-        f"temps={','.join(f'{temp:g}' for temp in cfg.temperature_schedule) if cfg.temperature_schedule else f'{cfg.temperature:g}'} "
+        return (
+            "whisperx (direct English output)"
+            if cfg.translate_to_english
+            else "auto (Spanish -> English when detected)"
+        )
+    return "whisperx direct" if cfg.translate_to_english else "off"
+
+
+def _decode_summary(cfg: RunConfig) -> str:
+    temperatures = cfg.temperature_schedule or (cfg.temperature,)
+    return (
+        f"temps={','.join(f'{temperature:g}' for temperature in temperatures)} "
         f"best_of={cfg.best_of if cfg.best_of is not None else 'auto'} "
         f"cr={cfg.compression_ratio_threshold if cfg.compression_ratio_threshold is not None else 'auto'} "
         f"logprob={cfg.logprob_threshold if cfg.logprob_threshold is not None else 'auto'} "
         f"no_speech={cfg.no_speech_threshold if cfg.no_speech_threshold is not None else 'auto'} "
         f"prev_text={'on' if cfg.condition_on_previous_text else 'off'}"
     )
+
+
+def print_summary(
+    cfg: RunConfig, input_path: Path, outputs: OutputPaths, report: Reporter = print
+) -> None:
+    cleanup = "on" if cfg.confidence_cleanup else "off"
+    if cfg.confidence_cleanup:
+        cleanup += f" ({cfg.confidence_cleanup_mode})"
+
+    lines = [
+        f'Input:     "{input_path}"',
+        f'Output:    "{outputs.srt_path}"',
+        f'LLM:       "{outputs.llm_path}"',
+        f'Log:       "{outputs.log_path}"',
+        f'Lock:      "{outputs.lock_path}"',
+        f'OutDir:    "{outputs.output_dir}"',
+        f"Lang:      {cfg.language}",
+        f"Translate: {_translation_summary(cfg)}",
+        f"Mode:      {cfg.mode}",
+        f"Model:     {cfg.model}",
+        f"Diarize:   {'on' if cfg.diarize else 'off'}",
+        f"Smooth:    {'on' if cfg.diarize and cfg.diarize_smoothing else 'off'}",
+        f"Cleanup:   {cleanup}",
+    ]
+    if cfg.glossary_path:
+        lines.append(f'Glossary:  "{cfg.glossary_path}"')
+    if cfg.asr_prompt:
+        lines.append("ASRPrompt: on")
+    lines.append(f"Decode:    {_decode_summary(cfg)}")
     if cfg.dry_run:
-        report("DryRun:    on")
-    report("")
+        lines.append("DryRun:    on")
+    report_block(report, *lines)
 
 
-def describe_dry_run_plan(cfg: RunConfig, input_path: Path, outputs: OutputPaths, report: Reporter) -> None:
-    report("Dry run. No files will be changed.")
-    report(f'Would acquire lock: "{outputs.lock_path}"')
-    report(f'Would run WhisperX with output dir: "{outputs.output_dir}"')
-    report(f'Would write transcript: "{outputs.srt_path}"')
-    report(f'Would write LLM prompt file: "{outputs.llm_path}"')
-    report(f'Would write log: "{outputs.log_path}"')
-    report(f'Would leave the source file in place: "{input_path}"')
+def describe_dry_run_plan(
+    cfg: RunConfig, input_path: Path, outputs: OutputPaths, report: Reporter
+) -> None:
+    report_lines(
+        report,
+        "Dry run. No files will be changed.",
+        f'Would acquire lock: "{outputs.lock_path}"',
+        f'Would run WhisperX with output dir: "{outputs.output_dir}"',
+        f'Would write transcript: "{outputs.srt_path}"',
+        f'Would write LLM prompt file: "{outputs.llm_path}"',
+        f'Would write log: "{outputs.log_path}"',
+        f'Would leave the source file in place: "{input_path}"',
+    )
+
+
+def _append_diarization_retry_log(log_path: Path) -> None:
+    with log_path.open("a", encoding="utf-8", errors="ignore") as log:
+        log.write(
+            "\n[transcriber] Diarization unavailable or blocked; "
+            "retrying without --diarize.\n"
+        )
+
+
+def _run_transcription_attempts(
+    cfg: RunConfig,
+    input_path: Path,
+    outputs: OutputPaths,
+    hf_token: str | None,
+    report: Reporter,
+) -> TranscriptionAttemptResult:
+    diarize = cfg.diarize
+    attempt = 0
+
+    while True:
+        return_code, detected_language = run_whisperx_direct_logged(
+            cfg,
+            input_path,
+            outputs.srt_path,
+            hf_token,
+            diarize=diarize,
+            log_path=outputs.log_path,
+            append=attempt > 0,
+        )
+        diarization_failed = diarize and should_fallback_without_diarization(
+            outputs.log_path
+        )
+        if return_code == 0:
+            return TranscriptionAttemptResult(
+                return_code=0,
+                detected_language=detected_language,
+                fell_back_from_diarization=diarization_failed,
+            )
+        if not diarization_failed:
+            return TranscriptionAttemptResult(
+                return_code=return_code,
+                detected_language=detected_language,
+                fell_back_from_diarization=False,
+            )
+
+        report_lines(
+            report,
+            "",
+            "Diarization unavailable or blocked. Retrying without diarization...",
+        )
+        _append_diarization_retry_log(outputs.log_path)
+        diarize = False
+        attempt += 1
+
+
+def _maybe_translate_auto_spanish(
+    cfg: RunConfig,
+    outputs: OutputPaths,
+    detected_language: str | None,
+    report: Reporter,
+) -> None:
+    if cfg.language == "auto":
+        report(f"Detected language: {detected_language or 'unknown'}.")
+
+    should_translate = (
+        not cfg.translate_to_english
+        and cfg.language == "auto"
+        and detected_language == "es"
+    )
+    if not should_translate:
+        return
+
+    if cfg.glossary_path and not Path(cfg.glossary_path).expanduser().exists():
+        report(f'Glossary file not found: "{cfg.glossary_path}"')
+    report("Translating Spanish transcript to English text...")
+    try:
+        translate_srt_to_english(
+            outputs.srt_path,
+            cfg.device,
+            glossary=cfg.glossary,
+            glossary_spec=cfg.glossary_path,
+            context_window=cfg.translation_context_window,
+            batch_size=cfg.translation_batch_size,
+            num_beams=cfg.translation_num_beams,
+            max_new_tokens=cfg.translation_max_new_tokens,
+            no_repeat_ngram_size=cfg.translation_no_repeat_ngram_size,
+            log_path=outputs.log_path,
+        )
+    except Exception as exc:
+        report_block(
+            report,
+            f"Translation failed: {exc}",
+            "Keeping the original transcript text.",
+        )
+
+
+def _finalize_existing_transcript(
+    cfg: RunConfig,
+    outputs: OutputPaths,
+    detected_language: str | None,
+    report: Reporter,
+) -> None:
+    if not outputs.srt_path.exists():
+        return
+    _maybe_translate_auto_spanish(cfg, outputs, detected_language, report)
+    with contextlib.suppress(Exception):
+        finalize_transcript_outputs(outputs.srt_path, outputs.llm_path)
+
+
+def _report_transcription_outcome(
+    cfg: RunConfig,
+    outputs: OutputPaths,
+    result: TranscriptionAttemptResult,
+    report: Reporter,
+) -> int:
+    if result.return_code != 0:
+        report_block(
+            report,
+            f"WhisperX failed (exit code {result.return_code}).",
+            f'See the log: "{outputs.log_path}"',
+        )
+        return result.return_code
+
+    if not outputs.srt_path.exists():
+        report_block(
+            report,
+            "Done, but SRT not found where expected:",
+            f'  "{outputs.srt_path}"',
+            "Check the log:",
+            f'  "{outputs.log_path}"',
+        )
+        return 1
+
+    lines = [
+        "Done.",
+        f'SRT: "{outputs.srt_path}"',
+        f'LLM: "{outputs.llm_path}"',
+    ]
+    if cfg.mode == "fast" and not cfg.diarize:
+        lines.append("Note: fast mode used (speaker diarization disabled).")
+    if result.fell_back_from_diarization:
+        lines.extend(
+            [
+                "Note: completed without speaker diarization.",
+                "To enable diarization, accept terms with the SAME HF account at:",
+                "  https://hf.co/pyannote/speaker-diarization-3.1",
+                "  https://hf.co/pyannote/segmentation-3.0",
+            ]
+        )
+    report_block(report, *lines)
+    return 0
 
 
 def transcribe_file(
@@ -2576,14 +1354,11 @@ def transcribe_file(
 ) -> int:
     error = input_path_error(input_path)
     if error is not None:
-        report("")
-        report(error)
-        report("")
+        report_block(report, error)
         return 1
 
     outputs = output_paths_for_input(input_path, cfg, create_dirs=not cfg.dry_run)
     print_summary(cfg, input_path, outputs, report=report)
-
     if cfg.dry_run:
         describe_dry_run_plan(cfg, input_path, outputs, report)
         return 0
@@ -2591,125 +1366,40 @@ def transcribe_file(
     try:
         ensure_ffmpeg_available_for_child_processes()
     except RuntimeError as exc:
-        report("")
-        report(str(exc))
-        report("")
+        report_block(report, str(exc))
         return 1
 
     if not acquire_lock(input_path, outputs.lock_path, stale_lock_seconds, report):
         return 0
 
-    hf_token: str | None = None
-    fallback_no_diarize = False
-    current_diarize = cfg.diarize
-    detected_language: str | None = None
-    rc = 1
-
     try:
-        if cfg.diarize:
-            hf_token = load_hf_token(project_dir())
-            if not hf_token:
-                report("")
-                report("Missing Hugging Face token.")
-                report(f'Create "{project_dir() / "hf_token.txt"}" (or "HF_TOKEN.txt") or set HF_TOKEN.')
-                report("")
-                return 1
+        hf_token = load_hf_token(project_dir()) if cfg.diarize else None
+        if cfg.diarize and not hf_token:
+            report_block(
+                report,
+                "Missing Hugging Face token.",
+                f'Create "{project_dir() / "hf_token.txt"}" '
+                '(or "HF_TOKEN.txt") or set HF_TOKEN.',
+            )
+            return 1
 
-        with tempfile.TemporaryDirectory(prefix="transcriber-audio-") as temp_audio_dir:
-            prepared_input = preprocess_audio_for_whisperx(input_path, Path(temp_audio_dir), report=report)
+        with tempfile.TemporaryDirectory(prefix="transcriber-audio-") as temp_dir:
+            prepared_input = preprocess_audio_for_whisperx(
+                input_path, Path(temp_dir), report=report
+            )
             if prepared_input != input_path:
                 report(f'Audio preprocessing: "{prepared_input}"')
+            result = _run_transcription_attempts(
+                cfg, prepared_input, outputs, hf_token, report
+            )
 
-            attempt = 0
-            while True:
-                rc, detected_language = run_whisperx_direct_logged(
-                    cfg,
-                    prepared_input,
-                    outputs.srt_path,
-                    hf_token,
-                    diarize=current_diarize,
-                    log_path=outputs.log_path,
-                    append=attempt > 0,
-                )
-                if rc == 0:
-                    if current_diarize and should_fallback_without_diarization(outputs.log_path):
-                        fallback_no_diarize = True
-                    break
-
-                if current_diarize and should_fallback_without_diarization(outputs.log_path):
-                    fallback_no_diarize = True
-                    current_diarize = False
-                    report("")
-                    report("Diarization unavailable or blocked. Retrying without diarization...")
-                    with outputs.log_path.open("a", encoding="utf-8", errors="ignore") as log:
-                        log.write("\n[transcriber] Diarization unavailable or blocked; retrying without --diarize.\n")
-                    attempt += 1
-                    continue
-
-                break
-
-        if outputs.srt_path.exists():
-            should_translate = (not cfg.translate_to_english) and cfg.language == "auto" and detected_language == "es"
-            if cfg.language == "auto":
-                report(f"Detected language: {detected_language or 'unknown'}.")
-            if should_translate:
-                if cfg.glossary_path and not Path(cfg.glossary_path).expanduser().exists():
-                    report(f'Glossary file not found: "{cfg.glossary_path}"')
-                report("Translating Spanish transcript to English text...")
-                try:
-                    translate_srt_to_english(
-                        outputs.srt_path,
-                        cfg.device,
-                        glossary=cfg.glossary,
-                        glossary_spec=cfg.glossary_path,
-                        context_window=cfg.translation_context_window,
-                        batch_size=cfg.translation_batch_size,
-                        num_beams=cfg.translation_num_beams,
-                        max_new_tokens=cfg.translation_max_new_tokens,
-                        no_repeat_ngram_size=cfg.translation_no_repeat_ngram_size,
-                        log_path=outputs.log_path,
-                    )
-                except Exception as exc:
-                    report("")
-                    report(f"Translation failed: {exc}")
-                    report("Keeping the original transcript text.")
-                    report("")
-            try:
-                finalize_transcript_outputs(outputs.srt_path, outputs.llm_path)
-            except Exception:
-                pass
-
-        if rc != 0:
-            report("")
-            report(f"WhisperX failed (exit code {rc}).")
-            report(f'See the log: "{outputs.log_path}"')
-            report("")
-            return rc
-
-        if outputs.srt_path.exists():
-            report("")
-            report("Done.")
-            report(f'SRT: "{outputs.srt_path}"')
-            report(f'LLM: "{outputs.llm_path}"')
-            if cfg.mode == "fast" and not cfg.diarize:
-                report("Note: fast mode used (speaker diarization disabled).")
-            if fallback_no_diarize:
-                report("Note: completed without speaker diarization.")
-                report("To enable diarization, accept terms with the SAME HF account at:")
-                report("  https://hf.co/pyannote/speaker-diarization-3.1")
-                report("  https://hf.co/pyannote/segmentation-3.0")
-            report("")
-            return 0
-
-        report("")
-        report("Done, but SRT not found where expected:")
-        report(f'  "{outputs.srt_path}"')
-        report("Check the log:")
-        report(f'  "{outputs.log_path}"')
-        report("")
-        return 0
+        _finalize_existing_transcript(cfg, outputs, result.detected_language, report)
+        return _report_transcription_outcome(cfg, outputs, result, report)
     finally:
         release_lock(outputs.lock_path, report=report)
+
+
+# Watch mode and command-line entry point
 
 
 def watcher_log(log_path: Path, message: str) -> None:
@@ -2779,6 +1469,69 @@ def needs_transcription(input_path: Path, cfg: RunConfig) -> bool:
     return input_mtime_ns > output_mtime_ns
 
 
+def _process_watch_candidate(
+    cfg: RunConfig,
+    path: Path,
+    key: str,
+    pending: dict[str, PendingWatchFile],
+    now: float,
+    settle_seconds: float,
+    report: Reporter,
+) -> None:
+    if not needs_transcription(path, cfg):
+        pending.pop(key, None)
+        return
+
+    try:
+        size, mtime_ns = file_signature(path)
+    except OSError:
+        pending.pop(key, None)
+        return
+
+    pending_file = pending.get(key)
+    if pending_file is None:
+        pending[key] = PendingWatchFile(size=size, mtime_ns=mtime_ns, stable_since=now)
+        report(f'Detected "{path.name}". Waiting for the file to settle.')
+        return
+
+    if pending_file.update_signature(size, mtime_ns, now):
+        return
+    if not pending_file.is_ready(now, settle_seconds):
+        return
+
+    pending_file.last_attempt_at = now
+    report(f'Starting transcription for "{path.name}".')
+    return_code = transcribe_file(cfg, path, report=report)
+    outputs = output_paths_for_input(path, cfg)
+    if return_code == 0 and outputs.srt_path.exists():
+        pending.pop(key, None)
+        report(f'Finished "{path.name}" -> "{outputs.srt_path.name}".')
+        return
+
+    report(
+        f'Failed "{path.name}". Will retry in '
+        f"{WATCH_RETRY_COOLDOWN_SECONDS:g}s if the transcript is still missing."
+    )
+
+
+def _scan_watch_directory(
+    cfg: RunConfig,
+    watch_dir: Path,
+    pending: dict[str, PendingWatchFile],
+    settle_seconds: float,
+    report: Reporter,
+) -> None:
+    now = time.monotonic()
+    current_paths: set[str] = set()
+    for path in iter_watch_candidates(watch_dir):
+        key = str(path.resolve())
+        current_paths.add(key)
+        _process_watch_candidate(cfg, path, key, pending, now, settle_seconds, report)
+
+    for missing_key in pending.keys() - current_paths:
+        pending.pop(missing_key, None)
+
+
 def run_watch_loop(
     cfg: RunConfig,
     watch_dir: Path,
@@ -2796,8 +1549,7 @@ def run_watch_loop(
         )
         return 1
 
-    watcher_log_path = project_dir() / LOG_DIR_NAME / WATCHER_LOG_NAME
-    report = make_watch_reporter(watcher_log_path)
+    report = make_watch_reporter(project_dir() / LOG_DIR_NAME / WATCHER_LOG_NAME)
     report(f'Watcher started for "{watch_dir}".')
     report(
         "Defaults: "
@@ -2806,65 +1558,14 @@ def run_watch_loop(
         f"compute_type={cfg.compute_type}."
     )
     report(
-        f"Polling every {poll_interval:g}s. A file must stay unchanged for {settle_seconds:g}s before transcription starts."
+        f"Polling every {poll_interval:g}s. A file must stay unchanged for "
+        f"{settle_seconds:g}s before transcription starts."
     )
 
     pending: dict[str, PendingWatchFile] = {}
     while True:
         try:
-            current_paths: set[str] = set()
-            now = time.monotonic()
-
-            for path in iter_watch_candidates(watch_dir):
-                key = str(path.resolve())
-                current_paths.add(key)
-
-                if not needs_transcription(path, cfg):
-                    pending.pop(key, None)
-                    continue
-
-                try:
-                    size, mtime_ns = file_signature(path)
-                except OSError:
-                    pending.pop(key, None)
-                    continue
-
-                pending_file = pending.get(key)
-                if pending_file is None:
-                    pending[key] = PendingWatchFile(size=size, mtime_ns=mtime_ns, stable_since=now)
-                    report(f'Detected "{path.name}". Waiting for the file to settle.')
-                    continue
-
-                if pending_file.size != size or pending_file.mtime_ns != mtime_ns:
-                    pending_file.size = size
-                    pending_file.mtime_ns = mtime_ns
-                    pending_file.stable_since = now
-                    pending_file.last_attempt_at = None
-                    continue
-
-                if now - pending_file.stable_since < settle_seconds:
-                    continue
-
-                if pending_file.last_attempt_at is not None:
-                    if now - pending_file.last_attempt_at < WATCH_RETRY_COOLDOWN_SECONDS:
-                        continue
-
-                pending_file.last_attempt_at = now
-                report(f'Starting transcription for "{path.name}".')
-                rc = transcribe_file(cfg, path, report=report)
-                outputs = output_paths_for_input(path, cfg)
-                if rc == 0 and outputs.srt_path.exists():
-                    pending.pop(key, None)
-                    report(f'Finished "{path.name}" -> "{outputs.srt_path.name}".')
-                else:
-                    report(
-                        f'Failed "{path.name}". Will retry in {WATCH_RETRY_COOLDOWN_SECONDS:g}s if the transcript is still missing.'
-                    )
-
-            for key in list(pending):
-                if key not in current_paths:
-                    pending.pop(key, None)
-
+            _scan_watch_directory(cfg, watch_dir, pending, settle_seconds, report)
             time.sleep(poll_interval)
         except KeyboardInterrupt:
             report("Watcher stopped.")
